@@ -1,0 +1,16 @@
+{$SITE_ADDRESS::80} {
+    encode zstd gzip
+
+    handle_path /media-webrtc/* {
+        reverse_proxy mediamtx:8889
+    }
+
+    handle_path /media-hls/* {
+        reverse_proxy mediamtx:8888
+    }
+
+    handle {
+        reverse_proxy app:8080
+    }
+}
+

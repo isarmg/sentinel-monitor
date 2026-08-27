@@ -1,0 +1,37 @@
+/* Scoped reset: consumers opt in with data-sarmg-scope. */
+[data-sarmg-scope],
+[data-sarmg-scope] *,
+[data-sarmg-scope] *::before,
+[data-sarmg-scope] *::after {
+  box-sizing: border-box;
+}
+
+[data-sarmg-scope] {
+  min-width: 320px;
+  min-height: 100%;
+  font-family: var(--sarmg-font-sans, system-ui, sans-serif);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  text-size-adjust: 100%;
+}
+
+[data-sarmg-scope] :where(button, input, select, textarea) {
+  font: inherit;
+  line-height: inherit;
+}
+
+[data-sarmg-scope] button {
+  cursor: pointer;
+}
+
+[data-sarmg-scope] button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+[data-sarmg-scope] :where(h1, h2, h3) {
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+

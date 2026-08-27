@@ -1,0 +1,12 @@
+/target
+/web/node_modules
+/web/dist
+/.env
+/.env.native
+/auto.crt
+/auto.key
+/recordings/
+/postgres-data/
+/.idea
+/.vscode
+*.log

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "package": "@sarmg/design",
+  "version": "0.1.0",
+  "source": "design/tokens/tokens.json",
+  "files": {
+    "reset.css": {
+      "sha256": "a3205194c0e0560c03b784dfb25344d974694ff42256b9d6a1c7cf43c29a9d7e",
+      "bytes": 737
+    },
+    "tokens.css": {
+      "sha256": "ae1667d954def9cbfd7678b029923fac525dd1a585a8e7f9305bb072a897e00f",
+      "bytes": 2688
+    },
+    "content-card.css": {
+      "sha256": "df73e1ef5019f5da7c362907e261daa885eab7f186c4fab7dcc13359eba63079",
+      "bytes": 3331
+    },
+    "login.css": {
+      "sha256": "0fd813267cbcbb4fad41a9362c67d3be3dad51336988762b73efaa80b2fe4a9a",
+      "bytes": 1677
+    },
+    "accessibility.css": {
+      "sha256": "bacc1fc8d961dc19f1d8f7e7187cc92e10e2ff195b342ef5ce137da0f33730da",
+      "bytes": 1140
+    },
+    "bundle.css": {
+      "sha256": "b133ec9889c492229e832785190d7218f1dbbe204b48ee1df33375e07d37c0b0",
+      "bytes": 9736
+    }
+  }
+}

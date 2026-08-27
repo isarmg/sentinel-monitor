@@ -1,0 +1,10 @@
+target
+web/node_modules
+web/dist
+.git
+.env
+.env.native
+auto.crt
+auto.key
+recordings
+postgres-data
