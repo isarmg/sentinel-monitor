@@ -48,7 +48,7 @@ cp .env.example .env.native
 复制 `.env.example` 为本机私有文件，并按需设置：
 
 ```dotenv
-DATABASE_URL=postgresql://...
+DATABASE_URL=sqlite:///var/lib/isarmg/sentinel-monitor/db/app.db
 APP_JWT_SECRET=<至少32字符随机值>
 CREDENTIALS_KEY=<base64编码的32字节随机值>
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com

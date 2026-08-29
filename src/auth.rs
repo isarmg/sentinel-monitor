@@ -82,7 +82,7 @@ impl FromRequestParts<AppState> for CurrentUser {
 
         let user = sqlx::query_as::<_, UserRecord>(
             "SELECT id, email, password_hash, role, active, last_login_at, created_at, updated_at \
-             FROM users WHERE id = $1",
+             FROM users WHERE id = ?",
         )
         .bind(user_id)
         .fetch_optional(&state.pool)
@@ -215,7 +215,7 @@ pub async fn bootstrap_admin(state: &AppState) -> Result<()> {
         })?;
     let hash = hash_password(password)?;
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, 'admin')")
+    sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, 'admin')")
         .bind(id)
         .bind(&state.config.bootstrap_admin_email)
         .bind(hash)

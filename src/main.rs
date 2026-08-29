@@ -12,8 +12,7 @@ use config::Config;
 use crypto::SecretBox;
 use mediamtx::MediaMtxClient;
 use models::EventRecord;
-use isarmg_postgres::{connect, run_migrations, PostgresConfig};
-use sqlx::PgPool;
+use sqlx::SqlitePool;
 use std::{error::Error, sync::Arc};
 use tokio::{net::TcpListener, signal, sync::broadcast};
 use tracing_subscriber::EnvFilter;
@@ -21,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    pub pool: PgPool,
+    pub pool: SqlitePool,
     pub secrets: SecretBox,
     pub http: reqwest::Client,
     pub media: MediaMtxClient,
@@ -39,8 +38,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Arc::new(Config::from_env().map_err(|error| format!("configuration: {error}"))?);
-    let pool = connect(&PostgresConfig::new(&config.database_url)).await?;
-    run_migrations(&pool, &sqlx::migrate!()).await?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(10)
+        .connect(&config.database_url)
+        .await?;
+    sqlx::migrate!().run(&pool).await?;
 
     let http = reqwest::Client::builder()
         .timeout(config.request_timeout)

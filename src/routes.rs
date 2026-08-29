@@ -72,7 +72,7 @@ async fn login(
     Json(request): Json<LoginRequest>,
 ) -> Result<impl IntoResponse> {
     let user =
-        sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} WHERE LOWER(email) = LOWER($1)"))
+        sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} WHERE LOWER(email) = LOWER(?)"))
             .bind(request.email.trim())
             .fetch_optional(&state.pool)
             .await?
@@ -82,7 +82,7 @@ async fn login(
         return Err(AppError::Unauthorized);
     }
 
-    sqlx::query("UPDATE users SET last_login_at = NOW() WHERE id = $1")
+    sqlx::query("UPDATE users SET last_login_at = datetime('now') WHERE id = ?")
         .bind(user.id)
         .execute(&state.pool)
         .await?;
@@ -139,7 +139,7 @@ async fn create_user(
     validate_role(&request.role)?;
     validate_email(&request.email)?;
     let record = sqlx::query_as::<_, UserRecord>(
-        "INSERT INTO users (id, email, password_hash, role) VALUES ($1, LOWER($2), $3, $4) \
+        "INSERT INTO users (id, email, password_hash, role) VALUES (?, LOWER(?), ?, ?) \
          RETURNING id, email, password_hash, role, active, last_login_at, created_at, updated_at",
     )
     .bind(Uuid::new_v4())
@@ -183,7 +183,7 @@ async fn update_user(
         _ => existing.password_hash,
     };
     let record = sqlx::query_as::<_, UserRecord>(
-        "UPDATE users SET role = $2, active = $3, password_hash = $4, updated_at = NOW() WHERE id = $1 \
+        "UPDATE users SET role = ?, active = ?, password_hash = ?, updated_at = datetime('now') WHERE id = ? \
          RETURNING id, email, password_hash, role, active, last_login_at, created_at, updated_at",
     )
     .bind(id)
@@ -217,7 +217,7 @@ async fn delete_user(
     if existing.role == "admin" {
         ensure_another_admin(&state, id).await?;
     }
-    sqlx::query("DELETE FROM users WHERE id = $1")
+    sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(id)
         .execute(&state.pool)
         .await?;
@@ -257,7 +257,7 @@ async fn create_camera(
     )?;
     let record = sqlx::query_as::<_, CameraRecord>(
         "INSERT INTO cameras (id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
     )
     .bind(Uuid::new_v4())
@@ -291,7 +291,7 @@ async fn create_camera(
     let sync_result = sync_camera(&state, &record).await;
     let warning = sync_result.as_ref().err().map(ToString::to_string);
     if warning.is_some() {
-        sqlx::query("UPDATE cameras SET status = 'error' WHERE id = $1")
+        sqlx::query("UPDATE cameras SET status = 'error' WHERE id = ?")
             .bind(record.id)
             .execute(&state.pool)
             .await?;
@@ -373,7 +373,7 @@ async fn update_camera(
     }
 
     let record = sqlx::query_as::<_, CameraRecord>(
-        "UPDATE cameras SET name = $2, location = $3, main_stream_url_enc = $4, sub_stream_url_enc = $5, onvif_url = $6, username = $7, password_enc = $8, enabled = $9, record_enabled = $10, status = CASE WHEN $9 THEN 'pending' ELSE 'disabled' END, updated_at = NOW() WHERE id = $1 \
+        "UPDATE cameras SET name = ?, location = ?, main_stream_url_enc = ?, sub_stream_url_enc = ?, onvif_url = ?, username = ?, password_enc = ?, enabled = ?, record_enabled = ?, status = CASE WHEN ? THEN 'pending' ELSE 'disabled' END, updated_at = datetime('now') WHERE id = ? \
          RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
     )
     .bind(id)
@@ -392,7 +392,7 @@ async fn update_camera(
     let sync_result = sync_camera(&state, &record).await;
     let warning = sync_result.as_ref().err().map(ToString::to_string);
     if warning.is_some() {
-        sqlx::query("UPDATE cameras SET status = 'error' WHERE id = $1")
+        sqlx::query("UPDATE cameras SET status = 'error' WHERE id = ?")
             .bind(id)
             .execute(&state.pool)
             .await?;
@@ -420,7 +420,7 @@ async fn delete_camera(
 ) -> Result<StatusCode> {
     user.require_admin()?;
     let camera = load_camera(&state, id).await?;
-    sqlx::query("DELETE FROM cameras WHERE id = $1")
+    sqlx::query("DELETE FROM cameras WHERE id = ?")
         .bind(id)
         .execute(&state.pool)
         .await?;
@@ -647,8 +647,8 @@ async fn list_events(
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let events = sqlx::query_as::<_, EventRecord>(
         "SELECT id, camera_id, kind, severity, message, details, acknowledged_at, acknowledged_by, created_at \
-         FROM events WHERE ($1::uuid IS NULL OR camera_id = $1) \
-         AND ($2::boolean = FALSE OR acknowledged_at IS NULL) ORDER BY created_at DESC LIMIT $3",
+         FROM events WHERE (?::uuid IS NULL OR camera_id = ?) \
+         AND (?::boolean = FALSE OR acknowledged_at IS NULL) ORDER BY created_at DESC LIMIT ?",
     )
     .bind(query.camera_id)
     .bind(query.unacknowledged.unwrap_or(false))
@@ -665,7 +665,7 @@ async fn ack_event(
 ) -> Result<StatusCode> {
     user.require_operator()?;
     let result = sqlx::query(
-        "UPDATE events SET acknowledged_at = NOW(), acknowledged_by = $2 WHERE id = $1",
+        "UPDATE events SET acknowledged_at = datetime('now'), acknowledged_by = ? WHERE id = ?",
     )
     .bind(id)
     .bind(user.id)
@@ -714,7 +714,7 @@ async fn list_audit(
 ) -> Result<Json<Vec<AuditRecord>>> {
     user.require_admin()?;
     let rows = sqlx::query_as::<_, AuditRecord>(
-        "SELECT id, user_id, action, entity_type, entity_id, details, created_at FROM audit_logs ORDER BY created_at DESC LIMIT $1",
+        "SELECT id, user_id, action, entity_type, entity_id, details, created_at FROM audit_logs ORDER BY created_at DESC LIMIT ?",
     )
     .bind(query.limit.unwrap_or(100).clamp(1, 500))
     .fetch_all(&state.pool)
@@ -770,7 +770,10 @@ async fn live() -> Json<Value> {
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
-    let database = isarmg_postgres::ready(&state.pool).await;
+    let database = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+        .is_ok();
     let media = state.media.health().await;
     let status = if database && media {
         StatusCode::OK
@@ -785,7 +788,7 @@ async fn ready(State(state): State<AppState>) -> Response {
 }
 
 async fn load_camera(state: &AppState, id: Uuid) -> Result<CameraRecord> {
-    sqlx::query_as::<_, CameraRecord>(&format!("{CAMERA_SELECT} WHERE id = $1"))
+    sqlx::query_as::<_, CameraRecord>(&format!("{CAMERA_SELECT} WHERE id = ?"))
         .bind(id)
         .fetch_optional(&state.pool)
         .await?
@@ -793,7 +796,7 @@ async fn load_camera(state: &AppState, id: Uuid) -> Result<CameraRecord> {
 }
 
 async fn load_user(state: &AppState, id: Uuid) -> Result<UserRecord> {
-    sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} WHERE id = $1"))
+    sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} WHERE id = ?"))
         .bind(id)
         .fetch_optional(&state.pool)
         .await?
@@ -802,7 +805,7 @@ async fn load_user(state: &AppState, id: Uuid) -> Result<UserRecord> {
 
 async fn ensure_another_admin(state: &AppState, excluded: Uuid) -> Result<()> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND active AND id <> $1",
+        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND active AND id <> ?",
     )
     .bind(excluded)
     .fetch_one(&state.pool)
@@ -899,7 +902,7 @@ async fn write_audit(
     details: Value,
 ) {
     if let Err(error) = sqlx::query(
-        "INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details) VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(Uuid::new_v4())
     .bind(user_id)

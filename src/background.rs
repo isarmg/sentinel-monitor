@@ -94,7 +94,7 @@ pub async fn emit_event(
 ) -> Result<EventRecord> {
     let event = sqlx::query_as::<_, EventRecord>(
         "INSERT INTO events (id, camera_id, kind, severity, message, details) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+         VALUES (?, ?, ?, ?, ?, ?) \
          RETURNING id, camera_id, kind, severity, message, details, acknowledged_at, acknowledged_by, created_at",
     )
     .bind(Uuid::new_v4())
@@ -116,7 +116,7 @@ async fn reconcile_all(state: &AppState) -> Result<()> {
     for camera in cameras {
         if let Err(error) = sync_camera(state, &camera).await {
             tracing::warn!(camera_id = %camera.id, %error, "camera media sync failed");
-            sqlx::query("UPDATE cameras SET status = 'error', updated_at = NOW() WHERE id = $1")
+            sqlx::query("UPDATE cameras SET status = 'error', updated_at = datetime('now') WHERE id = ?")
                 .bind(camera.id)
                 .execute(&state.pool)
                 .await?;
@@ -141,7 +141,7 @@ async fn refresh_statuses(state: &AppState) -> Result<()> {
         };
         if new_status == camera.status {
             if new_status == "online" {
-                sqlx::query("UPDATE cameras SET last_seen_at = NOW() WHERE id = $1")
+                sqlx::query("UPDATE cameras SET last_seen_at = datetime('now') WHERE id = ?")
                     .bind(camera.id)
                     .execute(&state.pool)
                     .await?;
@@ -150,7 +150,7 @@ async fn refresh_statuses(state: &AppState) -> Result<()> {
         }
 
         sqlx::query(
-            "UPDATE cameras SET status = $2, last_seen_at = CASE WHEN $2 = 'online' THEN NOW() ELSE last_seen_at END, updated_at = NOW() WHERE id = $1",
+            "UPDATE cameras SET status = ?, last_seen_at = CASE WHEN ? = 'online' THEN datetime('now') ELSE last_seen_at END, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(camera.id)
         .bind(new_status)
