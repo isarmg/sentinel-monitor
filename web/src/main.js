@@ -258,7 +258,7 @@ async function discoverDevices() {
   button.disabled = true; button.textContent = "正在扫描局域网…";
   try {
     const devices = await api("/api/discovery/onvif", { method: "POST" });
-    if (!devices.length) toast("没有发现ONVIF设备；Docker Desktop环境可改用手动添加", "warning");
+    if (!devices.length) toast("没有发现ONVIF设备；可改用手动添加", "warning");
     else {
       openCameraDialog();
       $("#camera-form").elements.onvif_url.value = devices[0].xaddrs[0] || "";
