@@ -1,0 +1,11 @@
+name: Independence gate
+on: [push, pull_request]
+jobs:
+  independence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -euo pipefail
+          if rg -n 'UNION_|X-Union-|PluginManifest|ProcessContext|sarmg-platform|sarmg_platform' .; then exit 1; fi
+          if find . -maxdepth 4 \( -iname 'Dockerfile*' -o -iname 'docker-compose*.yml' -o -iname 'docker-compose*.yaml' \) | grep .; then exit 1; fi
