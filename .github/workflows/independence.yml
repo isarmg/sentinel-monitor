@@ -7,5 +7,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: |
           set -euo pipefail
-          if grep -R -n -E 'UNION_|X-Union-|PluginManifest|ProcessContext|sarmg-platform|sarmg_platform' .; then exit 1; fi
+          if grep -R -n -E --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules 'UNION_|X-Union-|PluginManifest|ProcessContext|sarmg-platform|sarmg_platform' .; then exit 1; fi
           if find . -maxdepth 4 \( -iname 'Dockerfile*' -o -iname 'docker-compose*.yml' -o -iname 'docker-compose*.yaml' \) | grep .; then exit 1; fi

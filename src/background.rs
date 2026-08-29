@@ -116,10 +116,12 @@ async fn reconcile_all(state: &AppState) -> Result<()> {
     for camera in cameras {
         if let Err(error) = sync_camera(state, &camera).await {
             tracing::warn!(camera_id = %camera.id, %error, "camera media sync failed");
-            sqlx::query("UPDATE cameras SET status = 'error', updated_at = datetime('now') WHERE id = ?")
-                .bind(camera.id)
-                .execute(&state.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE cameras SET status = 'error', updated_at = datetime('now') WHERE id = ?",
+            )
+            .bind(camera.id)
+            .execute(&state.pool)
+            .await?;
         }
     }
     Ok(())
