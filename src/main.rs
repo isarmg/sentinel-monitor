@@ -12,7 +12,7 @@ use config::Config;
 use crypto::SecretBox;
 use mediamtx::MediaMtxClient;
 use models::EventRecord;
-use sarmg_platform_postgres::{connect, run_migrations, PostgresConfig};
+use isarmg_postgres::{connect, run_migrations, PostgresConfig};
 use sqlx::PgPool;
 use std::{error::Error, sync::Arc};
 use tokio::{net::TcpListener, signal, sync::broadcast};

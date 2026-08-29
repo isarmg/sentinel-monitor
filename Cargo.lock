@@ -1012,6 +1012,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
+name = "isarmg-postgres"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "thiserror",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1709,14 +1717,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "sarmg-platform-postgres"
-version = "0.1.0"
-dependencies = [
- "sqlx",
- "thiserror",
-]
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1734,11 +1734,11 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "isarmg-postgres",
  "jsonwebtoken",
  "rand 0.8.7",
  "reqwest",
  "roxmltree",
- "sarmg-platform-postgres",
  "serde",
  "serde_json",
  "sha1",

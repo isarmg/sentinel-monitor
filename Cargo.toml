@@ -17,7 +17,7 @@ jsonwebtoken = "9"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 roxmltree = "0.20"
-sarmg-platform-postgres = { path = "../platform/crates/postgres" }
+isarmg-postgres = { path = "../isarmg-foundation/rust/crates/isarmg-postgres" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"

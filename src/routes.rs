@@ -770,7 +770,7 @@ async fn live() -> Json<Value> {
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
-    let database = sarmg_platform_postgres::ready(&state.pool).await;
+    let database = isarmg_postgres::ready(&state.pool).await;
     let media = state.media.health().await;
     let status = if database && media {
         StatusCode::OK
