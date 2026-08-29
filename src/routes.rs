@@ -186,10 +186,10 @@ async fn update_user(
         "UPDATE users SET role = ?, active = ?, password_hash = ?, updated_at = datetime('now') WHERE id = ? \
          RETURNING id, email, password_hash, role, active, last_login_at, created_at, updated_at",
     )
-    .bind(id)
     .bind(&role)
     .bind(active)
     .bind(password_hash)
+    .bind(id)
     .fetch_one(&state.pool)
     .await?;
     write_audit(

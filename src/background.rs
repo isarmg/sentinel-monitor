@@ -154,8 +154,9 @@ async fn refresh_statuses(state: &AppState) -> Result<()> {
         sqlx::query(
             "UPDATE cameras SET status = ?, last_seen_at = CASE WHEN ? = 'online' THEN datetime('now') ELSE last_seen_at END, updated_at = datetime('now') WHERE id = ?",
         )
-        .bind(camera.id)
         .bind(new_status)
+        .bind(new_status)
+        .bind(camera.id)
         .execute(&state.pool)
         .await?;
 
