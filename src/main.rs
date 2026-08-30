@@ -7,6 +7,7 @@ mod mediamtx;
 mod models;
 mod onvif;
 mod routes;
+mod sqlite;
 
 #[cfg(test)]
 mod sqlite_tests;
@@ -41,10 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Arc::new(Config::from_env().map_err(|error| format!("configuration: {error}"))?);
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
-        .await?;
+    let pool = sqlite::open_pool(&config.database_url).await?;
     sqlx::migrate!().run(&pool).await?;
 
     let http = reqwest::Client::builder()

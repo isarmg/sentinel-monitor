@@ -5,7 +5,7 @@ use crate::{
     crypto::SecretBox,
     mediamtx::MediaMtxClient,
     models::CameraRecord,
-    routes, AppState,
+    routes, sqlite, AppState,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -15,17 +15,14 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    SqlitePool,
-};
+use sqlx::{SqliteConnection, SqlitePool};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 struct TestContext {
-    database_path: PathBuf,
+    _database: TemporaryDatabase,
     state: AppState,
     media_task: JoinHandle<()>,
 }
@@ -33,9 +30,33 @@ struct TestContext {
 impl Drop for TestContext {
     fn drop(&mut self) {
         self.media_task.abort();
-        let base = self.database_path.to_string_lossy();
+    }
+}
+
+struct TemporaryDatabase {
+    path: PathBuf,
+}
+
+impl TemporaryDatabase {
+    fn new() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "sentinel-monitor-sqlite-test-{}.sqlite3",
+                Uuid::new_v4()
+            )),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("sqlite://{}", self.path.display())
+    }
+}
+
+impl Drop for TemporaryDatabase {
+    fn drop(&mut self) {
+        let base = self.path.to_string_lossy();
         for path in [
-            self.database_path.clone(),
+            self.path.clone(),
             PathBuf::from(format!("{base}-shm")),
             PathBuf::from(format!("{base}-wal")),
         ] {
@@ -46,17 +67,9 @@ impl Drop for TestContext {
 
 impl TestContext {
     async fn migrated() -> Self {
-        let database_path = std::env::temp_dir().join(format!(
-            "sentinel-monitor-sqlite-test-{}.sqlite3",
-            Uuid::new_v4()
-        ));
-        let options = SqliteConnectOptions::new()
-            .filename(&database_path)
-            .create_if_missing(true)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
+        let database = TemporaryDatabase::new();
+        let database_url = database.url();
+        let pool = sqlite::open_pool(&database_url)
             .await
             .expect("open temporary SQLite database");
         sqlx::migrate!()
@@ -78,7 +91,7 @@ impl TestContext {
 
         let config = Arc::new(Config {
             bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
-            database_url: format!("sqlite://{}", database_path.display()),
+            database_url,
             jwt_secret: b"sentinel-test-jwt-secret-32-bytes".to_vec(),
             credentials_key: [7; 32],
             bootstrap_admin_email: "admin@example.com".into(),
@@ -116,7 +129,7 @@ impl TestContext {
         };
 
         Self {
-            database_path,
+            _database: database,
             state,
             media_task,
         }
@@ -196,6 +209,62 @@ async fn required_times(pool: &SqlitePool, table: &str, id: Uuid) -> (String, Op
 
 fn assert_utc_timestamp(value: &str) {
     DateTime::parse_from_rfc3339(value).expect("timestamp must be RFC 3339");
+}
+
+async fn assert_connection_configuration(connection: &mut SqliteConnection) {
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("read journal_mode");
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("read foreign_keys");
+    let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("read busy_timeout");
+    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("read synchronous");
+
+    assert_eq!(journal_mode, "wal");
+    assert_eq!(foreign_keys, 1);
+    assert_eq!(busy_timeout, 5_000);
+    assert_eq!(synchronous, 2);
+}
+
+async fn assert_foreign_key_enforced(connection: &mut SqliteConnection) {
+    let error = sqlx::query(
+        "INSERT INTO audit_logs (id, user_id, action, entity_type, details, created_at) \
+         VALUES (?, ?, 'test.invalid-reference', 'test', '{}', ?)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(Utc::now())
+    .execute(&mut *connection)
+    .await
+    .expect_err("foreign key violation must reject the insert");
+
+    match error {
+        sqlx::Error::Database(error) => assert!(error.is_foreign_key_violation(), "{error}"),
+        other => panic!("expected a database constraint error, got {other}"),
+    }
+}
+
+async fn assert_database_integrity(pool: &SqlitePool) {
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(pool)
+        .await
+        .expect("run integrity_check");
+    let foreign_key_violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(pool)
+        .await
+        .expect("run foreign_key_check");
+
+    assert_eq!(integrity, "ok");
+    assert!(foreign_key_violations.is_empty());
 }
 
 #[tokio::test]
@@ -505,4 +574,62 @@ async fn migrated_database_updates_cameras_filters_and_acknowledges_events() {
     assert_eq!(ids, expected);
 
     context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn production_pool_configures_every_connection_and_persists_after_reopen() {
+    let database = TemporaryDatabase::new();
+    let database_url = database.url();
+    assert!(!database.path.exists());
+
+    let pool = sqlite::open_pool(&database_url)
+        .await
+        .expect("open production-configured SQLite pool");
+    assert!(database.path.exists());
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .expect("run the real migrations");
+
+    let mut first = pool.acquire().await.expect("acquire first connection");
+    let mut second = pool.acquire().await.expect("acquire second connection");
+    assert_connection_configuration(&mut first).await;
+    assert_connection_configuration(&mut second).await;
+    assert_foreign_key_enforced(&mut first).await;
+    assert_foreign_key_enforced(&mut second).await;
+    drop(first);
+    drop(second);
+
+    let persisted_user = Uuid::new_v4();
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
+         VALUES (?, 'persisted@example.com', 'test-hash', 'viewer', 1, ?, ?)",
+    )
+    .bind(persisted_user)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert persistent test data");
+    assert_database_integrity(&pool).await;
+    pool.close().await;
+
+    let reopened = sqlite::open_pool(&database_url)
+        .await
+        .expect("reopen production-configured SQLite pool");
+    let loaded_user =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = 'persisted@example.com'")
+            .fetch_one(&reopened)
+            .await
+            .expect("load data after reopening");
+    assert_eq!(loaded_user, persisted_user);
+    let mut reopened_connection = reopened
+        .acquire()
+        .await
+        .expect("acquire reopened connection");
+    assert_connection_configuration(&mut reopened_connection).await;
+    drop(reopened_connection);
+    assert_database_integrity(&reopened).await;
+    reopened.close().await;
 }
