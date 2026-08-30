@@ -4,7 +4,6 @@ use crate::{
     AppState,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use tokio::time::{self, MissedTickBehavior};
 use url::Url;
 use uuid::Uuid;

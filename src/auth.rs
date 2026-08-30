@@ -21,6 +21,10 @@ pub struct CurrentUser {
     pub id: Uuid,
     pub email: String,
     pub role: String,
+    pub active: bool,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl CurrentUser {
@@ -45,9 +49,10 @@ impl CurrentUser {
             id: self.id,
             email: self.email.clone(),
             role: self.role.clone(),
-            active: true,
-            last_login_at: None,
-            created_at: Utc::now(),
+            active: self.active,
+            last_login_at: self.last_login_at,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
         }
     }
 }
@@ -94,6 +99,10 @@ impl FromRequestParts<AppState> for CurrentUser {
             id: user.id,
             email: user.email,
             role: user.role,
+            active: user.active,
+            last_login_at: user.last_login_at,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
         })
     }
 }

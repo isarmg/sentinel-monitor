@@ -23,6 +23,7 @@ pub struct UserView {
     pub active: bool,
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl From<UserRecord> for UserView {
@@ -34,6 +35,7 @@ impl From<UserRecord> for UserView {
             active: value.active,
             last_login_at: value.last_login_at,
             created_at: value.created_at,
+            updated_at: value.updated_at,
         }
     }
 }

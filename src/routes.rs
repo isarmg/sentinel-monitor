@@ -3,7 +3,7 @@ use crate::{
         decode_media_token, expired_session_cookie, hash_password, issue_media_token,
         issue_session, session_cookie, verify_password, CurrentUser,
     },
-    background::{camera_path, emit_event, sync_camera},
+    background::{camera_path, sync_camera},
     error::{AppError, Result},
     models::*,
     onvif, AppState,
@@ -14,13 +14,13 @@ use axum::{
     extract::{Path, Query, State},
     http::{
         header::{
-            ACCEPT_RANGES, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-            CONTENT_TYPE, RANGE, SET_COOKIE,
+            ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
+            SET_COOKIE,
         },
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{sse::Event, IntoResponse, Response, Sse},
-    routing::{delete, get, patch, post, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -115,8 +115,8 @@ async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse> {
     Ok((headers, StatusCode::NO_CONTENT))
 }
 
-async fn me(user: CurrentUser) -> Json<Value> {
-    Json(json!({ "id": user.id, "email": user.email, "role": user.role }))
+async fn me(user: CurrentUser) -> Json<UserView> {
+    Json(user.view())
 }
 
 async fn list_users(
@@ -379,11 +379,11 @@ async fn update_camera(
         return Err(AppError::Validation("摄像头名称不能为空".into()));
     }
 
+    let updated_at = Utc::now();
     let record = sqlx::query_as::<_, CameraRecord>(
-        "UPDATE cameras SET name = ?, location = ?, main_stream_url_enc = ?, sub_stream_url_enc = ?, onvif_url = ?, username = ?, password_enc = ?, enabled = ?, record_enabled = ?, status = CASE WHEN ? THEN 'pending' ELSE 'disabled' END, updated_at = datetime('now') WHERE id = ? \
+        "UPDATE cameras SET name = ?1, location = ?2, main_stream_url_enc = ?3, sub_stream_url_enc = ?4, onvif_url = ?5, username = ?6, password_enc = ?7, enabled = ?8, record_enabled = ?9, status = CASE WHEN ?8 THEN 'pending' ELSE 'disabled' END, updated_at = ?10 WHERE id = ?11 \
          RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
     )
-    .bind(id)
     .bind(name.trim())
     .bind(location.trim())
     .bind(main_stream_url_enc)
@@ -393,6 +393,8 @@ async fn update_camera(
     .bind(password_enc)
     .bind(enabled)
     .bind(record_enabled)
+    .bind(updated_at)
+    .bind(id)
     .fetch_one(&state.pool)
     .await?;
 
@@ -652,16 +654,22 @@ async fn list_events(
     Query(query): Query<EventQuery>,
 ) -> Result<Json<Vec<EventRecord>>> {
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let events = sqlx::query_as::<_, EventRecord>(
-        "SELECT id, camera_id, kind, severity, message, details, acknowledged_at, acknowledged_by, created_at \
-         FROM events WHERE (?::uuid IS NULL OR camera_id = ?) \
-         AND (?::boolean = FALSE OR acknowledged_at IS NULL) ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(query.camera_id)
-    .bind(query.unacknowledged.unwrap_or(false))
-    .bind(limit)
-    .fetch_all(&state.pool)
-    .await?;
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, camera_id, kind, severity, message, details, acknowledged_at, acknowledged_by, created_at FROM events WHERE 1 = 1",
+    );
+    if let Some(camera_id) = query.camera_id {
+        builder.push(" AND camera_id = ").push_bind(camera_id);
+    }
+    if query.unacknowledged.unwrap_or(false) {
+        builder.push(" AND acknowledged_at IS NULL");
+    }
+    builder
+        .push(" ORDER BY created_at DESC LIMIT ")
+        .push_bind(limit);
+    let events = builder
+        .build_query_as::<EventRecord>()
+        .fetch_all(&state.pool)
+        .await?;
     Ok(Json(events))
 }
 
@@ -671,13 +679,14 @@ async fn ack_event(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
     user.require_operator()?;
-    let result = sqlx::query(
-        "UPDATE events SET acknowledged_at = datetime('now'), acknowledged_by = ? WHERE id = ?",
-    )
-    .bind(id)
-    .bind(user.id)
-    .execute(&state.pool)
-    .await?;
+    let acknowledged_at = Utc::now();
+    let result =
+        sqlx::query("UPDATE events SET acknowledged_at = ?, acknowledged_by = ? WHERE id = ?")
+            .bind(acknowledged_at)
+            .bind(user.id)
+            .bind(id)
+            .execute(&state.pool)
+            .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("事件不存在".into()));
     }
