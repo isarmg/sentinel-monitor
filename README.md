@@ -19,29 +19,30 @@ IP Camera (RTSP / ONVIF)
 
 ## 物理机部署
 
-Sentinel 0.2.0 使用不可变版本目录，不支持旧 `.env.native` 或旧 runtime 就地迁移。准备与
-[`native/mediamtx.lock`](native/mediamtx.lock) 匹配的 MediaMTX `linux_amd64` 二进制，然后发布：
+Sentinel 0.2.0 使用唯一物理版本目录，不支持旧 `.env.native`、旧 runtime 或任何就地迁移。正式发布
+必须来自完全干净、HEAD 正好由 annotated `v0.2.0` 标记的 checkout。准备与
+[`native/mediamtx.lock`](native/mediamtx.lock) 匹配的 MediaMTX `linux_amd64` 二进制，然后执行一次性发布：
 
 ```bash
 export SENTINEL_MEDIAMTX_SOURCE=/absolute/path/to/mediamtx
 ./native/build.sh
 
-/opt/isarmg/sentinel-monitor/current/native/bootstrap.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/bootstrap.sh
 sudoedit /etc/isarmg/sentinel-monitor/sentinel-monitor.env
-/opt/isarmg/sentinel-monitor/current/native/bootstrap.sh --confirm-config
-/opt/isarmg/sentinel-monitor/current/native/start.sh
-/opt/isarmg/sentinel-monitor/current/native/status.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/bootstrap.sh --confirm-config
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/start.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/status.sh
 ```
 
 `bootstrap.sh` 不启动服务、不覆盖现有环境文件，也不回显随机初始秘密。停止服务使用发行目录中的入口：
 
 ```bash
-/opt/isarmg/sentinel-monitor/current/native/stop.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/stop.sh
 ```
 
-默认布局为 `/opt/isarmg/sentinel-monitor/releases/0.2.0`、原子 `current` symlink、
-`/etc/isarmg/sentinel-monitor` 配置、`/var/lib/isarmg/sentinel-monitor` 数据和
-`/run/isarmg/sentinel-monitor` 运行锁。`start.sh` 与 `stop.sh` 还共享一个短期 `operations.lock`，防止并发
+默认布局只有物理 `/opt/isarmg/sentinel-monitor/releases/0.2.0`，不创建 `current`、`latest` 或其他
+可切换别名；配置位于 `/etc/isarmg/sentinel-monitor`，数据位于 `/var/lib/isarmg/sentinel-monitor`，
+运行锁位于 `/run/isarmg/sentinel-monitor`。`start.sh` 与 `stop.sh` 还共享一个短期 `operations.lock`，防止并发
 启动器竞争 PID 文件；它不会被长寿命子进程继承。完整流程和权限边界见
 [`native/README.md`](native/README.md)。
 
@@ -82,9 +83,12 @@ PUBLIC_WEBRTC_BASE_URL=/media-webrtc
 STATIC_DIR=/opt/isarmg/sentinel-monitor/releases/0.2.0/web
 ```
 
-`STATIC_DIR` 没有默认值，必须是绝对、逐组件无 symlink 的版本路径。构建时的精确 Web 文件集合、大小和
-SHA-256 已嵌入二进制；服务在任何数据库访问前拒绝缺失、增加、篡改、特殊文件、硬链接，以及生产模式
-下仍带写权限的资源。普通未绑定静态 manifest 的开发二进制不能启动 `serve`。
+`STATIC_DIR` 没有默认值，必须等于已验证物理版本中的 `web/`。正式二进制在读取配置、取得运行锁或访问
+数据库前，先由同一进程验证自身物理位置、40 位源码 revision、target、`v2` 协议、当前 Schema、凭据
+envelope、Web 静态契约、MediaMTX lock/config/二进制以及整个 manifest 文件树；缺失、增加、篡改、
+错误权限、特殊文件、符号链接和硬链接都会失败。源码绑定的正式二进制只接受
+`serve-release /opt/isarmg/sentinel-monitor/releases/0.2.0`；普通 `serve` 仅供明确未绑定 revision 的
+开发构建使用。
 
 生产模式始终使用 `__Host-sentinel_session` Secure/HttpOnly/SameSite Cookie。仅本机开发可设置 `APP_ENV=development`，且服务会拒绝绑定非 loopback 地址。
 登录入口同时按连接来源和规范化账户名执行有界 Token Bucket 限流；Argon2 并发与超时参数应按主机内存和 CPU 预算调整。
@@ -136,7 +140,7 @@ AES-256-GCM 专用 key 由 `CREDENTIALS_KEY` 使用 HKDF-SHA256 派生，salt �
 5. 周期性比较期望 Path 与 MediaMTX 的配置/Publisher/Recording 实际态，发现漂移会创建新的
    `drift_detected` 操作。
 
-`serve` 在访问数据库前同时持有数据库同目录下的
+正式 `serve-release`（以及开发 `serve`）在访问数据库前同时持有数据库同目录下的
 `.app.db.sentinel-monitor.instance.lock`（排他）与
 `.app.db.sentinel-monitor.maintenance.lock`（共享），并继续持有绝对路径
 `SENTINEL_RUNTIME_DIR/app.lock`、维护 `app.pid` 到退出。数据库锁按数据库路径身份锚定，所以即使把
@@ -193,7 +197,7 @@ Sentinel `0.2.0` 产品进程只理解并初始化一个当前 schema，不承�
 application=sentinel-monitor
 application_version=0.2.0
 schema_revision=1
-schema_sha256=73a26cfd0d8d55f1559407904fe6445e278310614750cc1c0f3306a2803b7df6
+schema_sha256=b089342e00e672d6e6c679e15f331c90e599129371042a37948a4b53e5f8e49e
 ```
 
 指纹从 `sqlite_schema` 读取 `name NOT GLOB 'sqlite_*'` 且 `name <> 'product_metadata'` 的
@@ -220,10 +224,10 @@ set -a
 source /etc/isarmg/sentinel-monitor/sentinel-monitor.env
 set +a
 
-"/opt/isarmg/sentinel-monitor/current/bin/sentinel-monitor" doctor --offline
+"/opt/isarmg/sentinel-monitor/releases/0.2.0/bin/sentinel-monitor" doctor --offline
 
-/opt/isarmg/sentinel-monitor/current/native/start.sh
-"/opt/isarmg/sentinel-monitor/current/bin/sentinel-monitor" doctor
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/start.sh
+"/opt/isarmg/sentinel-monitor/releases/0.2.0/bin/sentinel-monitor" doctor
 ```
 
 `doctor` 执行 current-schema 元数据与现场指纹比对、`integrity_check`、`foreign_key_check`、可回滚

@@ -9,22 +9,22 @@ SQLite。历史数据升级由独立升级工具负责。
 
 ```text
 /opt/isarmg/sentinel-monitor/
-├── releases/0.2.0/
-│   ├── RELEASE-MANIFEST
-│   ├── bin/{sentinel-monitor,mediamtx}
-│   ├── web/{index.html,assets/...}
-│   ├── config/{mediamtx.yml,mediamtx.lock}
-│   └── native/{bootstrap,start,status,stop,common}.sh
-└── current -> releases/0.2.0
+└── releases/0.2.0/
+    ├── RELEASE-MANIFEST
+    ├── bin/{sentinel-monitor,mediamtx}
+    ├── web/{index.html,assets/...}
+    ├── config/{mediamtx.yml,mediamtx.lock}
+    └── native/{bootstrap,start,status,stop,common}.sh
 
 /etc/isarmg/sentinel-monitor/sentinel-monitor.env
 /var/lib/isarmg/sentinel-monitor/{db,recordings,logs}
 /run/isarmg/sentinel-monitor/{operations.lock,app.lock,app.pid,mediamtx.lock,mediamtx.pid}
 ```
 
-版本目录全部只读。`build.sh` 先在 `releases/` 内相邻暂存，完整验证后 rename 为 `0.2.0`，再通过同父
-目录临时 symlink 与原子 rename 切换 `current`。重复发布完全相同的内容是幂等操作；同一版本只要任一
-二进制、Web 文件、配置或脚本不同就拒绝，绝不覆盖。
+版本目录全部只读，不存在可切换 alias。`build.sh` 只接受干净、由 annotated `v0.2.0` 精确标记的
+checkout，把完整源码 revision 编译进二进制，在同一文件系统暂存并由真实二进制验明整个树后才发布到
+`releases/0.2.0`。该目标只允许从缺失状态排他创建；无论内容相同或不同，第二次发布都在写入安装树前
+失败，绝不覆盖或“幂等”复用同一版本。
 
 ## 构建与首次配置
 
@@ -36,7 +36,7 @@ Web 构建、配置及运维脚本一起发布：
 export SENTINEL_MEDIAMTX_SOURCE=/absolute/path/to/mediamtx
 ./native/build.sh
 
-/opt/isarmg/sentinel-monitor/current/native/bootstrap.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/bootstrap.sh
 ```
 
 `bootstrap.sh` 以 `create_new` 语义创建 0600 环境文件，绝不覆盖已有配置，也不会回显生成的 JWT、
@@ -45,34 +45,35 @@ Credential Key 或临时管理员密码。它不会启动服务。使用受保�
 
 ```bash
 sudoedit /etc/isarmg/sentinel-monitor/sentinel-monitor.env
-/opt/isarmg/sentinel-monitor/current/native/bootstrap.sh --confirm-config
-/opt/isarmg/sentinel-monitor/current/native/start.sh
-/opt/isarmg/sentinel-monitor/current/native/status.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/bootstrap.sh --confirm-config
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/start.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/status.sh
 ```
 
 停止顺序保持为应用（数据库/运行锁）在前、MediaMTX companion 锁在后：
 
 ```bash
-/opt/isarmg/sentinel-monitor/current/native/stop.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.0/native/stop.sh
 ```
 
-运维脚本必须从 `releases/0.2.0`（通常经 `current`）运行，并在每次启动/状态检查前验证完整
-`RELEASE-MANIFEST`。它们不从 Git checkout 读取应用、Web、MediaMTX 配置、lock 或秘密。
+运维脚本必须通过 `releases/0.2.0` 的绝对物理路径运行，任何 symlink alias 都会失败。每次
+bootstrap/start/status/stop 都调用发行树内真实二进制验证完整 `RELEASE-MANIFEST`；start 最终执行同一
+进程的 `serve-release`，因此验证不会与服务进程分离。它们不从 Git checkout 读取应用、Web、MediaMTX
+配置、lock 或秘密。
 本仓库不发布 systemd unit，也不依赖 systemd 的工作目录或环境注入；0.2.0 的唯一原生生命周期入口
 就是上述 release 内脚本。若主机另行编写 unit，它也只能调用这些绝对入口，不能重新定义运行路径。
 
 ## Web 构建契约
 
-`build.sh` 在独立暂存目录生成 Web，并把精确目录/文件集合、大小和 SHA-256 manifest 编译进 Rust
-二进制。`STATIC_DIR` 必须是版本目录中 Web 的绝对真实路径，不能经 symlink。服务在取得运行锁或打开
-SQLite 前重新遍历资源：拒绝缺失、增加、篡改、symlink、特殊文件、硬链接，以及生产模式下带任意
-写权限位的目录或文件。未由这套构建流程绑定静态 manifest 的普通 `cargo build` 二进制会 fail closed，
-不能启动 `serve`。
+`build.sh` 在独立暂存目录生成 Web，并把精确静态目录/文件集合、大小和 SHA-256 manifest 编译进 Rust
+二进制。完整 release manifest 还绑定源码 revision、构建 target、API/Schema/credential epochs、
+MediaMTX companion 与每个脚本/配置/二进制。`STATIC_DIR` 必须是版本目录中 Web 的绝对真实路径，不能
+经 symlink。正式二进制拒绝普通 `serve`；只有 revision 明确为 `unbound` 的开发构建可使用该命令。
 
 ## 测试覆盖
 
 `./native/lifecycle-test.sh` 只在 `mktemp` 根下运行，不修改 `/opt`、`/etc`、`/var` 或 `/run`。它覆盖
-发布幂等/冲突、原子 current、源码删除后的 bootstrap/start/status/stop、旧 `.env.native` 不导入、
+一次性 no-clobber 物理发布、alias 拒绝、源码删除后的 bootstrap/start/status/stop、旧 `.env.native` 不导入、
 秘密不回显、配置不覆盖、启动失败回滚、start/stop 串行化、中间/最终 symlink 和 release hardlink 拒绝。
 
 `./native/relocated-smoke-test.sh` 构建真实 Vite 资源和绑定该精确 manifest 的 Rust 二进制，将二者放到

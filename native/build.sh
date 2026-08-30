@@ -10,6 +10,7 @@ BUILD_TARGET="${SENTINEL_BUILD_TARGET:-/var/tmp/sentinel-monitor-build}"
 MEDIA_SOURCE="${SENTINEL_MEDIAMTX_SOURCE:-}"
 APP_SOURCE="${SENTINEL_APP_BINARY_SOURCE:-}"
 WEB_SOURCE="${SENTINEL_WEB_SOURCE:-}"
+SOURCE_REVISION="${SENTINEL_SOURCE_REVISION:-}"
 
 validate_absolute_path "$INSTALL_ROOT" "SENTINEL_NATIVE_INSTALL_ROOT"
 validate_absolute_path "$BUILD_TARGET" "SENTINEL_BUILD_TARGET"
@@ -36,6 +37,53 @@ require_command find
 require_command flock
 require_command sha256sum
 require_command sort
+
+is_source_revision() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+require_empty_release_destination() {
+  local entry
+  local -a entries
+  assert_no_symlink_components "$INSTALL_ROOT" "install root"
+  if [[ ! -e "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]]; then
+    return
+  fi
+  [[ -d "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]] ||
+    die "Install root must be a real directory"
+  entries=("$INSTALL_ROOT"/*)
+  for entry in "${entries[@]}"; do
+    [[ "$entry" == "$INSTALL_ROOT/releases" ]] ||
+      die "Install root contains an unexpected pre-existing entry"
+  done
+  if [[ -e "$INSTALL_ROOT/releases" || -L "$INSTALL_ROOT/releases" ]]; then
+    [[ -d "$INSTALL_ROOT/releases" && ! -L "$INSTALL_ROOT/releases" ]] ||
+      die "Releases destination must be a real directory"
+    entries=("$INSTALL_ROOT/releases"/*)
+    (( ${#entries[@]} == 0 )) ||
+      die "Releases destination is not empty; Sentinel 0.2.0 publication is one-shot"
+  fi
+}
+
+shopt -s nullglob dotglob
+require_empty_release_destination
+
+if [[ -n "$APP_SOURCE" || -n "$WEB_SOURCE" ]]; then
+  is_source_revision "$SOURCE_REVISION" ||
+    die "SENTINEL_SOURCE_REVISION must be a full lowercase commit in lifecycle tests"
+else
+  require_command git
+  [[ -d "$SOURCE_ROOT/.git" || -f "$SOURCE_ROOT/.git" ]] ||
+    die "Official publication requires a Git checkout"
+  [[ -z "$(git -C "$SOURCE_ROOT" status --porcelain=v1 --untracked-files=all)" ]] ||
+    die "Official publication requires a completely clean source tree"
+  SOURCE_REVISION="$(git -C "$SOURCE_ROOT" rev-parse --verify HEAD)"
+  is_source_revision "$SOURCE_REVISION" || die "Git HEAD is not a full lowercase commit"
+  [[ "$(git -C "$SOURCE_ROOT" cat-file -t "refs/tags/v$SENTINEL_VERSION" 2>/dev/null || true)" == "tag" ]] ||
+    die "Official publication requires annotated tag v$SENTINEL_VERSION"
+  [[ "$(git -C "$SOURCE_ROOT" rev-parse "refs/tags/v$SENTINEL_VERSION^{commit}")" == "$SOURCE_REVISION" ]] ||
+    die "Annotated tag v$SENTINEL_VERSION must identify HEAD"
+fi
 
 SOURCE_VERSION="$(awk '
   /^\[package\]$/ { package = 1; next }
@@ -69,14 +117,15 @@ EXPECTED_MEDIA_SHA256="$(manifest_value sha256)"
 ensure_directory "$BUILD_TARGET" 755 "build target"
 TEMPORARY="$(mktemp -d "$BUILD_TARGET/release-build.XXXXXX")"
 STAGE=""
-CURRENT_TEMP=""
+STAGE_CONTAINER=""
 cleanup() {
   if [[ -n "$STAGE" && -d "$STAGE" ]]; then
     chmod -R u+w -- "$STAGE" 2>/dev/null || true
     rm -rf -- "$STAGE"
   fi
-  if [[ -n "$CURRENT_TEMP" && -L "$CURRENT_TEMP" ]]; then
-    rm -- "$CURRENT_TEMP"
+  if [[ -n "$STAGE_CONTAINER" && -d "$STAGE_CONTAINER" && ! -L "$STAGE_CONTAINER" ]]; then
+    chmod -R u+w -- "$STAGE_CONTAINER" 2>/dev/null || true
+    rm -rf -- "$STAGE_CONTAINER"
   fi
   chmod -R u+w -- "$TEMPORARY" 2>/dev/null || true
   rm -rf -- "$TEMPORARY"
@@ -109,6 +158,7 @@ else
   require_command cargo
   CARGO_TARGET_DIR="$BUILD_TARGET/cargo" \
     SENTINEL_STATIC_MANIFEST_PATH="$STATIC_MANIFEST" \
+    SENTINEL_SOURCE_REVISION="$SOURCE_REVISION" \
     cargo build --locked --release --manifest-path "$SOURCE_ROOT/Cargo.toml"
   install -m 0755 -- "$BUILD_TARGET/cargo/release/sentinel-monitor" "$APP_STAGE"
 fi
@@ -116,11 +166,15 @@ fi
   die "Sentinel application binary version is not $SENTINEL_VERSION"
 [[ "$($APP_STAGE static-contract | tr -d '\r\n')" == "$STATIC_CONTRACT" ]] ||
   die "Sentinel binary is not bound to the staged Web asset contract"
+[[ "$($APP_STAGE release-manifest-header | awk -F= '$1 == "source_revision" { print $2 }')" == "$SOURCE_REVISION" ]] ||
+  die "Sentinel binary is not bound to the exact source revision"
 
+require_empty_release_destination
 ensure_directory "$INSTALL_ROOT" 755 "install root"
 RELEASES_ROOT="$INSTALL_ROOT/releases"
 ensure_directory "$RELEASES_ROOT" 755 "releases directory"
-STAGE="$(mktemp -d "$RELEASES_ROOT/.${SENTINEL_VERSION}.stage.XXXXXX")"
+STAGE_CONTAINER="$(mktemp -d "$RELEASES_ROOT/.${SENTINEL_VERSION}.stage.XXXXXX")"
+STAGE="$STAGE_CONTAINER/opt/isarmg/sentinel-monitor/releases/$SENTINEL_VERSION"
 mkdir -p -- "$STAGE/bin" "$STAGE/config" "$STAGE/native" "$STAGE/web"
 install -m 0555 -- "$APP_STAGE" "$STAGE/bin/sentinel-monitor"
 install -m 0555 -- "$MEDIA_SOURCE" "$STAGE/bin/mediamtx"
@@ -161,30 +215,25 @@ chmod 0555 -- "$STAGE"
 verify_release "$STAGE"
 
 RELEASE_ROOT="$RELEASES_ROOT/$SENTINEL_VERSION"
-if [[ -e "$RELEASE_ROOT" || -L "$RELEASE_ROOT" ]]; then
-  [[ ! -L "$RELEASE_ROOT" && -d "$RELEASE_ROOT" ]] ||
-    die "Existing release target is not a real directory: $RELEASE_ROOT"
-  verify_release "$RELEASE_ROOT"
-  if ! cmp -s -- "$STAGE/RELEASE-MANIFEST" "$RELEASE_ROOT/RELEASE-MANIFEST"; then
-    die "Release $SENTINEL_VERSION already exists with different content"
-  fi
-  chmod -R u+w -- "$STAGE"
-  rm -rf -- "$STAGE"
-  STAGE=""
-else
-  mv -T -- "$STAGE" "$RELEASE_ROOT"
-  STAGE=""
-fi
+[[ ! -e "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] ||
+  die "Release $SENTINEL_VERSION destination appeared during publication"
+# Open only the staging root mode for the rename boundary; every payload entry
+# remains read-only, and no runtime alias or service points at the destination.
+chmod 0755 -- "$STAGE"
+mv -T -n -- "$STAGE" "$RELEASE_ROOT"
+[[ ! -e "$STAGE" && ! -L "$STAGE" ]] ||
+  die "Release $SENTINEL_VERSION destination appeared concurrently"
+STAGE=""
+chmod 0555 -- "$RELEASE_ROOT"
+chmod -R u+w -- "$STAGE_CONTAINER" 2>/dev/null || true
+rm -rf -- "$STAGE_CONTAINER"
+STAGE_CONTAINER=""
+verify_release "$RELEASE_ROOT"
 
-CURRENT="$INSTALL_ROOT/current"
-if [[ -e "$CURRENT" && ! -L "$CURRENT" ]]; then
-  die "current must be absent or a managed symbolic link"
+if [[ -z "${SENTINEL_NATIVE_TEST_ROOT:-}" ]]; then
+  [[ -z "$(git -C "$SOURCE_ROOT" status --porcelain=v1 --untracked-files=all)" ]] ||
+    die "Official publication changed the source tree"
 fi
-CURRENT_TEMP="$INSTALL_ROOT/.current.${SENTINEL_VERSION}.$$"
-[[ ! -e "$CURRENT_TEMP" && ! -L "$CURRENT_TEMP" ]] || die "Temporary current link already exists"
-ln -s -- "releases/$SENTINEL_VERSION" "$CURRENT_TEMP"
-mv -Tf -- "$CURRENT_TEMP" "$CURRENT"
-CURRENT_TEMP=""
 
 echo "Published immutable Sentinel release: $RELEASE_ROOT"
-echo "Next: $CURRENT/native/bootstrap.sh"
+echo "Next: $RELEASE_ROOT/native/bootstrap.sh"

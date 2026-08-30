@@ -33,7 +33,7 @@ if [[ "$MODE" == "confirm" ]]; then
     assert_private_file "$SENTINEL_REVIEW_MARKER" "configuration review marker"
     rm -- "$SENTINEL_REVIEW_MARKER"
   fi
-  echo "Sentinel 0.2.0 configuration accepted. Start it with: $SENTINEL_INSTALL_ROOT/current/native/start.sh"
+  echo "Sentinel 0.2.0 configuration accepted. Start it with: $SENTINEL_RELEASE_ROOT/native/start.sh"
   exit 0
 fi
 
@@ -42,7 +42,7 @@ if [[ -e "$SENTINEL_ENV_FILE" || -L "$SENTINEL_ENV_FILE" ]]; then
   echo "Configuration already exists and was not changed: $SENTINEL_ENV_FILE"
   if [[ -e "$SENTINEL_REVIEW_MARKER" || -L "$SENTINEL_REVIEW_MARKER" ]]; then
     assert_private_file "$SENTINEL_REVIEW_MARKER" "configuration review marker"
-    echo "Review it, then run: $SENTINEL_INSTALL_ROOT/current/native/bootstrap.sh --confirm-config"
+    echo "Review it, then run: $SENTINEL_RELEASE_ROOT/native/bootstrap.sh --confirm-config"
   fi
   exit 0
 fi
@@ -124,4 +124,4 @@ unset JWT_SECRET CREDENTIAL_KEY ADMIN_PASSWORD
 echo "Created private configuration without printing its secrets: $SENTINEL_ENV_FILE"
 echo "Replace the generated administrator password and review every setting with a protected editor."
 echo "This script never imports .env.native or an older runtime layout."
-echo "Then run: $SENTINEL_INSTALL_ROOT/current/native/bootstrap.sh --confirm-config"
+echo "Then run: $SENTINEL_RELEASE_ROOT/native/bootstrap.sh --confirm-config"

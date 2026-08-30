@@ -10,6 +10,7 @@ mod models;
 mod onvif;
 mod protocol;
 mod reconciliation;
+mod release;
 mod routes;
 mod runtime_lock;
 mod sqlite;
@@ -59,11 +60,20 @@ struct Cli {
 enum Command {
     /// Serve the HTTP control plane (the default command).
     Serve,
+    /// Serve only after verifying this exact physical 0.2.0 release tree.
+    ServeRelease { release_root: PathBuf },
     /// Check database read/write, credential, storage, readiness and companion contracts.
     Doctor(DoctorArgs),
     /// Print the static asset contract embedded in this build.
     #[command(hide = true)]
     StaticContract,
+    /// Print the complete identity compiled into this binary.
+    ReleaseIdentity,
+    /// Verify a complete physical 0.2.0 release with its own binary.
+    VerifyRelease { release_root: PathBuf },
+    /// Print the canonical release-manifest identity header.
+    #[command(hide = true)]
+    ReleaseManifestHeader,
 }
 
 #[derive(Args)]
@@ -111,7 +121,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().command.unwrap_or(Command::Serve) {
-        Command::Serve => serve().await,
+        Command::Serve => {
+            release::ensure_unbound_development_serve()?;
+            serve(None).await
+        }
+        Command::ServeRelease { release_root } => {
+            release::verify_release(&release_root)?;
+            serve(Some(&release_root)).await
+        }
         Command::Doctor(args) => {
             let key = required_credentials_key()?;
             let report = doctor::run(&doctor::DoctorOptions {
@@ -133,6 +150,21 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", static_assets::embedded_contract_sha256()?);
             Ok(())
         }
+        Command::ReleaseIdentity => {
+            println!("{}", release::identity_json()?);
+            Ok(())
+        }
+        Command::VerifyRelease { release_root } => {
+            println!(
+                "{}",
+                serde_json::to_string(&release::verify_release(&release_root)?)?
+            );
+            Ok(())
+        }
+        Command::ReleaseManifestHeader => {
+            print!("{}", release::manifest_header()?);
+            Ok(())
+        }
     }
 }
 
@@ -148,9 +180,15 @@ fn required_credentials_key() -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("CREDENTIALS_KEY must decode to exactly 32 bytes"))
 }
 
-async fn serve() -> anyhow::Result<()> {
+async fn serve(release_root: Option<&std::path::Path>) -> anyhow::Result<()> {
     let config =
         Arc::new(Config::from_env().map_err(|error| anyhow::anyhow!("configuration: {error}"))?);
+    if let Some(root) = release_root {
+        anyhow::ensure!(
+            config.static_dir == root.join("web"),
+            "STATIC_DIR must equal the verified physical release Web directory"
+        );
+    }
     static_assets::validate(&config.static_dir, !config.development_mode)
         .map_err(|error| anyhow::anyhow!("static asset contract: {error:#}"))?;
     let application_lock =

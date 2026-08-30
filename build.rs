@@ -4,6 +4,21 @@ const UNBOUND_MANIFEST: &str = "format=sentinel-static-layout-v1\napplication=se
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SENTINEL_STATIC_MANIFEST_PATH");
+    println!("cargo:rerun-if-env-changed=SENTINEL_SOURCE_REVISION");
+
+    let target = env::var("TARGET").expect("Cargo must provide TARGET");
+    let source_revision =
+        env::var("SENTINEL_SOURCE_REVISION").unwrap_or_else(|_| "unbound".to_owned());
+    assert!(
+        source_revision == "unbound"
+            || (source_revision.len() == 40
+                && source_revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))),
+        "SENTINEL_SOURCE_REVISION must be unbound or a full lowercase 40-hex Git commit"
+    );
+    println!("cargo:rustc-env=SENTINEL_BUILD_TARGET={target}");
+    println!("cargo:rustc-env=SENTINEL_SOURCE_REVISION={source_revision}");
 
     let manifest = match env::var_os("SENTINEL_STATIC_MANIFEST_PATH") {
         Some(path) => {

@@ -6,6 +6,7 @@ SCRIPT_PATH="${BASH_SOURCE[0]}"
 source "$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)/common.sh"
 resolve_release_context "$SCRIPT_PATH"
 deployment_paths
+verify_release "$SENTINEL_RELEASE_ROOT"
 require_command flock
 acquire_native_operation_lock
 

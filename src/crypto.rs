@@ -7,13 +7,13 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
 const PRODUCT: &str = "sentinel-monitor";
 const APPLICATION_VERSION: &str = "0.2.0";
-const ENVELOPE_REVISION: u32 = 1;
+pub(crate) const CREDENTIAL_ENVELOPE_REVISION: u32 = 1;
 const KEY_ID: &str = "sentinel-credentials-0.2.0-key-1";
 const KEY_DERIVATION_SALT: &[u8] = b"sentinel-monitor/0.2.0/credential-envelope/key/v1";
 const KEY_DERIVATION_INFO: &[u8] = b"sentinel-credential-envelope/aes-256-gcm";
@@ -94,7 +94,7 @@ impl SecretBox {
         let envelope = CredentialEnvelope {
             product: PRODUCT.into(),
             application_version: APPLICATION_VERSION.into(),
-            envelope_revision: ENVELOPE_REVISION,
+            envelope_revision: CREDENTIAL_ENVELOPE_REVISION,
             key_id: KEY_ID.into(),
             nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
             ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
@@ -118,7 +118,7 @@ impl SecretBox {
         if canonical != encoded
             || envelope.product != PRODUCT
             || envelope.application_version != APPLICATION_VERSION
-            || envelope.envelope_revision != ENVELOPE_REVISION
+            || envelope.envelope_revision != CREDENTIAL_ENVELOPE_REVISION
             || envelope.key_id != KEY_ID
         {
             return Err(malformed_envelope());
@@ -156,7 +156,7 @@ fn decode_canonical_base64(encoded: &str) -> Result<Vec<u8>> {
 
 fn credential_aad(camera_id: Uuid, field: CredentialField) -> Vec<u8> {
     let camera_id = camera_id.hyphenated().to_string();
-    let revision = ENVELOPE_REVISION.to_string();
+    let revision = CREDENTIAL_ENVELOPE_REVISION.to_string();
     let mut aad = Vec::new();
     for value in [
         AAD_DOMAIN,
@@ -171,6 +171,15 @@ fn credential_aad(camera_id: Uuid, field: CredentialField) -> Vec<u8> {
         aad.extend_from_slice(value.as_bytes());
     }
     aad
+}
+
+pub(crate) fn credential_contract_sha256() -> String {
+    let contract = format!(
+        "format=sentinel-credential-envelope-contract-v1\nproduct={PRODUCT}\napplication_version={APPLICATION_VERSION}\nenvelope_revision={CREDENTIAL_ENVELOPE_REVISION}\nkey_id={KEY_ID}\nkey_derivation_salt={}\nkey_derivation_info={}\naad_domain={AAD_DOMAIN}\nfields=main_stream_url_enc,sub_stream_url_enc,username_enc,password_enc\nnonce_bytes=12\ntag_bytes=16\nmax_envelope_bytes={MAX_ENVELOPE_BYTES}\nmax_plaintext_bytes={MAX_PLAINTEXT_BYTES}\n",
+        String::from_utf8_lossy(KEY_DERIVATION_SALT),
+        String::from_utf8_lossy(KEY_DERIVATION_INFO),
+    );
+    format!("{:x}", Sha256::digest(contract.as_bytes()))
 }
 
 fn malformed_envelope() -> AppError {
@@ -214,7 +223,7 @@ mod tests {
         let envelope: CredentialEnvelope = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(envelope.product, PRODUCT);
         assert_eq!(envelope.application_version, APPLICATION_VERSION);
-        assert_eq!(envelope.envelope_revision, ENVELOPE_REVISION);
+        assert_eq!(envelope.envelope_revision, CREDENTIAL_ENVELOPE_REVISION);
         assert_eq!(envelope.key_id, KEY_ID);
         assert_eq!(serde_json::to_vec(&envelope).unwrap(), encoded);
         assert_eq!(

@@ -3,7 +3,6 @@
 readonly SENTINEL_PRODUCT="sentinel-monitor"
 readonly SENTINEL_VERSION="0.2.0"
 readonly SENTINEL_STATIC_FORMAT="sentinel-static-layout-v1"
-readonly SENTINEL_RELEASE_FORMAT="sentinel-release-v1"
 
 die() {
   echo "$*" >&2
@@ -143,13 +142,12 @@ write_release_manifest() {
   local root="$1"
   local output="$2"
   assert_directory "$root" "release staging directory"
+  assert_regular_file "$root/bin/sentinel-monitor" "release Sentinel binary"
   local temporary="${output}.tmp.$$"
   (
     umask 077
     {
-      echo "format=$SENTINEL_RELEASE_FORMAT"
-      echo "application=$SENTINEL_PRODUCT"
-      echo "application_version=$SENTINEL_VERSION"
+      "$root/bin/sentinel-monitor" release-manifest-header
       while IFS= read -r -d '' relative; do
         [[ "$relative" != "RELEASE-MANIFEST" ]] || continue
         portable_relative_path "$relative" || die "Release contains a non-portable path"
@@ -223,12 +221,20 @@ verify_release() {
     die "Release content does not match RELEASE-MANIFEST: $root"
   fi
   rm -f -- "$generated"
+  "$root/bin/sentinel-monitor" verify-release "$root" >/dev/null ||
+    die "Release binary rejected its physical tree: $root"
 }
 
 resolve_release_context() {
   local script_path="$1"
+  [[ "$script_path" == /* ]] || die "Operational scripts require their absolute physical path"
+  validate_absolute_path "$script_path" "operational script path"
   local script_directory
   script_directory="$(cd "$(dirname "$script_path")" && pwd -P)"
+  local physical_script
+  physical_script="$script_directory/$(basename "$script_path")"
+  [[ "$script_path" == "$physical_script" && ! -L "$script_path" ]] ||
+    die "Operational scripts must be invoked through their physical release path"
   SENTINEL_RELEASE_ROOT="$(cd "$script_directory/.." && pwd -P)"
   [[ "$(basename "$SENTINEL_RELEASE_ROOT")" == "$SENTINEL_VERSION" ]] ||
     die "Operational scripts must run from releases/$SENTINEL_VERSION"
@@ -237,6 +243,8 @@ resolve_release_context() {
   [[ "$(basename "$releases_root")" == "releases" ]] ||
     die "Operational scripts must run from an immutable releases directory"
   SENTINEL_INSTALL_ROOT="$(dirname "$releases_root")"
+  [[ "$SENTINEL_RELEASE_ROOT" == */opt/isarmg/sentinel-monitor/releases/0.2.0 ]] ||
+    die "Operational scripts must use the fixed Sentinel 0.2.0 physical release suffix"
   validate_absolute_path "$SENTINEL_INSTALL_ROOT" "install root"
   if [[ -n "${SENTINEL_NATIVE_INSTALL_ROOT:-}" ]]; then
     validate_absolute_path "$SENTINEL_NATIVE_INSTALL_ROOT" "SENTINEL_NATIVE_INSTALL_ROOT"

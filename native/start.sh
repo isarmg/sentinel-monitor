@@ -149,7 +149,8 @@ if [[ -z "$APP_PID" ]]; then
     assert_private_file "$APP_PID_FILE" "application PID file"
     rm -- "$APP_PID_FILE"
   fi
-  nohup "$APP_BIN" serve 9>&- >"$SENTINEL_STATE_DIR/logs/app.log" 2>&1 &
+  nohup "$APP_BIN" serve-release "$SENTINEL_RELEASE_ROOT" \
+    9>&- >"$SENTINEL_STATE_DIR/logs/app.log" 2>&1 &
   STARTED_APP="$!"
 fi
 

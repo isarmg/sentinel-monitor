@@ -23,7 +23,11 @@ enum ExpectedEntry {
 pub fn embedded_contract_sha256() -> Result<String> {
     parse_manifest(EMBEDDED_MANIFEST)
         .context("binary was not built with a valid static asset contract")?;
-    Ok(encode_hex(&Sha256::digest(EMBEDDED_MANIFEST.as_bytes())))
+    Ok(embedded_manifest_sha256())
+}
+
+pub(crate) fn embedded_manifest_sha256() -> String {
+    encode_hex(&Sha256::digest(EMBEDDED_MANIFEST.as_bytes()))
 }
 
 pub fn validate(static_dir: &Path, production: bool) -> Result<()> {
