@@ -51,6 +51,7 @@ cp .env.example .env.native
 DATABASE_URL=sqlite:///var/lib/isarmg/sentinel-monitor/db/app.db
 APP_JWT_SECRET=<至少32字符随机值>
 CREDENTIALS_KEY=<base64编码的32字节随机值>
+CREDENTIALS_KEY_ID=vault://sentinel/credentials-key/v1
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com
 BOOTSTRAP_ADMIN_PASSWORD=<初始管理员密码>
 APP_ENV=production
@@ -66,6 +67,11 @@ LOGIN_ARGON2_PARALLELISM=2
 LOGIN_ARGON2_TIMEOUT_MS=5000
 MEDIAMTX_API_URL=http://127.0.0.1:9997
 MEDIAMTX_PLAYBACK_URL=http://127.0.0.1:9996
+MEDIAMTX_CONFIG=/etc/sentinel-monitor/mediamtx.yml
+MEDIAMTX_CONTRACT=/etc/sentinel-monitor/mediamtx.lock
+MEDIAMTX_BINARY=/opt/sentinel-monitor/bin/mediamtx
+RECORDINGS_DIR=/var/lib/sentinel-monitor/recordings
+SENTINEL_RUNTIME_DIR=/run/sentinel-monitor
 PUBLIC_HLS_BASE_URL=/media-hls
 PUBLIC_WEBRTC_BASE_URL=/media-webrtc
 STATIC_DIR=web/dist
@@ -122,7 +128,43 @@ STATIC_DIR=web/dist
 
 ## 运维
 
-- 定期一致性备份 SQLite 数据库与录像目录，并实际演练恢复。
+Sentinel 的可恢复数据集是一个整包：SQLite Online Backup 一致快照、MediaMTX 配置与版本契约、
+录像文件及逐文件 SHA-256 清单，以及应用/schema/关键表记录数。Manifest 只保存非秘密
+`CREDENTIALS_KEY_ID`，不会保存 `CREDENTIALS_KEY`；主密钥必须在独立秘密管理系统中托管，否则
+摄像头凭据无法恢复。
+
+由于当前 MediaMTX 没有冻结录像文件集的快照 API，整包创建和恢复会 fail closed：必须先停止
+Sentinel 与 MediaMTX，并由 `native/start.sh` 的两个 `flock` 锁证明服务未运行。SQLite 即使处于
+WAL 模式仍始终使用 Online Backup API，不会裸拷主 `.db` 文件。
+
+```bash
+set -a
+source .env.native
+set +a
+
+./native/stop.sh
+
+"$SENTINEL_RUNTIME_DIR/bin/sentinel-monitor" backup create \
+  --output /srv/backups/sentinel-2026-08-29
+"$SENTINEL_RUNTIME_DIR/bin/sentinel-monitor" backup verify \
+  --input /srv/backups/sentinel-2026-08-29
+
+"$SENTINEL_RUNTIME_DIR/bin/sentinel-monitor" restore \
+  --input /srv/backups/sentinel-2026-08-29
+"$SENTINEL_RUNTIME_DIR/bin/sentinel-monitor" doctor --offline
+
+./native/start.sh
+"$SENTINEL_RUNTIME_DIR/bin/sentinel-monitor" doctor
+```
+
+`backup create` 以 `0700` 创建新目录且绝不覆盖；包内文件为 `0600`。`backup verify` 校验产品身份、
+Manifest、全部哈希和录像清单，再临时恢复数据库并运行 `integrity_check`、`foreign_key_check`、
+schema、关键表/index 与记录数检查。`restore` 只接受无符号链接、无路径逃逸的已验证包，先在各目标
+同目录构造并 fsync，取得数据库排他锁后逐项原子替换；任一步安装或安装后验证失败都会把旧数据库、
+MediaMTX 配置和录像目录一起回滚。成功后清除 SQLite WAL/SHM sidecar。`doctor` 还会执行可回滚的
+数据库写探针、录像目录读写探针、全量凭据解密检查、MediaMTX 二进制版本/SHA 契约检查；默认再检查
+两个 loopback readiness 端点，停机演练使用 `--offline`。
+
 - 将 `.env.native`、`auto.crt`、`auto.key` 放在主机秘密管理机制中，不要提交版本库。
 - 更换 `CREDENTIALS_KEY` 前先迁移已加密字段。
 - 摄像头放在独立 VLAN；MediaMTX 的 9996、9997、9998 端口不应暴露到互联网。

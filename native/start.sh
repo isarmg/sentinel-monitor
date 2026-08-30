@@ -24,6 +24,10 @@ if [[ ! -r "$MEDIA_LOCK" ]]; then
   echo "Missing MediaMTX companion lock: $MEDIA_LOCK" >&2
   exit 1
 fi
+if ! command -v flock >/dev/null 2>&1; then
+  echo "Missing required flock utility" >&2
+  exit 1
+fi
 
 locked_value() {
   awk -F= -v key="$1" '$1 == key { print $2 }' "$MEDIA_LOCK"
@@ -52,7 +56,10 @@ source "$ENV_FILE"
 set +a
 export STATIC_DIR="$ROOT_DIR/web/dist"
 
+umask 077
 mkdir -p "$RUNTIME_DIR/data" "$RUNTIME_DIR/logs" "$RUNTIME_DIR/recordings"
+touch "$RUNTIME_DIR/app.lock" "$RUNTIME_DIR/mediamtx.lock"
+chmod 600 "$RUNTIME_DIR/app.lock" "$RUNTIME_DIR/mediamtx.lock"
 WSL_ADDRESS="$(hostname -I | awk '{print $1}')"
 MEDIA_HOSTS="${MEDIA_PUBLIC_HOSTS:-$WSL_ADDRESS}"
 
@@ -62,7 +69,10 @@ is_running() {
 }
 
 if ! is_running "$RUNTIME_DIR/mediamtx.pid"; then
-  nohup env MTX_WEBRTCADDITIONALHOSTS="$MEDIA_HOSTS" \
+  # --no-fork execs MediaMTX in this PID while retaining flock's descriptor,
+  # so the lock is held for the companion's complete lifetime.
+  nohup flock --no-fork --nonblock "$RUNTIME_DIR/mediamtx.lock" \
+    env MTX_WEBRTCADDITIONALHOSTS="$MEDIA_HOSTS" \
     "$MEDIA_BIN" "$ROOT_DIR/native/mediamtx.yml" \
     >"$RUNTIME_DIR/logs/mediamtx.log" 2>&1 &
   echo $! >"$RUNTIME_DIR/mediamtx.pid"
@@ -77,7 +87,9 @@ done
 
 if ! is_running "$RUNTIME_DIR/app.pid"; then
   cd "$ROOT_DIR"
-  nohup "$APP_BIN" >"$RUNTIME_DIR/logs/app.log" 2>&1 &
+  # The inherited lock descriptor remains open after flock execs the Rust app.
+  nohup flock --no-fork --nonblock "$RUNTIME_DIR/app.lock" \
+    "$APP_BIN" >"$RUNTIME_DIR/logs/app.log" 2>&1 &
   echo $! >"$RUNTIME_DIR/app.pid"
 fi
 

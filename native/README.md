@@ -42,9 +42,15 @@ platform=linux_amd64
 sha256=25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336
 ```
 
-SQLite 数据库和录像目录共同构成可恢复数据集。备份前应暂停 Sentinel 与 MediaMTX，完成 SQLite
-checkpoint，并同时复制 `data/sentinel.sqlite3` 和 `recordings/`；恢复演练必须验证数据库外键、
-录像可读性以及启动后的期望态/实际态对账。
+SQLite 数据库、MediaMTX 配置/版本契约和录像目录共同构成可恢复数据集。不要手工复制 WAL 数据库
+主文件，也不要把仅有录像清单的目录称为完整备份。`sentinel-monitor backup create` 使用 SQLite
+Online Backup API，并把录像文件本体、逐文件哈希与非秘密凭据 key ID 写入同一个不覆盖的整包。
+
+当前 MediaMTX 没有冻结录像目录的快照 API，所以创建与恢复整包前必须运行 `./native/stop.sh`。
+`native/start.sh` 通过 `$SENTINEL_RUNTIME_DIR/app.lock` 和 `mediamtx.lock` 持有全生命周期排他锁，
+具体使用 `flock --no-fork` 在同一 PID 中 exec 服务并保留锁文件描述符，不是启动脚本的一次性锁。
+运维命令同时校验锁与 PID 并在服务未完全停止时拒绝继续。完整命令和恢复/Doctor 流程见项目
+[`README.md`](../README.md) 的“运维”章节。
 
 服务日志：
 
