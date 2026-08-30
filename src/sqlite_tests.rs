@@ -297,7 +297,7 @@ impl TestContext {
             request_timeout: Duration::from_millis(100),
             onvif_discovery_timeout: Duration::from_millis(100),
             onvif_xaddr_allowlist: Vec::new(),
-            static_dir: PathBuf::from("web/dist"),
+            static_dir: std::env::temp_dir().join("sentinel-monitor-test-web"),
         });
         let http = reqwest::Client::builder()
             .timeout(config.request_timeout)

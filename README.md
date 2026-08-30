@@ -19,33 +19,38 @@ IP Camera (RTSP / ONVIF)
 
 ## 物理机部署
 
-准备受控版本的 MediaMTX、Caddy，以及本项目原生脚本。可参考
+Sentinel 0.2.0 使用不可变版本目录，不支持旧 `.env.native` 或旧 runtime 就地迁移。准备与
+[`native/mediamtx.lock`](native/mediamtx.lock) 匹配的 MediaMTX `linux_amd64` 二进制，然后发布：
+
+```bash
+export SENTINEL_MEDIAMTX_SOURCE=/absolute/path/to/mediamtx
+./native/build.sh
+
+/opt/isarmg/sentinel-monitor/current/native/bootstrap.sh
+sudoedit /etc/isarmg/sentinel-monitor/sentinel-monitor.env
+/opt/isarmg/sentinel-monitor/current/native/bootstrap.sh --confirm-config
+/opt/isarmg/sentinel-monitor/current/native/start.sh
+/opt/isarmg/sentinel-monitor/current/native/status.sh
+```
+
+`bootstrap.sh` 不启动服务、不覆盖现有环境文件，也不回显随机初始秘密。停止服务使用发行目录中的入口：
+
+```bash
+/opt/isarmg/sentinel-monitor/current/native/stop.sh
+```
+
+默认布局为 `/opt/isarmg/sentinel-monitor/releases/0.2.0`、原子 `current` symlink、
+`/etc/isarmg/sentinel-monitor` 配置、`/var/lib/isarmg/sentinel-monitor` 数据和
+`/run/isarmg/sentinel-monitor` 运行锁。`start.sh` 与 `stop.sh` 还共享一个短期 `operations.lock`，防止并发
+启动器竞争 PID 文件；它不会被长寿命子进程继承。完整流程和权限边界见
 [`native/README.md`](native/README.md)。
 
-简要步骤：
-
-```bash
-cd /mnt/sarmg.org/sentinel-monitor
-cp .env.example .env.native
-# 编辑 .env.native 中的数据库、JWT、管理员密码和媒体地址
-./native/bootstrap.sh
-./native/build.sh
-./native/start.sh
-./native/status.sh
-```
-
-停止：
-
-```bash
-./native/stop.sh
-```
-
-浏览器入口为 `http://127.0.0.1:8080`。WHEP 使用 `8889/TCP`，HLS 使用 `8888/TCP`，WebRTC
-媒体使用 `8189/UDP`。
+仓库不发布 systemd unit，也不依赖 systemd 的相对工作目录或环境注入；原生部署只有 release 内上述
+脚本这一套生命周期合同。
 
 ## 环境变量
 
-复制 `.env.example` 为本机私有文件，并按需设置：
+`.env.example` 只作字段参考。实际 0600 文件由已安装的 bootstrap 在源码树之外创建，核心路径必须是：
 
 ```dotenv
 DATABASE_URL=sqlite:///var/lib/isarmg/sentinel-monitor/db/app.db
@@ -66,16 +71,20 @@ LOGIN_ARGON2_PARALLELISM=2
 LOGIN_ARGON2_TIMEOUT_MS=5000
 MEDIAMTX_API_URL=http://127.0.0.1:9997
 MEDIAMTX_PLAYBACK_URL=http://127.0.0.1:9996
-MEDIAMTX_CONFIG=/etc/sentinel-monitor/mediamtx.yml
-MEDIAMTX_CONTRACT=/etc/sentinel-monitor/mediamtx.lock
-MEDIAMTX_BINARY=/opt/sentinel-monitor/bin/mediamtx
-RECORDINGS_DIR=/var/lib/sentinel-monitor/recordings
-SENTINEL_RUNTIME_DIR=/run/sentinel-monitor
+MEDIAMTX_CONFIG=/opt/isarmg/sentinel-monitor/releases/0.2.0/config/mediamtx.yml
+MEDIAMTX_CONTRACT=/opt/isarmg/sentinel-monitor/releases/0.2.0/config/mediamtx.lock
+MEDIAMTX_BINARY=/opt/isarmg/sentinel-monitor/releases/0.2.0/bin/mediamtx
+RECORDINGS_DIR=/var/lib/isarmg/sentinel-monitor/recordings
+SENTINEL_RUNTIME_DIR=/run/isarmg/sentinel-monitor
 REQUEST_TIMEOUT_SECS=20
 PUBLIC_HLS_BASE_URL=/media-hls
 PUBLIC_WEBRTC_BASE_URL=/media-webrtc
-STATIC_DIR=web/dist
+STATIC_DIR=/opt/isarmg/sentinel-monitor/releases/0.2.0/web
 ```
+
+`STATIC_DIR` 没有默认值，必须是绝对、逐组件无 symlink 的版本路径。构建时的精确 Web 文件集合、大小和
+SHA-256 已嵌入二进制；服务在任何数据库访问前拒绝缺失、增加、篡改、特殊文件、硬链接，以及生产模式
+下仍带写权限的资源。普通未绑定静态 manifest 的开发二进制不能启动 `serve`。
 
 生产模式始终使用 `__Host-sentinel_session` Secure/HttpOnly/SameSite Cookie。仅本机开发可设置 `APP_ENV=development`，且服务会拒绝绑定非 loopback 地址。
 登录入口同时按连接来源和规范化账户名执行有界 Token Bucket 限流；Argon2 并发与超时参数应按主机内存和 CPU 预算调整。
@@ -125,9 +134,10 @@ maintenance 排他锁，再取得 runtime/MediaMTX 锁，避免跨身份锁顺�
 ## MediaMTX Companion 契约
 
 原生部署固定使用 `linux_amd64` MediaMTX `v1.20.0`，其二进制 SHA-256 记录在
-[`native/mediamtx.lock`](native/mediamtx.lock)。`native/start.sh` 会同时校验平台、版本和摘要，
-任一不匹配都会拒绝启动。升级 MediaMTX 时必须在独立变更中更新二进制、锁文件、两份配置模板，
-并重跑协调器 fake-process 回归测试；不要使用浮动 `latest`。
+[`native/mediamtx.lock`](native/mediamtx.lock)。构建发布和已安装的 `start.sh` 都会同时校验平台、版本
+和摘要；二进制、配置与 lock 均来自同一只读 release。任一不匹配都会拒绝启动。升级 MediaMTX 时必须
+在独立变更中更新二进制、lock 与配置，并重跑协调器 fake-process 和 native lifecycle 回归测试；不要
+使用浮动 `latest`。
 
 ## 角色权限
 
@@ -161,25 +171,26 @@ big-endian 字节长度，再馈入原字节，最终输出小写 SHA-256。启�
 ## 运维
 
 Sentinel 进程全生命周期持有数据库 instance/shared-maintenance 锁和 runtime `app.lock`，MediaMTX
-由 `native/start.sh` 的 `flock --no-fork` 持有 `mediamtx.lock`。外部升级工具必须在服务停止后，按
+由已安装 release 中 `start.sh` 的 `flock --no-fork` 持有 `mediamtx.lock`。外部升级工具必须在服务停止后，按
 数据库 maintenance、runtime、MediaMTX 的固定顺序取得排他锁；产品仓库不提供改变历史数据代际的
 命令。
 
 ```bash
 set -a
-source .env.native
+source /etc/isarmg/sentinel-monitor/sentinel-monitor.env
 set +a
 
-"$SENTINEL_RUNTIME_DIR/bin/sentinel-monitor" doctor --offline
+"/opt/isarmg/sentinel-monitor/current/bin/sentinel-monitor" doctor --offline
 
-./native/start.sh
-"$SENTINEL_RUNTIME_DIR/bin/sentinel-monitor" doctor
+/opt/isarmg/sentinel-monitor/current/native/start.sh
+"/opt/isarmg/sentinel-monitor/current/bin/sentinel-monitor" doctor
 ```
 
 `doctor` 执行 current-schema 元数据与现场指纹比对、`integrity_check`、`foreign_key_check`、可回滚
 数据库写探针、录像目录读写探针、全量凭据解密检查及 MediaMTX 二进制版本/SHA/配置契约检查；默认
 再检查两个 loopback readiness 端点，停机检查使用 `--offline`。
 
-- 将 `.env.native`、`auto.crt`、`auto.key` 放在主机秘密管理机制中，不要提交版本库。
+- 将 `/etc/isarmg/sentinel-monitor/sentinel-monitor.env`、证书与私钥放在主机秘密管理机制中；部署脚本
+  不会向源码树写入这些内容。
 - `CREDENTIALS_KEY` 必须由主机秘密管理机制托管；任何数据代际变更都交给独立升级工具。
 - 摄像头放在独立 VLAN；MediaMTX 的 9996、9997、9998 端口不应暴露到互联网。

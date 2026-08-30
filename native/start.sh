@@ -1,104 +1,174 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_DIR="${SENTINEL_RUNTIME_DIR:-/mnt/c/Users/micro/sentinel-runtime}"
-ENV_FILE="$ROOT_DIR/.env.native"
-MEDIA_BIN="$RUNTIME_DIR/bin/mediamtx"
-APP_BIN="$RUNTIME_DIR/bin/sentinel-monitor"
-MEDIA_LOCK="$ROOT_DIR/native/mediamtx.lock"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)/common.sh"
+resolve_release_context "$SCRIPT_PATH"
+deployment_paths
+verify_release "$SENTINEL_RELEASE_ROOT"
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Missing $ENV_FILE" >&2
-  exit 1
-fi
-if [[ ! -x "$MEDIA_BIN" ]]; then
-  echo "Missing MediaMTX binary: $MEDIA_BIN" >&2
-  exit 1
-fi
-if [[ ! -x "$APP_BIN" ]]; then
-  echo "Missing Rust application: $APP_BIN" >&2
-  exit 1
-fi
-if [[ ! -r "$MEDIA_LOCK" ]]; then
-  echo "Missing MediaMTX companion lock: $MEDIA_LOCK" >&2
-  exit 1
-fi
-if ! command -v flock >/dev/null 2>&1; then
-  echo "Missing required flock utility" >&2
-  exit 1
-fi
+[[ ! -e "$SENTINEL_REVIEW_MARKER" && ! -L "$SENTINEL_REVIEW_MARKER" ]] ||
+  die "Configuration has not been confirmed; run bootstrap.sh --confirm-config"
+load_deployment_env
+require_runtime_contract
+assert_private_directory "$SENTINEL_STATE_DIR" "state directory"
+assert_private_directory "$SENTINEL_STATE_DIR/db" "database directory"
+assert_private_directory "$RECORDINGS_DIR" "recordings directory"
+assert_private_directory "$SENTINEL_STATE_DIR/logs" "log directory"
+assert_private_directory "$SENTINEL_RUNTIME_PATH" "runtime directory"
+assert_regular_file "$MEDIAMTX_BINARY" "MediaMTX binary"
+assert_regular_file "$MEDIAMTX_CONFIG" "MediaMTX configuration"
+assert_regular_file "$MEDIAMTX_CONTRACT" "MediaMTX contract"
+assert_regular_file "$SENTINEL_RELEASE_ROOT/bin/sentinel-monitor" "Sentinel binary"
+require_command curl
+require_command flock
+umask 077
+acquire_native_operation_lock
 
 locked_value() {
-  awk -F= -v key="$1" '$1 == key { print $2 }' "$MEDIA_LOCK"
+  awk -F= -v key="$1" '$1 == key { print $2 }' "$MEDIAMTX_CONTRACT"
 }
 
 EXPECTED_MEDIA_VERSION="$(locked_value version)"
 EXPECTED_MEDIA_PLATFORM="$(locked_value platform)"
 EXPECTED_MEDIA_SHA256="$(locked_value sha256)"
-ACTUAL_MEDIA_VERSION="$("$MEDIA_BIN" --version | tr -d '\r\n')"
-ACTUAL_MEDIA_SHA256="$(sha256sum "$MEDIA_BIN" | awk '{print $1}')"
-if [[ "$EXPECTED_MEDIA_PLATFORM" != "linux_amd64" ]]; then
-  echo "Unsupported MediaMTX companion platform: $EXPECTED_MEDIA_PLATFORM" >&2
-  exit 1
-fi
-if [[ "$ACTUAL_MEDIA_VERSION" != "$EXPECTED_MEDIA_VERSION" ]]; then
-  echo "MediaMTX version mismatch: expected $EXPECTED_MEDIA_VERSION, got $ACTUAL_MEDIA_VERSION" >&2
-  exit 1
-fi
-if [[ "$ACTUAL_MEDIA_SHA256" != "$EXPECTED_MEDIA_SHA256" ]]; then
-  echo "MediaMTX SHA-256 mismatch; refusing to start an unapproved companion" >&2
-  exit 1
-fi
+ACTUAL_MEDIA_VERSION="$($MEDIAMTX_BINARY --version | tr -d '\r\n')"
+ACTUAL_MEDIA_SHA256="$(sha256sum -- "$MEDIAMTX_BINARY" | awk '{print $1}')"
+[[ "$EXPECTED_MEDIA_PLATFORM" == "linux_amd64" ]] ||
+  die "Unsupported MediaMTX companion platform: $EXPECTED_MEDIA_PLATFORM"
+[[ "$ACTUAL_MEDIA_VERSION" == "$EXPECTED_MEDIA_VERSION" ]] ||
+  die "MediaMTX version mismatch"
+[[ "$ACTUAL_MEDIA_SHA256" == "$EXPECTED_MEDIA_SHA256" ]] ||
+  die "MediaMTX SHA-256 mismatch; refusing to start an unapproved companion"
 
-set -a
-source "$ENV_FILE"
-set +a
-export STATIC_DIR="$ROOT_DIR/web/dist"
+APP_BIN="$SENTINEL_RELEASE_ROOT/bin/sentinel-monitor"
+MEDIA_LOCK="$SENTINEL_RUNTIME_PATH/mediamtx.lock"
+MEDIA_PID_FILE="$SENTINEL_RUNTIME_PATH/mediamtx.pid"
+APP_PID_FILE="$SENTINEL_RUNTIME_PATH/app.pid"
+ensure_lock_file "$SENTINEL_RUNTIME_PATH/app.lock" "application runtime lock"
+ensure_lock_file "$MEDIA_LOCK" "MediaMTX runtime lock"
 
-umask 077
-mkdir -p "$RUNTIME_DIR/data" "$RUNTIME_DIR/logs" "$RUNTIME_DIR/recordings"
-touch "$RUNTIME_DIR/app.lock" "$RUNTIME_DIR/mediamtx.lock"
-chmod 600 "$RUNTIME_DIR/app.lock" "$RUNTIME_DIR/mediamtx.lock"
-WSL_ADDRESS="$(hostname -I | awk '{print $1}')"
-MEDIA_HOSTS="${MEDIA_PUBLIC_HOSTS:-$WSL_ADDRESS}"
-
-is_running() {
-  local pid_file="$1"
-  [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null
+APP_PID="$(read_running_pid "$APP_PID_FILE" "$APP_BIN" || true)"
+MEDIA_PID="$(read_running_pid "$MEDIA_PID_FILE" "$MEDIAMTX_BINARY" || true)"
+STARTED_APP=""
+STARTED_MEDIA=""
+START_COMPLETE=false
+remove_matching_pid_file() {
+  local path="$1"
+  local pid="$2"
+  if [[ -f "$path" && ! -L "$path" ]] && [[ "$(<"$path")" == "$pid" ]]; then
+    rm -- "$path"
+  fi
 }
 
-if ! is_running "$RUNTIME_DIR/mediamtx.pid"; then
-  # --no-fork execs MediaMTX in this PID while retaining flock's descriptor,
-  # so the lock is held for the companion's complete lifetime.
-  nohup flock --no-fork --nonblock "$RUNTIME_DIR/mediamtx.lock" \
+rollback_start() {
+  if [[ -n "$STARTED_APP" ]]; then
+    terminate_started_process "$STARTED_APP"
+    remove_matching_pid_file "$APP_PID_FILE" "$STARTED_APP"
+  fi
+  if [[ -n "$STARTED_MEDIA" ]]; then
+    terminate_started_process "$STARTED_MEDIA"
+    remove_matching_pid_file "$MEDIA_PID_FILE" "$STARTED_MEDIA"
+  fi
+}
+
+terminate_started_process() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..40}; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+cleanup_failed_start() {
+  local status="$?"
+  trap - EXIT
+  if [[ "$START_COMPLETE" != true ]]; then
+    rollback_start
+  fi
+  exit "$status"
+}
+trap cleanup_failed_start EXIT
+
+wait_for_pid_identity() {
+  local path="$1"
+  local binary="$2"
+  local expected_pid="$3"
+  local actual_pid
+  for _ in {1..20}; do
+    kill -0 "$expected_pid" 2>/dev/null || return 1
+    actual_pid="$(read_running_pid "$path" "$binary" || true)"
+    [[ "$actual_pid" == "$expected_pid" ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# Neither long-lived process inherits the operator's checkout or working
+# directory. Every runtime input below is an absolute release/state path.
+cd /
+
+if [[ -z "$MEDIA_PID" ]]; then
+  if [[ -e "$MEDIA_PID_FILE" || -L "$MEDIA_PID_FILE" ]]; then
+    assert_private_file "$MEDIA_PID_FILE" "MediaMTX PID file"
+    rm -- "$MEDIA_PID_FILE"
+  fi
+  MEDIA_HOSTS="${MEDIA_PUBLIC_HOSTS:-127.0.0.1}"
+  nohup flock --no-fork --nonblock "$MEDIA_LOCK" \
     env MTX_WEBRTCADDITIONALHOSTS="$MEDIA_HOSTS" \
-    "$MEDIA_BIN" "$ROOT_DIR/native/mediamtx.yml" \
-    >"$RUNTIME_DIR/logs/mediamtx.log" 2>&1 &
-  echo $! >"$RUNTIME_DIR/mediamtx.pid"
+    MTX_PATHDEFAULTS_RECORDPATH="$RECORDINGS_DIR/%path/%Y-%m-%d_%H-%M-%S-%f" \
+    MTX_PATHDEFAULTS_RECORDDELETEAFTER="${RECORD_DELETE_AFTER:-168h}" \
+    "$MEDIAMTX_BINARY" "$MEDIAMTX_CONFIG" \
+    9>&- >"$SENTINEL_STATE_DIR/logs/mediamtx.log" 2>&1 &
+  STARTED_MEDIA="$!"
+  write_pid_file "$MEDIA_PID_FILE" "$STARTED_MEDIA"
 fi
 
+MEDIA_READY=false
 for _ in {1..30}; do
-  if curl -fsS http://127.0.0.1:9997/v3/info >/dev/null; then
+  if curl -fsS "${MEDIAMTX_READY_URL:-http://127.0.0.1:9997/v3/info}" >/dev/null; then
+    MEDIA_READY=true
     break
   fi
   sleep 0.25
 done
-
-if ! is_running "$RUNTIME_DIR/app.pid"; then
-  cd "$ROOT_DIR"
-  # The Rust process owns app.lock and app.pid itself for its full lifetime.
-  nohup "$APP_BIN" >"$RUNTIME_DIR/logs/app.log" 2>&1 &
+[[ "$MEDIA_READY" == true ]] || die "MediaMTX did not become ready"
+if [[ -n "$STARTED_MEDIA" ]]; then
+  wait_for_pid_identity "$MEDIA_PID_FILE" "$MEDIAMTX_BINARY" "$STARTED_MEDIA" ||
+    die "MediaMTX did not retain its expected PID identity"
 fi
 
+if [[ -z "$APP_PID" ]]; then
+  if [[ -e "$APP_PID_FILE" || -L "$APP_PID_FILE" ]]; then
+    assert_private_file "$APP_PID_FILE" "application PID file"
+    rm -- "$APP_PID_FILE"
+  fi
+  nohup "$APP_BIN" serve 9>&- >"$SENTINEL_STATE_DIR/logs/app.log" 2>&1 &
+  STARTED_APP="$!"
+fi
+
+APP_READY=false
 for _ in {1..60}; do
-  if curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; then
-    echo "Sentinel Monitor is ready at http://127.0.0.1:8080"
-    echo "WSL media candidate address: $MEDIA_HOSTS"
-    exit 0
+  if curl -fsS "${SENTINEL_READY_URL:-http://127.0.0.1:8080/health/ready}" >/dev/null; then
+    APP_READY=true
+    break
   fi
   sleep 0.25
 done
+[[ "$APP_READY" == true ]] || die "Sentinel application did not become ready"
+if [[ -n "$STARTED_APP" ]]; then
+  wait_for_pid_identity "$APP_PID_FILE" "$APP_BIN" "$STARTED_APP" ||
+    die "Sentinel application did not retain its expected PID identity"
+fi
+START_COMPLETE=true
+trap - EXIT
+STARTED_APP=""
+STARTED_MEDIA=""
 
-echo "Startup did not become ready; inspect $RUNTIME_DIR/logs/app.log" >&2
-exit 1
+echo "Sentinel Monitor 0.2.0 is ready at ${SENTINEL_READY_URL:-http://127.0.0.1:8080/health/ready}"

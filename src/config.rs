@@ -115,8 +115,17 @@ impl Config {
                 3000,
             )?),
             onvif_xaddr_allowlist: parse_cidr_list("ONVIF_XADDR_ALLOWLIST")?,
-            static_dir: PathBuf::from(value("STATIC_DIR", "web/dist")),
+            static_dir: absolute_path("STATIC_DIR", required("STATIC_DIR")?)?,
         })
+    }
+}
+
+fn absolute_path(name: &str, value: String) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(format!("{name} must be an absolute path"))
     }
 }
 
@@ -209,5 +218,17 @@ mod tests {
         assert!(validate_development_bind("0.0.0.0:8080".parse().unwrap(), true).is_err());
         assert!(validate_development_bind("192.168.1.10:8080".parse().unwrap(), true).is_err());
         assert!(validate_development_bind("0.0.0.0:8080".parse().unwrap(), false).is_ok());
+    }
+
+    #[test]
+    fn runtime_paths_are_absolute() {
+        assert_eq!(
+            absolute_path("STATIC_DIR", "/opt/sentinel/web".into()).unwrap(),
+            PathBuf::from("/opt/sentinel/web")
+        );
+        assert_eq!(
+            absolute_path("STATIC_DIR", "web/dist".into()).unwrap_err(),
+            "STATIC_DIR must be an absolute path"
+        );
     }
 }

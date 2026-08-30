@@ -12,6 +12,7 @@ mod reconciliation;
 mod routes;
 mod runtime_lock;
 mod sqlite;
+mod static_assets;
 
 #[cfg(test)]
 mod sqlite_tests;
@@ -59,6 +60,9 @@ enum Command {
     Serve,
     /// Check database read/write, credential, storage, readiness and companion contracts.
     Doctor(DoctorArgs),
+    /// Print the static asset contract embedded in this build.
+    #[command(hide = true)]
+    StaticContract,
 }
 
 #[derive(Args)]
@@ -98,7 +102,6 @@ struct MediaPaths {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -125,6 +128,10 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
+        Command::StaticContract => {
+            println!("{}", static_assets::embedded_contract_sha256()?);
+            Ok(())
+        }
     }
 }
 
@@ -143,6 +150,8 @@ fn required_credentials_key() -> anyhow::Result<[u8; 32]> {
 async fn serve() -> anyhow::Result<()> {
     let config =
         Arc::new(Config::from_env().map_err(|error| anyhow::anyhow!("configuration: {error}"))?);
+    static_assets::validate(&config.static_dir, !config.development_mode)
+        .map_err(|error| anyhow::anyhow!("static asset contract: {error:#}"))?;
     let application_lock =
         runtime_lock::ApplicationLock::acquire(&config.database_url, &config.runtime_directory)?;
     if config.development_mode {

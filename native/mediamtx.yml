@@ -35,11 +35,12 @@ pathDefaults:
   sourceOnDemandStartTimeout: 15s
   sourceOnDemandCloseAfter: 15s
   recordFormat: fmp4
-  recordPath: /mnt/c/Users/micro/sentinel-runtime/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  # start.sh supplies the absolute state path through
+  # MTX_PATHDEFAULTS_RECORDPATH; this inert default never points at a checkout.
+  recordPath: /var/lib/isarmg/sentinel-monitor/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
   recordPartDuration: 1s
   recordMaxPartSize: 100M
   recordSegmentDuration: 15m
   recordDeleteAfter: 168h
 
 paths: {}
-
