@@ -215,12 +215,18 @@ pub async fn bootstrap_admin(state: &AppState) -> Result<()> {
         })?;
     let hash = hash_password(password)?;
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, 'admin')")
-        .bind(id)
-        .bind(&state.config.bootstrap_admin_email)
-        .bind(hash)
-        .execute(&state.pool)
-        .await?;
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
+         VALUES (?, ?, ?, 'admin', 1, ?, ?)",
+    )
+    .bind(id)
+    .bind(&state.config.bootstrap_admin_email)
+    .bind(hash)
+    .bind(now)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
     tracing::info!(email = %state.config.bootstrap_admin_email, "bootstrap administrator created");
     Ok(())
 }

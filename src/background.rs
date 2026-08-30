@@ -92,9 +92,10 @@ pub async fn emit_event(
     message: &str,
     details: Value,
 ) -> Result<EventRecord> {
+    let now = chrono::Utc::now();
     let event = sqlx::query_as::<_, EventRecord>(
-        "INSERT INTO events (id, camera_id, kind, severity, message, details) \
-         VALUES (?, ?, ?, ?, ?, ?) \
+        "INSERT INTO events (id, camera_id, kind, severity, message, details, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
          RETURNING id, camera_id, kind, severity, message, details, acknowledged_at, acknowledged_by, created_at",
     )
     .bind(Uuid::new_v4())
@@ -103,6 +104,7 @@ pub async fn emit_event(
     .bind(severity)
     .bind(message)
     .bind(details)
+    .bind(now)
     .fetch_one(&state.pool)
     .await?;
     let _ = state.events.send(event.clone());

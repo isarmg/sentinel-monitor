@@ -8,6 +8,9 @@ mod models;
 mod onvif;
 mod routes;
 
+#[cfg(test)]
+mod sqlite_tests;
+
 use config::Config;
 use crypto::SecretBox;
 use mediamtx::MediaMtxClient;

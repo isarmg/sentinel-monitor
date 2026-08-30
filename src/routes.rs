@@ -138,14 +138,18 @@ async fn create_user(
     user.require_admin()?;
     validate_role(&request.role)?;
     validate_email(&request.email)?;
+    let now = Utc::now();
     let record = sqlx::query_as::<_, UserRecord>(
-        "INSERT INTO users (id, email, password_hash, role) VALUES (?, LOWER(?), ?, ?) \
+        "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
+         VALUES (?, LOWER(?), ?, ?, 1, ?, ?) \
          RETURNING id, email, password_hash, role, active, last_login_at, created_at, updated_at",
     )
     .bind(Uuid::new_v4())
     .bind(request.email.trim())
     .bind(hash_password(&request.password)?)
     .bind(&request.role)
+    .bind(now)
+    .bind(now)
     .fetch_one(&state.pool)
     .await
     .map_err(map_unique_email)?;
@@ -255,9 +259,10 @@ async fn create_camera(
         request.sub_stream_url.as_deref(),
         request.onvif_url.as_deref(),
     )?;
+    let now = Utc::now();
     let record = sqlx::query_as::<_, CameraRecord>(
-        "INSERT INTO cameras (id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, created_by) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO cameras (id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, created_by, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
     )
     .bind(Uuid::new_v4())
@@ -285,6 +290,8 @@ async fn create_camera(
     .bind(request.enabled)
     .bind(request.record_enabled)
     .bind(user.id)
+    .bind(now)
+    .bind(now)
     .fetch_one(&state.pool)
     .await?;
 
@@ -901,8 +908,10 @@ async fn write_audit(
     entity_id: Option<Uuid>,
     details: Value,
 ) {
+    let now = Utc::now();
     if let Err(error) = sqlx::query(
-        "INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(Uuid::new_v4())
     .bind(user_id)
@@ -910,6 +919,7 @@ async fn write_audit(
     .bind(entity_type)
     .bind(entity_id)
     .bind(details)
+    .bind(now)
     .execute(&state.pool)
     .await
     {
