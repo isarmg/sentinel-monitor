@@ -10,6 +10,7 @@ pub struct UserRecord {
     pub password_hash: String,
     pub role: String,
     pub active: bool,
+    pub session_version: i64,
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

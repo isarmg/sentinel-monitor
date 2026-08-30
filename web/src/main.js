@@ -19,11 +19,16 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 async function api(path, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  const csrfToken = readCookie("__Host-sentinel_csrf") || readCookie("sentinel_csrf");
   const response = await fetch(path, {
     credentials: "same-origin",
     ...options,
     headers: {
       ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(["POST", "PUT", "PATCH", "DELETE"].includes(method) && csrfToken
+        ? { "X-CSRF-Token": csrfToken }
+        : {}),
       ...(options.headers || {}),
     },
   });
@@ -36,6 +41,15 @@ async function api(path, options = {}) {
     throw error;
   }
   return payload;
+}
+
+function readCookie(name) {
+  const prefix = `${name}=`;
+  const cookie = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  return cookie ? cookie.slice(prefix.length) : "";
 }
 
 async function boot() {

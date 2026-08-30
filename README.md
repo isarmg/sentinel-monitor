@@ -53,13 +53,17 @@ APP_JWT_SECRET=<至少32字符随机值>
 CREDENTIALS_KEY=<base64编码的32字节随机值>
 BOOTSTRAP_ADMIN_EMAIL=admin@example.com
 BOOTSTRAP_ADMIN_PASSWORD=<初始管理员密码>
-SESSION_COOKIE_SECURE=true
+APP_ENV=production
+SESSION_IDLE_TTL_MINUTES=30
+SESSION_ABSOLUTE_TTL_HOURS=12
 MEDIAMTX_API_URL=http://127.0.0.1:9997
 MEDIAMTX_PLAYBACK_URL=http://127.0.0.1:9996
 PUBLIC_HLS_BASE_URL=/media-hls
 PUBLIC_WEBRTC_BASE_URL=/media-webrtc
 STATIC_DIR=web/dist
 ```
+
+生产模式始终使用 `__Host-sentinel_session` Secure/HttpOnly/SameSite Cookie。仅本机开发可设置 `APP_ENV=development`，且服务会拒绝绑定非 loopback 地址。
 
 ## 角色权限
 

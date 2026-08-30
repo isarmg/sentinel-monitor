@@ -1,20 +1,42 @@
 use crate::{
     config::Config,
     error::{AppError, Result},
-    models::{UserRecord, UserView},
+    models::UserView,
     AppState,
 };
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{
+    body::Body,
+    extract::{FromRequestParts, State},
+    http::{
+        header::{COOKIE, HOST, ORIGIN},
+        request::Parts,
+        uri::Authority,
+        HeaderMap, Method, Request,
+    },
+    middleware::Next,
+    response::Response,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+use subtle::ConstantTimeEq;
+use url::Url;
 use uuid::Uuid;
 
-pub const SESSION_COOKIE: &str = "monitor_session";
+const PRODUCTION_SESSION_COOKIE: &str = "__Host-sentinel_session";
+const DEVELOPMENT_SESSION_COOKIE: &str = "sentinel_session";
+const PRODUCTION_CSRF_COOKIE: &str = "__Host-sentinel_csrf";
+const DEVELOPMENT_CSRF_COOKIE: &str = "sentinel_csrf";
+const TOKEN_BYTES: usize = 32;
+const MAX_TOKEN_LENGTH: usize = 128;
 
 #[derive(Clone)]
 pub struct CurrentUser {
@@ -25,6 +47,7 @@ pub struct CurrentUser {
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub(crate) session_id: Uuid,
 }
 
 impl CurrentUser {
@@ -58,14 +81,6 @@ impl CurrentUser {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct SessionClaims {
-    sub: String,
-    kind: String,
-    iat: usize,
-    exp: usize,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
 pub struct MediaClaims {
     pub sub: String,
     pub camera_id: Uuid,
@@ -76,35 +91,61 @@ pub struct MediaClaims {
     pub exp: usize,
 }
 
+pub struct IssuedBrowserSession {
+    #[cfg(test)]
+    pub session_id: Uuid,
+    pub token: String,
+    pub csrf_token: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct SessionUserRow {
+    session_id: Uuid,
+    csrf_digest: Vec<u8>,
+    absolute_expires_at: DateTime<Utc>,
+    user_id: Uuid,
+    email: String,
+    role: String,
+    active: bool,
+    last_login_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+struct AuthenticatedBrowserSession {
+    user: CurrentUser,
+    csrf_digest: Vec<u8>,
+}
+
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self> {
-        let token = bearer_token(&parts.headers)
-            .or_else(|| cookie_token(&parts.headers))
-            .ok_or(AppError::Unauthorized)?;
-        let user_id = decode_session(&token, &state.config)?;
-
-        let user = sqlx::query_as::<_, UserRecord>(
-            "SELECT id, email, password_hash, role, active, last_login_at, created_at, updated_at \
-             FROM users WHERE id = ?",
-        )
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .filter(|user| user.active)
-        .ok_or(AppError::Unauthorized)?;
-
-        Ok(Self {
-            id: user.id,
-            email: user.email,
-            role: user.role,
-            active: user.active,
-            last_login_at: user.last_login_at,
-            created_at: user.created_at,
-            updated_at: user.updated_at,
-        })
+        if let Some(user) = parts.extensions.get::<Self>() {
+            return Ok(user.clone());
+        }
+        Ok(authenticate_browser_session(&parts.headers, state)
+            .await?
+            .user)
     }
+}
+
+pub async fn enforce_browser_security(
+    State(state): State<AppState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response> {
+    if !is_state_changing(request.method()) {
+        return Ok(next.run(request).await);
+    }
+
+    validate_same_origin(request.headers())?;
+    if !matches!(request.uri().path(), "/auth/login" | "/api/auth/login") {
+        let session = authenticate_browser_session(request.headers(), &state).await?;
+        validate_csrf(request.headers(), &session.csrf_digest)?;
+        request.extensions_mut().insert(session.user);
+    }
+    Ok(next.run(request).await)
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
@@ -127,20 +168,64 @@ pub fn verify_password(password: &str, encoded: &str) -> bool {
         .is_ok()
 }
 
-pub fn issue_session(user_id: Uuid, config: &Config) -> Result<String> {
-    let now = Utc::now().timestamp() as usize;
-    let claims = SessionClaims {
-        sub: user_id.to_string(),
-        kind: "session".into(),
-        iat: now,
-        exp: now + config.session_ttl.as_secs() as usize,
-    };
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(&config.jwt_secret),
+pub async fn issue_session(
+    state: &AppState,
+    user_id: Uuid,
+    session_version: i64,
+) -> Result<IssuedBrowserSession> {
+    let now = Utc::now();
+    let absolute_expires_at = now + chrono_duration(state.config.session_absolute_ttl)?;
+    let idle_expires_at = std::cmp::min(
+        now + chrono_duration(state.config.session_idle_ttl)?,
+        absolute_expires_at,
+    );
+    let token = random_token();
+    let csrf_token = random_token();
+    let session_id = Uuid::new_v4();
+
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM browser_sessions \
+         WHERE user_id = ? AND (revoked_at IS NOT NULL OR idle_expires_at <= ? OR absolute_expires_at <= ?)",
     )
-    .map_err(|error| AppError::Internal(format!("session token failed: {error}")))
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO browser_sessions \
+         (id, user_id, token_digest, csrf_digest, session_version, created_at, last_seen_at, idle_expires_at, absolute_expires_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(token_digest(&token).to_vec())
+    .bind(token_digest(&csrf_token).to_vec())
+    .bind(session_version)
+    .bind(now)
+    .bind(now)
+    .bind(idle_expires_at)
+    .bind(absolute_expires_at)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(IssuedBrowserSession {
+        #[cfg(test)]
+        session_id,
+        token,
+        csrf_token,
+    })
+}
+
+pub async fn revoke_session(state: &AppState, session_id: Uuid) -> Result<()> {
+    sqlx::query("UPDATE browser_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+        .bind(Utc::now())
+        .bind(session_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(())
 }
 
 pub fn issue_media_token(
@@ -187,22 +272,47 @@ pub fn decode_media_token(token: &str, config: &Config) -> Result<MediaClaims> {
 }
 
 pub fn session_cookie(token: &str, config: &Config) -> String {
-    let mut value = format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
-        config.session_ttl.as_secs()
-    );
-    if config.session_cookie_secure {
-        value.push_str("; Secure");
-    }
-    value
+    persistent_cookie(
+        session_cookie_name(config),
+        token,
+        config,
+        true,
+        state_cookie_max_age(config),
+    )
+}
+
+pub fn csrf_cookie(token: &str, config: &Config) -> String {
+    persistent_cookie(
+        csrf_cookie_name(config),
+        token,
+        config,
+        false,
+        state_cookie_max_age(config),
+    )
 }
 
 pub fn expired_session_cookie(config: &Config) -> String {
-    let mut value = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
-    if config.session_cookie_secure {
-        value.push_str("; Secure");
+    persistent_cookie(session_cookie_name(config), "", config, true, 0)
+}
+
+pub fn expired_csrf_cookie(config: &Config) -> String {
+    persistent_cookie(csrf_cookie_name(config), "", config, false, 0)
+}
+
+pub fn session_cookie_name(config: &Config) -> &'static str {
+    if config.development_mode {
+        DEVELOPMENT_SESSION_COOKIE
+    } else {
+        PRODUCTION_SESSION_COOKIE
     }
-    value
+}
+
+pub fn csrf_cookie_name(config: &Config) -> &'static str {
+    if config.development_mode {
+        DEVELOPMENT_CSRF_COOKIE
+    } else {
+        PRODUCTION_CSRF_COOKIE
+    }
 }
 
 pub async fn bootstrap_admin(state: &AppState) -> Result<()> {
@@ -240,33 +350,166 @@ pub async fn bootstrap_admin(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-fn decode_session(token: &str, config: &Config) -> Result<Uuid> {
-    let claims = decode::<SessionClaims>(
-        token,
-        &DecodingKey::from_secret(&config.jwt_secret),
-        &Validation::new(Algorithm::HS256),
+async fn authenticate_browser_session(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<AuthenticatedBrowserSession> {
+    let token = cookie_token(headers, session_cookie_name(&state.config))
+        .filter(|token| !token.is_empty() && token.len() <= MAX_TOKEN_LENGTH)
+        .ok_or(AppError::Unauthorized)?;
+    let now = Utc::now();
+    let row = sqlx::query_as::<_, SessionUserRow>(
+        "SELECT s.id AS session_id, s.csrf_digest, s.absolute_expires_at, \
+                u.id AS user_id, u.email, u.role, u.active, u.last_login_at, u.created_at, u.updated_at \
+         FROM browser_sessions s \
+         JOIN users u ON u.id = s.user_id \
+         WHERE s.token_digest = ? AND s.revoked_at IS NULL \
+           AND s.session_version = u.session_version AND u.active = 1 \
+           AND s.idle_expires_at > ? AND s.absolute_expires_at > ?",
     )
-    .map_err(|_| AppError::Unauthorized)?
-    .claims;
-    if claims.kind != "session" {
+    .bind(token_digest(&token).to_vec())
+    .bind(now)
+    .bind(now)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::Unauthorized)?;
+
+    let next_idle_expiry = std::cmp::min(
+        now + chrono_duration(state.config.session_idle_ttl)?,
+        row.absolute_expires_at,
+    );
+    let updated = sqlx::query(
+        "UPDATE browser_sessions \
+         SET last_seen_at = MAX(last_seen_at, ?), \
+             idle_expires_at = MIN(absolute_expires_at, MAX(idle_expires_at, ?)) \
+         WHERE id = ? AND revoked_at IS NULL AND idle_expires_at > ? AND absolute_expires_at > ? \
+           AND session_version = (SELECT session_version FROM users WHERE id = user_id AND active = 1)",
+    )
+    .bind(now)
+    .bind(next_idle_expiry)
+    .bind(row.session_id)
+    .bind(now)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
+    if updated.rows_affected() != 1 {
         return Err(AppError::Unauthorized);
     }
-    Uuid::parse_str(&claims.sub).map_err(|_| AppError::Unauthorized)
+
+    Ok(AuthenticatedBrowserSession {
+        csrf_digest: row.csrf_digest,
+        user: CurrentUser {
+            id: row.user_id,
+            email: row.email,
+            role: row.role,
+            active: row.active,
+            last_login_at: row.last_login_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            session_id: row.session_id,
+        },
+    })
 }
 
-fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::to_owned)
+fn validate_csrf(headers: &HeaderMap, expected_digest: &[u8]) -> Result<()> {
+    let token = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= MAX_TOKEN_LENGTH)
+        .ok_or(AppError::Forbidden)?;
+    let digest = token_digest(token);
+    if expected_digest.len() != digest.len()
+        || expected_digest.ct_eq(digest.as_slice()).unwrap_u8() != 1
+    {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
 }
 
-fn cookie_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    let cookies = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+fn validate_same_origin(headers: &HeaderMap) -> Result<()> {
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AppError::Forbidden)?;
+    let authority = host.parse::<Authority>().map_err(|_| AppError::Forbidden)?;
+    let raw_origin = headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AppError::Forbidden)?;
+    let origin = Url::parse(raw_origin).map_err(|_| AppError::Forbidden)?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(AppError::Forbidden);
+    }
+    let origin_host = origin.host_str().ok_or(AppError::Forbidden)?;
+    if normalize_host(origin_host) != normalize_host(authority.host()) {
+        return Err(AppError::Forbidden);
+    }
+    match authority.port_u16() {
+        Some(port) if origin.port_or_known_default() != Some(port) => Err(AppError::Forbidden),
+        None if origin.port().is_some() => Err(AppError::Forbidden),
+        _ => Ok(()),
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn is_state_changing(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    )
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+fn cookie_token(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    let cookies = headers.get(COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|part| {
         let (name, value) = part.trim().split_once('=')?;
-        (name == SESSION_COOKIE).then(|| value.to_string())
+        (name == cookie_name).then(|| value.to_string())
     })
+}
+
+fn persistent_cookie(
+    name: &str,
+    value: &str,
+    config: &Config,
+    http_only: bool,
+    max_age: u64,
+) -> String {
+    let mut cookie = format!("{name}={value}; Path=/; SameSite=Strict; Max-Age={max_age}");
+    if http_only {
+        cookie.push_str("; HttpOnly");
+    }
+    if !config.development_mode {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn state_cookie_max_age(config: &Config) -> u64 {
+    config.session_absolute_ttl.as_secs()
+}
+
+fn chrono_duration(duration: Duration) -> Result<ChronoDuration> {
+    ChronoDuration::from_std(duration)
+        .map_err(|_| AppError::Internal("invalid session duration".into()))
 }

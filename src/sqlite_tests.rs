@@ -1,5 +1,8 @@
 use crate::{
-    auth::{bootstrap_admin, issue_session},
+    auth::{
+        bootstrap_admin, csrf_cookie, csrf_cookie_name, issue_media_token, issue_session,
+        session_cookie, session_cookie_name, IssuedBrowserSession,
+    },
     background::emit_event,
     config::Config,
     crypto::SecretBox,
@@ -9,7 +12,10 @@ use crate::{
 };
 use axum::{
     body::{to_bytes, Body},
-    http::{header::AUTHORIZATION, Method, Request, StatusCode},
+    http::{
+        header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE},
+        HeaderMap, Method, Request, StatusCode,
+    },
     response::Response,
     Router,
 };
@@ -26,6 +32,40 @@ struct TestContext {
     state: AppState,
     media_task: JoinHandle<()>,
     _network_guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[derive(Clone)]
+struct BrowserCredentials {
+    session_id: Option<Uuid>,
+    token: String,
+    csrf_token: String,
+}
+
+impl From<IssuedBrowserSession> for BrowserCredentials {
+    fn from(session: IssuedBrowserSession) -> Self {
+        Self {
+            session_id: Some(session.session_id),
+            token: session.token,
+            csrf_token: session.csrf_token,
+        }
+    }
+}
+
+impl BrowserCredentials {
+    fn cookie_header(&self) -> String {
+        format!(
+            "sentinel_session={}; sentinel_csrf={}",
+            self.token, self.csrf_token
+        )
+    }
+}
+
+#[derive(Default)]
+struct BrowserRequestContext<'a> {
+    credentials: Option<&'a BrowserCredentials>,
+    csrf_token: Option<&'a str>,
+    host: Option<&'a str>,
+    origin: Option<&'a str>,
 }
 
 impl Drop for TestContext {
@@ -98,8 +138,9 @@ impl TestContext {
             credentials_key: [7; 32],
             bootstrap_admin_email: "admin@example.com".into(),
             bootstrap_admin_password: Some("bootstrap-password".into()),
-            session_cookie_secure: false,
-            session_ttl: Duration::from_secs(3_600),
+            development_mode: true,
+            session_idle_ttl: Duration::from_secs(1_800),
+            session_absolute_ttl: Duration::from_secs(3_600),
             media_token_ttl: Duration::from_secs(120),
             mediamtx_api_url: media_url.clone(),
             mediamtx_playback_url: media_url,
@@ -139,16 +180,20 @@ impl TestContext {
         }
     }
 
-    async fn bootstrap(&self) -> (Uuid, String) {
+    async fn bootstrap(&self) -> (Uuid, BrowserCredentials) {
         bootstrap_admin(&self.state)
             .await
             .expect("bootstrap administrator");
-        let id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE role = 'admin'")
-            .fetch_one(&self.state.pool)
+        let (id, session_version) = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT id, session_version FROM users WHERE role = 'admin'",
+        )
+        .fetch_one(&self.state.pool)
+        .await
+        .expect("load administrator id");
+        let session = issue_session(&self.state, id, session_version)
             .await
-            .expect("load administrator id");
-        let token = issue_session(id, &self.state.config).expect("issue administrator session");
-        (id, token)
+            .expect("issue administrator session");
+        (id, session.into())
     }
 }
 
@@ -156,10 +201,10 @@ async fn send_json(
     app: &Router,
     method: Method,
     uri: &str,
-    token: &str,
+    credentials: &BrowserCredentials,
     value: serde_json::Value,
 ) -> StatusCode {
-    send_request(app, method, uri, token, Some(value))
+    send_request(app, method, uri, credentials, Some(value))
         .await
         .status()
 }
@@ -168,16 +213,48 @@ async fn send_request(
     app: &Router,
     method: Method,
     uri: &str,
-    token: &str,
+    credentials: &BrowserCredentials,
+    value: Option<Value>,
+) -> Response {
+    send_custom_request(
+        app,
+        method,
+        uri,
+        BrowserRequestContext {
+            credentials: Some(credentials),
+            csrf_token: Some(&credentials.csrf_token),
+            host: Some("sentinel.test"),
+            origin: Some("https://sentinel.test"),
+        },
+        value,
+    )
+    .await
+}
+
+async fn send_custom_request(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    context: BrowserRequestContext<'_>,
     value: Option<Value>,
 ) -> Response {
     let body = value
         .map(|value| Body::from(value.to_string()))
         .unwrap_or_else(Body::empty);
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(host) = context.host {
+        builder = builder.header(HOST, host);
+    }
+    if let Some(origin) = context.origin {
+        builder = builder.header(ORIGIN, origin);
+    }
+    if let Some(credentials) = context.credentials {
+        builder = builder.header(COOKIE, credentials.cookie_header());
+    }
+    if let Some(csrf_token) = context.csrf_token {
+        builder = builder.header("x-csrf-token", csrf_token);
+    }
+    let request = builder
         .header("content-type", "application/json")
         .body(body)
         .expect("build test request");
@@ -185,6 +262,26 @@ async fn send_request(
         .oneshot(request)
         .await
         .expect("serve test request")
+}
+
+fn login_credentials(headers: &HeaderMap, config: &Config) -> BrowserCredentials {
+    BrowserCredentials {
+        session_id: None,
+        token: set_cookie_value(headers, session_cookie_name(config)),
+        csrf_token: set_cookie_value(headers, csrf_cookie_name(config)),
+    }
+}
+
+fn set_cookie_value(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookie| {
+            let value = cookie.strip_prefix(name)?.strip_prefix('=')?;
+            Some(value.split(';').next().unwrap_or_default().to_string())
+        })
+        .unwrap_or_else(|| panic!("missing {name} Set-Cookie header"))
 }
 
 async fn response_json(response: Response) -> Value {
@@ -577,6 +674,328 @@ async fn migrated_database_updates_cameras_filters_and_acknowledges_events() {
     expected.sort();
     assert_eq!(ids, expected);
 
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separate() {
+    let mut context = TestContext::migrated().await;
+    bootstrap_admin(&context.state)
+        .await
+        .expect("bootstrap administrator");
+    let admin_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE role = 'admin'")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("load administrator id");
+    let app = routes::router(context.state.clone());
+    let login_body = json!({
+        "email": "admin@example.com",
+        "password": "bootstrap-password"
+    });
+
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        BrowserRequestContext {
+            host: Some("sentinel.test"),
+            ..Default::default()
+        },
+        Some(login_body.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        BrowserRequestContext {
+            host: Some("sentinel.test"),
+            origin: Some("https://attacker.test"),
+            ..Default::default()
+        },
+        Some(login_body.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        BrowserRequestContext {
+            host: Some("sentinel.test"),
+            origin: Some("https://sentinel.test"),
+            ..Default::default()
+        },
+        Some(login_body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let credentials = login_credentials(response.headers(), &context.state.config);
+    assert!(!credentials.token.is_empty());
+    assert!(!credentials.csrf_token.is_empty());
+
+    let (token_digest, csrf_digest, idle_expires_at, absolute_expires_at): (
+        Vec<u8>,
+        Vec<u8>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    ) = sqlx::query_as(
+        "SELECT token_digest, csrf_digest, idle_expires_at, absolute_expires_at \
+         FROM browser_sessions WHERE user_id = ?",
+    )
+    .bind(admin_id)
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("load persisted browser session");
+    assert_eq!(token_digest.len(), 32);
+    assert_eq!(csrf_digest.len(), 32);
+    assert_ne!(token_digest, credentials.token.as_bytes());
+    assert_ne!(csrf_digest, credentials.csrf_token.as_bytes());
+    assert!(idle_expires_at < absolute_expires_at);
+
+    let mut production = (*context.state.config).clone();
+    production.development_mode = false;
+    let production_session_cookie = session_cookie("session-token", &production);
+    assert!(production_session_cookie.starts_with("__Host-sentinel_session=session-token;"));
+    assert!(production_session_cookie.contains("; Secure"));
+    assert!(production_session_cookie.contains("; HttpOnly"));
+    assert!(production_session_cookie.contains("; SameSite=Strict"));
+    let production_csrf_cookie = csrf_cookie("csrf-token", &production);
+    assert!(production_csrf_cookie.starts_with("__Host-sentinel_csrf=csrf-token;"));
+    assert!(production_csrf_cookie.contains("; Secure"));
+    assert!(!production_csrf_cookie.contains("HttpOnly"));
+
+    let bearer_only = Request::builder()
+        .method(Method::GET)
+        .uri("/api/me")
+        .header(AUTHORIZATION, format!("Bearer {}", credentials.token))
+        .body(Body::empty())
+        .expect("build bearer-only browser request");
+    let response = app
+        .clone()
+        .oneshot(bearer_only)
+        .await
+        .expect("serve bearer-only browser request");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let camera_id = Uuid::new_v4();
+    let (machine_token, _) = issue_media_token(
+        admin_id,
+        camera_id,
+        "camera/main".into(),
+        vec!["read".into()],
+        &context.state.config,
+    )
+    .expect("issue separate machine media token");
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/internal/media/auth",
+        BrowserRequestContext::default(),
+        Some(json!({
+            "token": machine_token,
+            "action": "read",
+            "path": "camera/main"
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        send_request(&app, Method::GET, "/api/me", &credentials, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    drop(app);
+    context.state.pool.close().await;
+    context.state.pool = sqlite::open_pool(&context.state.config.database_url)
+        .await
+        .expect("reopen session database after simulated restart");
+    let restarted_app = routes::router(context.state.clone());
+    assert_eq!(
+        send_request(&restarted_app, Method::GET, "/api/me", &credentials, None,)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries() {
+    let context = TestContext::migrated().await;
+    let (admin_id, first) = context.bootstrap().await;
+    let session_version =
+        sqlx::query_scalar::<_, i64>("SELECT session_version FROM users WHERE id = ?")
+            .bind(admin_id)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("load administrator session version");
+    let second: BrowserCredentials = issue_session(&context.state, admin_id, session_version)
+        .await
+        .expect("issue second browser session")
+        .into();
+    let app = routes::router(context.state.clone());
+
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/api/auth/logout",
+        BrowserRequestContext {
+            credentials: Some(&first),
+            csrf_token: Some(&second.csrf_token),
+            host: Some("sentinel.test"),
+            origin: Some("https://sentinel.test"),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/api/auth/logout",
+        BrowserRequestContext {
+            credentials: Some(&first),
+            csrf_token: Some(&first.csrf_token),
+            host: Some("sentinel.test"),
+            origin: Some("https://attacker.test"),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/api/auth/logout",
+        BrowserRequestContext {
+            credentials: Some(&first),
+            csrf_token: Some(&first.csrf_token),
+            host: Some("sentinel.test"),
+            origin: None,
+        },
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = send_request(&app, Method::POST, "/api/auth/logout", &first, None).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM browser_sessions WHERE id = ?")
+            .bind(first.session_id.expect("first session id"))
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("load revoked session state");
+    assert!(revoked);
+    assert_eq!(
+        send_request(&app, Method::GET, "/api/me", &first, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let past = Utc::now() - chrono::Duration::minutes(1);
+    sqlx::query("UPDATE browser_sessions SET idle_expires_at = ? WHERE id = ?")
+        .bind(past)
+        .bind(second.session_id.expect("second session id"))
+        .execute(&context.state.pool)
+        .await
+        .expect("expire idle session deadline");
+    assert_eq!(
+        send_request(&app, Method::GET, "/api/me", &second, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let absolute: BrowserCredentials = issue_session(&context.state, admin_id, session_version)
+        .await
+        .expect("issue absolute-expiry session")
+        .into();
+    sqlx::query(
+        "UPDATE browser_sessions SET idle_expires_at = ?, absolute_expires_at = ? WHERE id = ?",
+    )
+    .bind(past)
+    .bind(past)
+    .bind(absolute.session_id.expect("absolute-expiry session id"))
+    .execute(&context.state.pool)
+    .await
+    .expect("expire absolute session deadline");
+    assert_eq!(
+        send_request(&app, Method::GET, "/api/me", &absolute, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn password_reset_advances_version_and_invalidates_existing_sessions() {
+    let context = TestContext::migrated().await;
+    let (_admin_id, admin) = context.bootstrap().await;
+    let app = routes::router(context.state.clone());
+    assert_eq!(
+        send_json(
+            &app,
+            Method::POST,
+            "/api/users",
+            &admin,
+            json!({
+                "email": "session-operator@example.com",
+                "password": "operator-password",
+                "role": "operator"
+            }),
+        )
+        .await,
+        StatusCode::CREATED
+    );
+    let (operator_id, version) = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT id, session_version FROM users WHERE email = 'session-operator@example.com'",
+    )
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("load operator session version");
+    let operator: BrowserCredentials = issue_session(&context.state, operator_id, version)
+        .await
+        .expect("issue operator session")
+        .into();
+    assert_eq!(
+        send_request(&app, Method::GET, "/api/me", &operator, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        send_json(
+            &app,
+            Method::PUT,
+            &format!("/api/users/{operator_id}"),
+            &admin,
+            json!({ "password": "replacement-password" }),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let updated_version =
+        sqlx::query_scalar::<_, i64>("SELECT session_version FROM users WHERE id = ?")
+            .bind(operator_id)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("load updated operator session version");
+    assert_eq!(updated_version, version + 1);
+    assert_eq!(
+        send_request(&app, Method::GET, "/api/me", &operator, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     context.state.pool.close().await;
 }
 

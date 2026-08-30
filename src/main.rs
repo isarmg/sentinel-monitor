@@ -45,6 +45,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Arc::new(Config::from_env().map_err(|error| format!("configuration: {error}"))?);
+    if config.development_mode {
+        tracing::warn!(
+            address = %config.bind_addr,
+            "development mode uses loopback-only cookies without Secure"
+        );
+    }
     let pool = sqlite::open_pool(&config.database_url).await?;
     sqlx::migrate!().run(&pool).await?;
 

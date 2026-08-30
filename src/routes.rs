@@ -1,7 +1,8 @@
 use crate::{
     auth::{
-        decode_media_token, expired_session_cookie, hash_password, issue_media_token,
-        issue_session, session_cookie, verify_password, CurrentUser,
+        csrf_cookie, decode_media_token, enforce_browser_security, expired_csrf_cookie,
+        expired_session_cookie, hash_password, issue_media_token, issue_session, revoke_session,
+        session_cookie, verify_password, CurrentUser,
     },
     background::{camera_path, sync_camera},
     error::{AppError, Result},
@@ -19,6 +20,7 @@ use axum::{
         },
         HeaderMap, HeaderValue, StatusCode,
     },
+    middleware,
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post, put},
     Json, Router,
@@ -32,7 +34,7 @@ use tower_http::{compression::CompressionLayer, services::ServeDir, trace::Trace
 use url::Url;
 use uuid::Uuid;
 
-const USER_SELECT: &str = "SELECT id, email, password_hash, role, active, last_login_at, created_at, updated_at FROM users";
+const USER_SELECT: &str = "SELECT id, email, password_hash, role, active, session_version, last_login_at, created_at, updated_at FROM users";
 const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at FROM cameras";
 
 pub fn router(state: AppState) -> Router {
@@ -54,7 +56,11 @@ pub fn router(state: AppState) -> Router {
         .route("/events/stream", get(event_stream))
         .route("/events/{id}/ack", post(ack_event))
         .route("/audit", get(list_audit))
-        .route("/system/status", get(system_status));
+        .route("/system/status", get(system_status))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_browser_security,
+        ));
 
     Router::new()
         .route("/health/live", get(live))
@@ -86,12 +92,17 @@ async fn login(
         .bind(user.id)
         .execute(&state.pool)
         .await?;
-    let token = issue_session(user.id, &state.config)?;
+    let session = issue_session(&state, user.id, user.session_version).await?;
     let mut headers = HeaderMap::new();
-    headers.insert(
+    headers.append(
         SET_COOKIE,
-        HeaderValue::from_str(&session_cookie(&token, &state.config))
+        HeaderValue::from_str(&session_cookie(&session.token, &state.config))
             .map_err(|_| AppError::Internal("session cookie failed".into()))?,
+    );
+    headers.append(
+        SET_COOKIE,
+        HeaderValue::from_str(&csrf_cookie(&session.csrf_token, &state.config))
+            .map_err(|_| AppError::Internal("csrf cookie failed".into()))?,
     );
     write_audit(
         &state,
@@ -105,12 +116,18 @@ async fn login(
     Ok((headers, Json(UserView::from(user))))
 }
 
-async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse> {
+async fn logout(user: CurrentUser, State(state): State<AppState>) -> Result<impl IntoResponse> {
+    revoke_session(&state, user.session_id).await?;
     let mut headers = HeaderMap::new();
-    headers.insert(
+    headers.append(
         SET_COOKIE,
         HeaderValue::from_str(&expired_session_cookie(&state.config))
             .map_err(|_| AppError::Internal("session cookie failed".into()))?,
+    );
+    headers.append(
+        SET_COOKIE,
+        HeaderValue::from_str(&expired_csrf_cookie(&state.config))
+            .map_err(|_| AppError::Internal("csrf cookie failed".into()))?,
     );
     Ok((headers, StatusCode::NO_CONTENT))
 }
@@ -142,7 +159,7 @@ async fn create_user(
     let record = sqlx::query_as::<_, UserRecord>(
         "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
          VALUES (?, LOWER(?), ?, ?, 1, ?, ?) \
-         RETURNING id, email, password_hash, role, active, last_login_at, created_at, updated_at",
+         RETURNING id, email, password_hash, role, active, session_version, last_login_at, created_at, updated_at",
     )
     .bind(Uuid::new_v4())
     .bind(request.email.trim())
@@ -182,17 +199,21 @@ async fn update_user(
     if existing.role == "admin" && (role != "admin" || !active) {
         ensure_another_admin(&state, id).await?;
     }
-    let password_hash = match request.password {
-        Some(password) if !password.is_empty() => hash_password(&password)?,
-        _ => existing.password_hash,
+    let (password_hash, password_changed) = match request.password {
+        Some(password) if !password.is_empty() => (hash_password(&password)?, true),
+        _ => (existing.password_hash, false),
     };
+    let invalidate_sessions =
+        password_changed || role != existing.role || active != existing.active;
     let record = sqlx::query_as::<_, UserRecord>(
-        "UPDATE users SET role = ?, active = ?, password_hash = ?, updated_at = datetime('now') WHERE id = ? \
-         RETURNING id, email, password_hash, role, active, last_login_at, created_at, updated_at",
+        "UPDATE users SET role = ?, active = ?, password_hash = ?, \
+         session_version = session_version + ?, updated_at = datetime('now') WHERE id = ? \
+         RETURNING id, email, password_hash, role, active, session_version, last_login_at, created_at, updated_at",
     )
     .bind(&role)
     .bind(active)
     .bind(password_hash)
+    .bind(i64::from(invalidate_sessions))
     .bind(id)
     .fetch_one(&state.pool)
     .await?;

@@ -10,8 +10,9 @@ pub struct Config {
     pub credentials_key: [u8; 32],
     pub bootstrap_admin_email: String,
     pub bootstrap_admin_password: Option<String>,
-    pub session_cookie_secure: bool,
-    pub session_ttl: Duration,
+    pub development_mode: bool,
+    pub session_idle_ttl: Duration,
+    pub session_absolute_ttl: Duration,
     pub media_token_ttl: Duration,
     pub mediamtx_api_url: String,
     pub mediamtx_playback_url: String,
@@ -27,6 +28,16 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
+        let bind_addr = value("BIND_ADDR", "0.0.0.0:8080")
+            .parse::<SocketAddr>()
+            .map_err(|_| "BIND_ADDR is invalid".to_string())?;
+        let development_mode = match value("APP_ENV", "production").as_str() {
+            "production" => false,
+            "development" => true,
+            _ => return Err("APP_ENV must be production or development".into()),
+        };
+        validate_development_bind(bind_addr, development_mode)?;
+
         let jwt_secret = required("APP_JWT_SECRET")?.into_bytes();
         if jwt_secret.len() < 32 {
             return Err("APP_JWT_SECRET must contain at least 32 bytes".into());
@@ -40,9 +51,7 @@ impl Config {
             .map_err(|_| "CREDENTIALS_KEY must decode to exactly 32 bytes".to_string())?;
 
         Ok(Self {
-            bind_addr: value("BIND_ADDR", "0.0.0.0:8080")
-                .parse()
-                .map_err(|_| "BIND_ADDR is invalid".to_string())?,
+            bind_addr,
             database_url: required("DATABASE_URL")?,
             jwt_secret,
             credentials_key,
@@ -50,8 +59,9 @@ impl Config {
                 .trim()
                 .to_lowercase(),
             bootstrap_admin_password: env::var("BOOTSTRAP_ADMIN_PASSWORD").ok(),
-            session_cookie_secure: parse_bool("SESSION_COOKIE_SECURE", false)?,
-            session_ttl: Duration::from_secs(parse_u64("SESSION_TTL_HOURS", 12)? * 3600),
+            development_mode,
+            session_idle_ttl: duration_from_env("SESSION_IDLE_TTL_MINUTES", 30, 60)?,
+            session_absolute_ttl: duration_from_env("SESSION_ABSOLUTE_TTL_HOURS", 12, 3_600)?,
             media_token_ttl: Duration::from_secs(parse_u64("MEDIA_TOKEN_TTL_SECS", 120)?),
             mediamtx_api_url: trim_slash(value("MEDIAMTX_API_URL", "http://127.0.0.1:9997")),
             mediamtx_playback_url: trim_slash(value(
@@ -87,10 +97,23 @@ fn parse_u64(name: &str, default: u64) -> Result<u64, String> {
         .map_err(|_| format!("{name} must be an unsigned integer"))
 }
 
-fn parse_bool(name: &str, default: bool) -> Result<bool, String> {
-    value(name, if default { "true" } else { "false" })
-        .parse()
-        .map_err(|_| format!("{name} must be true or false"))
+fn duration_from_env(name: &str, default: u64, unit_seconds: u64) -> Result<Duration, String> {
+    let value = parse_u64(name, default)?;
+    let seconds = value
+        .checked_mul(unit_seconds)
+        .ok_or_else(|| format!("{name} is too large"))?;
+    if seconds == 0 {
+        return Err(format!("{name} must be greater than zero"));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn validate_development_bind(bind_addr: SocketAddr, development_mode: bool) -> Result<(), String> {
+    if development_mode && !bind_addr.ip().is_loopback() {
+        Err("development mode must bind to a loopback address".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_cidr_list(name: &str) -> Result<Vec<IpNet>, String> {
@@ -112,4 +135,18 @@ fn trim_slash(mut value: String) -> String {
         value.pop();
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn development_mode_only_accepts_loopback_bindings() {
+        assert!(validate_development_bind("127.0.0.1:8080".parse().unwrap(), true).is_ok());
+        assert!(validate_development_bind("[::1]:8080".parse().unwrap(), true).is_ok());
+        assert!(validate_development_bind("0.0.0.0:8080".parse().unwrap(), true).is_err());
+        assert!(validate_development_bind("192.168.1.10:8080".parse().unwrap(), true).is_err());
+        assert!(validate_development_bind("0.0.0.0:8080".parse().unwrap(), false).is_ok());
+    }
 }
