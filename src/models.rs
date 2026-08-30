@@ -158,6 +158,8 @@ pub struct CameraMutationResponse {
     pub camera: CameraView,
     pub media_synced: bool,
     pub warning: Option<String>,
+    pub operation_id: String,
+    pub operation_state: String,
 }
 
 #[derive(Deserialize)]

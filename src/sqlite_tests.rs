@@ -3,28 +3,35 @@ use crate::{
         bootstrap_admin, csrf_cookie, csrf_cookie_name, issue_media_token, issue_session,
         session_cookie, session_cookie_name, IssuedBrowserSession,
     },
-    background::emit_event,
+    background::{camera_path, emit_event},
     config::Config,
     crypto::SecretBox,
     login_security::LoginProtection,
     mediamtx::MediaMtxClient,
     models::CameraRecord,
-    routes, sqlite, AppState,
+    reconciliation, routes, sqlite, AppState,
 };
 use axum::{
     body::{to_bytes, Body},
-    extract::ConnectInfo,
+    extract::{ConnectInfo, Path, State},
     http::{
         header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, RETRY_AFTER, SET_COOKIE},
         HeaderMap, Method, Request, StatusCode,
     },
-    response::Response,
-    Router,
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post},
+    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::{SqliteConnection, SqlitePool};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -32,8 +39,137 @@ use uuid::Uuid;
 struct TestContext {
     _database: TemporaryDatabase,
     state: AppState,
+    fake_media: FakeMediaService,
     media_task: JoinHandle<()>,
     _network_guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[derive(Clone, Default)]
+struct FakeMediaService {
+    inner: Arc<Mutex<FakeMediaState>>,
+}
+
+#[derive(Default)]
+struct FakeMediaState {
+    paths: HashMap<String, FakePathConfig>,
+    mutation_calls: usize,
+    fail_mutations: usize,
+}
+
+#[derive(Clone)]
+struct FakePathConfig {
+    source: String,
+    source_on_demand: bool,
+    record: bool,
+}
+
+impl FakeMediaService {
+    fn router(&self) -> Router {
+        Router::new()
+            .route("/v3/info", get(|| async { StatusCode::OK }))
+            .route("/v3/config/paths/list", get(fake_config_list))
+            .route("/v3/paths/list", get(fake_runtime_paths))
+            .route("/v3/config/paths/get/{path}", get(fake_get_path))
+            .route("/v3/config/paths/add/{path}", post(fake_upsert_path))
+            .route("/v3/config/paths/patch/{path}", patch(fake_upsert_path))
+            .route("/v3/config/paths/delete/{path}", delete(fake_delete_path))
+            .fallback(|| async { StatusCode::OK })
+            .with_state(self.clone())
+    }
+
+    fn fail_next_mutations(&self, count: usize) {
+        self.inner.lock().unwrap().fail_mutations = count;
+    }
+
+    fn mutation_calls(&self) -> usize {
+        self.inner.lock().unwrap().mutation_calls
+    }
+
+    fn path(&self, path: &str) -> Option<FakePathConfig> {
+        self.inner.lock().unwrap().paths.get(path).cloned()
+    }
+
+    fn remove_path(&self, path: &str) {
+        self.inner.lock().unwrap().paths.remove(path);
+    }
+}
+
+async fn fake_config_list(State(fake): State<FakeMediaService>) -> Json<Value> {
+    let inner = fake.inner.lock().unwrap();
+    Json(json!({
+        "items": inner.paths.iter().map(|(name, config)| json!({
+            "name": name,
+            "source": config.source,
+            "sourceOnDemand": config.source_on_demand,
+            "record": config.record
+        })).collect::<Vec<_>>()
+    }))
+}
+
+async fn fake_runtime_paths(State(fake): State<FakeMediaService>) -> Json<Value> {
+    let inner = fake.inner.lock().unwrap();
+    Json(json!({
+        "items": inner.paths.keys().map(|name| json!({
+            "name": name,
+            "ready": true,
+            "readers": [],
+            "tracks": ["video"]
+        })).collect::<Vec<_>>()
+    }))
+}
+
+async fn fake_get_path(
+    State(fake): State<FakeMediaService>,
+    Path(path): Path<String>,
+) -> StatusCode {
+    if fake.inner.lock().unwrap().paths.contains_key(&path) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+async fn fake_upsert_path(
+    State(fake): State<FakeMediaService>,
+    Path(path): Path<String>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let mut inner = fake.inner.lock().unwrap();
+    inner.mutation_calls += 1;
+    if inner.fail_mutations > 0 {
+        inner.fail_mutations -= 1;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rtsp://admin:server-secret@camera.invalid/leaked-by-upstream",
+        )
+            .into_response();
+    }
+    inner.paths.insert(
+        path,
+        FakePathConfig {
+            source: payload["source"].as_str().unwrap_or_default().to_string(),
+            source_on_demand: payload["sourceOnDemand"].as_bool().unwrap_or(false),
+            record: payload["record"].as_bool().unwrap_or(false),
+        },
+    );
+    StatusCode::OK.into_response()
+}
+
+async fn fake_delete_path(
+    State(fake): State<FakeMediaService>,
+    Path(path): Path<String>,
+) -> StatusCode {
+    let mut inner = fake.inner.lock().unwrap();
+    inner.mutation_calls += 1;
+    if inner.fail_mutations > 0 {
+        inner.fail_mutations -= 1;
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    if inner.paths.remove(&path).is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 #[derive(Clone)]
@@ -126,8 +262,10 @@ impl TestContext {
             .await
             .expect("bind fake media service");
         let media_address = media_listener.local_addr().expect("fake media address");
+        let fake_media = FakeMediaService::default();
+        let fake_service = fake_media.clone();
         let media_task = tokio::spawn(async move {
-            let service = Router::new().fallback(|| async { StatusCode::OK });
+            let service = fake_service.router();
             axum::serve(media_listener, service)
                 .await
                 .expect("serve fake media service");
@@ -187,6 +325,7 @@ impl TestContext {
         Self {
             _database: database,
             state,
+            fake_media,
             media_task,
             _network_guard: network_guard,
         }
@@ -570,7 +709,11 @@ async fn migrated_database_updates_cameras_filters_and_acknowledges_events() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let response = response_json(response).await;
-    assert_eq!(response["media_synced"], json!(true));
+    assert_eq!(response["media_synced"], json!(false));
+    assert_eq!(response["operation_state"], json!("pending"));
+    assert!(response["operation_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
     assert_eq!(response["camera"]["id"], json!(target_id));
     assert_eq!(response["camera"]["status"], json!("disabled"));
 
@@ -1182,4 +1325,315 @@ async fn production_pool_configures_every_connection_and_persists_after_reopen()
     drop(reopened_connection);
     assert_database_integrity(&reopened).await;
     reopened.close().await;
+}
+
+#[tokio::test]
+async fn media_write_persists_desired_operation_before_side_effect_and_tracks_actual() {
+    let context = TestContext::migrated().await;
+    let (_admin_id, admin) = context.bootstrap().await;
+    let app = routes::router(context.state.clone());
+
+    let response = send_request(
+        &app,
+        Method::POST,
+        "/api/cameras",
+        &admin,
+        Some(json!({
+            "name": "Queued Camera",
+            "main_stream_url": "rtsp://camera.example/live",
+            "username": "camera-user",
+            "password": "camera-secret",
+            "enabled": true,
+            "record_enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = response_json(response).await;
+    assert_eq!(response["media_synced"], false);
+    assert_eq!(response["operation_state"], "pending");
+    let operation_id = response["operation_id"]
+        .as_str()
+        .expect("operation id")
+        .to_string();
+    let camera_id: Uuid = serde_json::from_value(response["camera"]["id"].clone()).unwrap();
+    assert_eq!(context.fake_media.mutation_calls(), 0);
+
+    let desired: (i64, bool, String) = sqlx::query_as(
+        "SELECT generation, desired_present, main_path FROM media_desired_states WHERE camera_id = ?",
+    )
+    .bind(camera_id)
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("load desired state before media side effect");
+    assert_eq!(desired.0, 1);
+    assert!(desired.1);
+    assert_eq!(desired.2, format!("cam_{}_main", camera_id.simple()));
+
+    assert!(reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("run queued reconciliation"));
+    let operation = reconciliation::get_operation(&context.state.pool, &operation_id)
+        .await
+        .expect("load completed operation");
+    assert_eq!(operation.state, "succeeded");
+    assert_eq!(operation.attempt, 1);
+    let path = camera_path(camera_id, "main");
+    let fake_path = context
+        .fake_media
+        .path(&path)
+        .expect("configured media path");
+    assert_eq!(
+        fake_path.source,
+        "rtsp://camera-user:camera-secret@camera.example/live"
+    );
+    assert!(fake_path.record);
+    assert!(!fake_path.source_on_demand);
+
+    let actual: (bool, bool, Option<Vec<u8>>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT present, record_configured, source_digest, applied_generation, last_operation_id \
+         FROM media_actual_paths WHERE path_name = ?",
+    )
+    .bind(&path)
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("load persisted actual state");
+    assert!(actual.0);
+    assert!(actual.1);
+    assert_eq!(actual.2.expect("source digest").len(), 32);
+    assert_eq!(actual.3, Some(1));
+    assert_eq!(actual.4.as_deref(), Some(operation_id.as_str()));
+
+    let operation_response = send_request(
+        &app,
+        Method::GET,
+        &format!("/api/media/operations/{operation_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(operation_response.status(), StatusCode::OK);
+    let serialized = response_json(operation_response).await.to_string();
+    assert!(!serialized.contains("camera-secret"));
+    assert!(!serialized.contains("camera.example"));
+
+    let delete_response = send_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/cameras/{camera_id}"),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
+    let delete_operation = response_json(delete_response).await;
+    assert_eq!(delete_operation["state"], "pending");
+    let delete_operation_id = delete_operation["id"].as_str().unwrap().to_string();
+    assert!(context.fake_media.path(&path).is_some());
+    let cameras =
+        response_json(send_request(&app, Method::GET, "/api/cameras", &admin, None).await).await;
+    assert!(cameras.as_array().unwrap().is_empty());
+    assert!(reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("apply queued media cleanup"));
+    assert!(context.fake_media.path(&path).is_none());
+    assert_eq!(
+        reconciliation::get_operation(&context.state.pool, &delete_operation_id)
+            .await
+            .expect("load completed delete operation")
+            .state,
+        "succeeded"
+    );
+    let desired_present: bool =
+        sqlx::query_scalar("SELECT desired_present FROM media_desired_states WHERE camera_id = ?")
+            .bind(camera_id)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("load deleted camera desired state");
+    assert!(!desired_present);
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn media_failure_is_sanitized_and_retries_to_success() {
+    let context = TestContext::migrated().await;
+    let (_admin_id, admin) = context.bootstrap().await;
+    let app = routes::router(context.state.clone());
+    let response = send_request(
+        &app,
+        Method::POST,
+        "/api/cameras",
+        &admin,
+        Some(json!({
+            "name": "Retry Camera",
+            "main_stream_url": "rtsp://camera.invalid/live",
+            "username": "admin",
+            "password": "database-secret",
+            "enabled": true,
+            "record_enabled": false
+        })),
+    )
+    .await;
+    let payload = response_json(response).await;
+    let operation_id = payload["operation_id"].as_str().unwrap().to_string();
+    context.fake_media.fail_next_mutations(1);
+
+    assert!(reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("record known media failure"));
+    let failed = reconciliation::get_operation(&context.state.pool, &operation_id)
+        .await
+        .expect("load failed operation");
+    assert_eq!(failed.state, "failed");
+    assert_eq!(failed.error_code.as_deref(), Some("media_request_failed"));
+    assert!(failed.retry_at.is_some());
+    let persisted_error = failed.error_message.unwrap_or_default();
+    for forbidden in [
+        "database-secret",
+        "server-secret",
+        "camera.invalid",
+        "rtsp://",
+    ] {
+        assert!(!persisted_error.contains(forbidden), "leaked {forbidden}");
+    }
+
+    sqlx::query("UPDATE media_operations SET retry_at = ? WHERE id = ?")
+        .bind(Utc::now() - chrono::Duration::seconds(1))
+        .bind(&operation_id)
+        .execute(&context.state.pool)
+        .await
+        .expect("make retry immediately due");
+    assert!(reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("retry media reconciliation"));
+    let succeeded = reconciliation::get_operation(&context.state.pool, &operation_id)
+        .await
+        .expect("load retried operation");
+    assert_eq!(succeeded.state, "succeeded");
+    assert_eq!(succeeded.attempt, 2);
+    assert!(succeeded.error_message.is_none());
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn media_restart_marks_running_unknown_then_safely_recovers() {
+    let context = TestContext::migrated().await;
+    let (_admin_id, admin) = context.bootstrap().await;
+    let app = routes::router(context.state.clone());
+    let response = send_request(
+        &app,
+        Method::POST,
+        "/api/cameras",
+        &admin,
+        Some(json!({
+            "name": "Restart Camera",
+            "main_stream_url": "rtsp://camera.example/restart",
+            "enabled": true,
+            "record_enabled": false
+        })),
+    )
+    .await;
+    let payload = response_json(response).await;
+    let operation_id = payload["operation_id"].as_str().unwrap().to_string();
+    sqlx::query(
+        "UPDATE media_operations SET state = 'running', attempt = 1, started_at = ?, \
+         lease_owner = 'dead-worker', lease_expires_at = ? WHERE id = ?",
+    )
+    .bind(Utc::now())
+    .bind(Utc::now() + chrono::Duration::minutes(1))
+    .bind(&operation_id)
+    .execute(&context.state.pool)
+    .await
+    .expect("simulate interrupted worker");
+
+    assert_eq!(
+        reconciliation::recover_interrupted_operations(&context.state.pool)
+            .await
+            .expect("recover interrupted operation"),
+        1
+    );
+    let unknown = reconciliation::get_operation(&context.state.pool, &operation_id)
+        .await
+        .expect("load unknown operation");
+    assert_eq!(unknown.state, "unknown");
+    assert_eq!(unknown.error_code.as_deref(), Some("worker_restarted"));
+
+    assert!(reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("safely retry idempotent desired state"));
+    let succeeded = reconciliation::get_operation(&context.state.pool, &operation_id)
+        .await
+        .expect("load recovered operation");
+    assert_eq!(succeeded.state, "succeeded");
+    assert_eq!(succeeded.attempt, 2);
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn media_claim_is_concurrent_safe_and_stable_state_is_idempotent() {
+    let context = TestContext::migrated().await;
+    let (_admin_id, admin) = context.bootstrap().await;
+    let app = routes::router(context.state.clone());
+    let response = send_request(
+        &app,
+        Method::POST,
+        "/api/cameras",
+        &admin,
+        Some(json!({
+            "name": "Concurrent Camera",
+            "main_stream_url": "rtsp://camera.example/concurrent",
+            "enabled": true,
+            "record_enabled": false
+        })),
+    )
+    .await;
+    let payload = response_json(response).await;
+    let camera_id: Uuid = serde_json::from_value(payload["camera"]["id"].clone()).unwrap();
+
+    let (first, second) = tokio::join!(
+        reconciliation::reconcile_once(&context.state),
+        reconciliation::reconcile_once(&context.state)
+    );
+    first.expect("first concurrent worker");
+    second.expect("second concurrent worker");
+    let calls_after_convergence = context.fake_media.mutation_calls();
+    let operation_debug: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, state, reason, finished_at FROM media_operations WHERE camera_id = ? ORDER BY created_at, id",
+    )
+    .bind(camera_id)
+    .fetch_all(&context.state.pool)
+    .await
+    .expect("load operation debug state");
+    assert_eq!(
+        calls_after_convergence, 2,
+        "operations: {operation_debug:?}"
+    );
+    let succeeded: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_operations WHERE camera_id = ? AND state = 'succeeded'",
+    )
+    .bind(camera_id)
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("count completed operations");
+    assert_eq!(succeeded, 1);
+
+    assert!(!reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("observe already converged state"));
+    assert_eq!(context.fake_media.mutation_calls(), calls_after_convergence);
+
+    let path = camera_path(camera_id, "main");
+    context.fake_media.remove_path(&path);
+    assert!(reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("repair externally introduced drift"));
+    assert!(context.fake_media.path(&path).is_some());
+    let operations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_operations WHERE camera_id = ?")
+            .bind(camera_id)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("count initial and drift operations");
+    assert_eq!(operations, 2);
+    context.state.pool.close().await;
 }

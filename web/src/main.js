@@ -256,7 +256,9 @@ async function saveCamera(event) {
   try {
     const result = await api(id ? `/api/cameras/${id}` : "/api/cameras", { method: id ? "PUT" : "POST", body: JSON.stringify(payload) });
     $("#camera-dialog").close();
-    toast(result.warning ? `设备已保存，但媒体同步失败：${result.warning}` : "摄像头已保存", result.warning ? "warning" : "success");
+    if (result.warning) toast(`设备已保存，但媒体同步失败：${result.warning}`, "warning");
+    else if (result.operation_state === "pending") toast("摄像头已保存，媒体配置正在后台应用", "success");
+    else toast("摄像头已保存", "success");
     await loadCameras();
   } catch (error) { toast(error.message, "error"); }
 }

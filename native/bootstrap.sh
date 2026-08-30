@@ -3,24 +3,29 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT_DIR/.env.native"
+RUNTIME_DIR="${SENTINEL_RUNTIME_DIR:-/mnt/c/Users/micro/sentinel-runtime}"
+DATABASE_PATH="$RUNTIME_DIR/data/sentinel.sqlite3"
+
+mkdir -p "$RUNTIME_DIR/data" "$RUNTIME_DIR/logs" "$RUNTIME_DIR/recordings"
 
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   source "$ENV_FILE"
   set +a
-  DB_PASSWORD="${DATABASE_URL#postgres://monitor:}"
-  DB_PASSWORD="${DB_PASSWORD%@*}"
-  ADMIN_PASSWORD="$BOOTSTRAP_ADMIN_PASSWORD"
+  if [[ "${DATABASE_URL:-}" != sqlite://* ]]; then
+    echo "Existing .env.native must use a sqlite:// DATABASE_URL" >&2
+    exit 1
+  fi
+  ADMIN_PASSWORD="${BOOTSTRAP_ADMIN_PASSWORD:-unchanged}"
 else
   umask 077
-  DB_PASSWORD="$(openssl rand -hex 24)"
   JWT_SECRET="$(openssl rand -hex 48)"
   CREDENTIAL_KEY="$(openssl rand -base64 32 | tr -d '\n')"
   ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24)"
 
   cat >"$ENV_FILE" <<EOF
 BIND_ADDR=0.0.0.0:8080
-DATABASE_URL=postgres://monitor:${DB_PASSWORD}@127.0.0.1:5432/monitor
+DATABASE_URL=sqlite://${DATABASE_PATH}
 APP_JWT_SECRET=${JWT_SECRET}
 CREDENTIALS_KEY=${CREDENTIAL_KEY}
 BOOTSTRAP_ADMIN_EMAIL=admin@sentinel.local
@@ -48,18 +53,6 @@ EOF
   chmod 600 "$ENV_FILE"
 fi
 
-/usr/sbin/runuser -u postgres -- /usr/bin/psql \
-  --set=ON_ERROR_STOP=1 \
-  --set=db_password="$DB_PASSWORD" \
-  --dbname=postgres <<'SQL'
-SELECT format('CREATE ROLE monitor LOGIN PASSWORD %L', :'db_password')
-WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'monitor') \gexec
-SELECT format('ALTER ROLE monitor WITH LOGIN PASSWORD %L', :'db_password') \gexec
-SELECT 'CREATE DATABASE monitor OWNER monitor'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'monitor') \gexec
-SELECT 'ALTER DATABASE monitor OWNER TO monitor' \gexec
-SQL
-
-echo "Database: monitor"
-echo "Administrator: admin@sentinel.local"
+echo "Database: ${DATABASE_URL:-sqlite://${DATABASE_PATH}}"
+echo "Administrator: ${BOOTSTRAP_ADMIN_EMAIL:-admin@sentinel.local}"
 echo "Temporary administrator password: $ADMIN_PASSWORD"

@@ -8,7 +8,7 @@
 IP Camera (RTSP / ONVIF)
           |
           v
-      MediaMTX  <------>  Rust / Axum  <------> PostgreSQL
+      MediaMTX  <------>  Rust / Axum  <------> SQLite
        |   |                |   |
     WHEP  HLS          Auth/API/PTZ       encrypted secrets
        \   /                |
@@ -19,7 +19,7 @@ IP Camera (RTSP / ONVIF)
 
 ## 物理机部署
 
-准备 PostgreSQL、MediaMTX、Caddy，以及本项目原生脚本。可参考
+准备受控版本的 MediaMTX、Caddy，以及本项目原生脚本。可参考
 [`native/README.md`](native/README.md)。
 
 简要步骤：
@@ -74,6 +74,43 @@ STATIC_DIR=web/dist
 生产模式始终使用 `__Host-sentinel_session` Secure/HttpOnly/SameSite Cookie。仅本机开发可设置 `APP_ENV=development`，且服务会拒绝绑定非 loopback 地址。
 登录入口同时按连接来源和规范化账户名执行有界 Token Bucket 限流；Argon2 并发与超时参数应按主机内存和 CPU 预算调整。
 
+## MediaMTX 一致性模型
+
+摄像头写接口不再把一次 HTTP 请求伪装成数据库与 MediaMTX 的原子事务：
+
+1. 创建、修改或删除摄像头时，先在同一个 SQLite 事务中提交摄像头期望态和
+   `media_operations` 记录；
+2. 后台协调器原子领取 `pending` 操作，再在事务之外调用 MediaMTX；
+3. 成功后记录 `succeeded` 与 `media_actual_paths`，明确失败记录 `failed` 并指数退避；
+4. 进程中断时，遗留的 `running` 在启动阶段转为 `unknown`，随后安全重试幂等的
+   Path upsert/delete；
+5. 周期性比较期望 Path 与 MediaMTX 的配置/Publisher/Recording 实际态，发现漂移会创建新的
+   `drift_detected` 操作。
+
+创建和修改响应保留原有的 `camera`、`media_synced`、`warning` 字段，并增加：
+
+```json
+{
+  "operation_id": "7a5d...",
+  "operation_state": "pending"
+}
+```
+
+其中 `media_synced=false` 表示已可靠排队而非失败。可通过
+`GET /api/media/operations/{operation_id}` 查询
+`pending/running/succeeded/failed/unknown`。删除接口改为 `202 Accepted` 并返回同一操作对象；
+摄像头会立即从产品 API 隐藏，但 MediaMTX Path 的异步清理状态仍可追踪。
+
+操作响应、持久错误和日志只包含摄像头 ID、操作 ID 与固定错误码。完整 RTSP Source、URL userinfo、
+用户名和密码均不会进入这些边界；实际态只保存不可逆 SHA-256 摘要。
+
+## MediaMTX Companion 契约
+
+原生部署固定使用 `linux_amd64` MediaMTX `v1.20.0`，其二进制 SHA-256 记录在
+[`native/mediamtx.lock`](native/mediamtx.lock)。`native/start.sh` 会同时校验平台、版本和摘要，
+任一不匹配都会拒绝启动。升级 MediaMTX 时必须在独立变更中更新二进制、锁文件、两份配置模板，
+并重跑协调器 fake-process 回归测试；不要使用浮动 `latest`。
+
 ## 角色权限
 
 | 操作 | 管理员 | 操作员 | 观察员 |
@@ -85,7 +122,7 @@ STATIC_DIR=web/dist
 
 ## 运维
 
-- 定期备份 PostgreSQL 与录像目录，并实际演练恢复。
+- 定期一致性备份 SQLite 数据库与录像目录，并实际演练恢复。
 - 将 `.env.native`、`auto.crt`、`auto.key` 放在主机秘密管理机制中，不要提交版本库。
 - 更换 `CREDENTIALS_KEY` 前先迁移已加密字段。
 - 摄像头放在独立 VLAN；MediaMTX 的 9996、9997、9998 端口不应暴露到互联网。

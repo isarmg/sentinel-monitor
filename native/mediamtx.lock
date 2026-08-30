@@ -1,0 +1,4 @@
+# Sentinel Monitor companion artifact contract.
+version=v1.20.0
+platform=linux_amd64
+sha256=25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336

@@ -23,6 +23,8 @@ pub enum AppError {
     RateLimited { retry_after: u64 },
     #[error("upstream media service: {0}")]
     Upstream(String),
+    #[error("upstream media service outcome is unknown: {0}")]
+    UpstreamUnknown(String),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("internal error: {0}")]
@@ -74,7 +76,7 @@ impl IntoResponse for AppError {
                 false,
                 Some(*retry_after),
             ),
-            Self::Upstream(_) => (
+            Self::Upstream(_) | Self::UpstreamUnknown(_) => (
                 StatusCode::BAD_GATEWAY,
                 "media_service_error",
                 "媒体服务暂时不可用".to_string(),

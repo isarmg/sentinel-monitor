@@ -15,7 +15,5 @@ show_status() {
 
 show_status "Rust application" "$RUNTIME_DIR/app.pid"
 show_status "MediaMTX" "$RUNTIME_DIR/mediamtx.pid"
-pg_isready || true
 curl -fsS http://127.0.0.1:8080/health/ready || true
 echo
-

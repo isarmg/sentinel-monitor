@@ -6,6 +6,7 @@ RUNTIME_DIR="${SENTINEL_RUNTIME_DIR:-/mnt/c/Users/micro/sentinel-runtime}"
 ENV_FILE="$ROOT_DIR/.env.native"
 MEDIA_BIN="$RUNTIME_DIR/bin/mediamtx"
 APP_BIN="$RUNTIME_DIR/bin/sentinel-monitor"
+MEDIA_LOCK="$ROOT_DIR/native/mediamtx.lock"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing $ENV_FILE" >&2
@@ -19,8 +20,30 @@ if [[ ! -x "$APP_BIN" ]]; then
   echo "Missing Rust application: $APP_BIN" >&2
   exit 1
 fi
-if ! pg_isready -q; then
-  echo "PostgreSQL is not ready" >&2
+if [[ ! -r "$MEDIA_LOCK" ]]; then
+  echo "Missing MediaMTX companion lock: $MEDIA_LOCK" >&2
+  exit 1
+fi
+
+locked_value() {
+  awk -F= -v key="$1" '$1 == key { print $2 }' "$MEDIA_LOCK"
+}
+
+EXPECTED_MEDIA_VERSION="$(locked_value version)"
+EXPECTED_MEDIA_PLATFORM="$(locked_value platform)"
+EXPECTED_MEDIA_SHA256="$(locked_value sha256)"
+ACTUAL_MEDIA_VERSION="$("$MEDIA_BIN" --version | tr -d '\r\n')"
+ACTUAL_MEDIA_SHA256="$(sha256sum "$MEDIA_BIN" | awk '{print $1}')"
+if [[ "$EXPECTED_MEDIA_PLATFORM" != "linux_amd64" ]]; then
+  echo "Unsupported MediaMTX companion platform: $EXPECTED_MEDIA_PLATFORM" >&2
+  exit 1
+fi
+if [[ "$ACTUAL_MEDIA_VERSION" != "$EXPECTED_MEDIA_VERSION" ]]; then
+  echo "MediaMTX version mismatch: expected $EXPECTED_MEDIA_VERSION, got $ACTUAL_MEDIA_VERSION" >&2
+  exit 1
+fi
+if [[ "$ACTUAL_MEDIA_SHA256" != "$EXPECTED_MEDIA_SHA256" ]]; then
+  echo "MediaMTX SHA-256 mismatch; refusing to start an unapproved companion" >&2
   exit 1
 fi
 
@@ -29,7 +52,7 @@ source "$ENV_FILE"
 set +a
 export STATIC_DIR="$ROOT_DIR/web/dist"
 
-mkdir -p "$RUNTIME_DIR/logs" "$RUNTIME_DIR/recordings"
+mkdir -p "$RUNTIME_DIR/data" "$RUNTIME_DIR/logs" "$RUNTIME_DIR/recordings"
 WSL_ADDRESS="$(hostname -I | awk '{print $1}')"
 MEDIA_HOSTS="${MEDIA_PUBLIC_HOSTS:-$WSL_ADDRESS}"
 

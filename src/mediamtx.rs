@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -17,6 +18,13 @@ pub struct PathSnapshot {
     pub ready: bool,
     pub readers: usize,
     pub tracks: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PathConfigSnapshot {
+    pub source_digest: Option<[u8; 32]>,
+    pub source_on_demand: bool,
+    pub record: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,14 +61,20 @@ impl MediaMtxClient {
         record: bool,
     ) -> Result<()> {
         let get_url = format!("{}/v3/config/paths/get/{path}", self.api_url);
-        let exists = self
+        let status = self
             .client
             .get(&get_url)
             .send()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))?
-            .status()
-            .is_success();
+            .map_err(|_| AppError::UpstreamUnknown("path lookup did not complete".into()))?
+            .status();
+        let exists = if status.is_success() {
+            true
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            false
+        } else {
+            return Err(AppError::Upstream(format!("path lookup returned {status}")));
+        };
 
         let payload = json!({
             "source": source,
@@ -82,13 +96,10 @@ impl MediaMtxClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))?;
+            .map_err(|_| AppError::UpstreamUnknown("path update did not complete".into()))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Upstream(format!(
-                "path {path} returned {status}: {body}"
-            )));
+            return Err(AppError::Upstream(format!("path update returned {status}")));
         }
         Ok(())
     }
@@ -99,12 +110,12 @@ impl MediaMtxClient {
             .delete(format!("{}/v3/config/paths/delete/{path}", self.api_url))
             .send()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))?;
+            .map_err(|_| AppError::UpstreamUnknown("path deletion did not complete".into()))?;
         if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(());
         }
         Err(AppError::Upstream(format!(
-            "delete path {path} returned {}",
+            "path deletion returned {}",
             response.status()
         )))
     }
@@ -115,7 +126,7 @@ impl MediaMtxClient {
             .get(format!("{}/v3/paths/list", self.api_url))
             .send()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))?;
+            .map_err(|_| AppError::UpstreamUnknown("path inventory did not complete".into()))?;
         if !response.status().is_success() {
             return Err(AppError::Upstream(format!(
                 "path list returned {}",
@@ -125,7 +136,7 @@ impl MediaMtxClient {
         let value: Value = response
             .json()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))?;
+            .map_err(|_| AppError::Upstream("path inventory response was invalid".into()))?;
         let mut paths = HashMap::new();
         for item in value
             .get("items")
@@ -156,6 +167,53 @@ impl MediaMtxClient {
         Ok(paths)
     }
 
+    pub async fn path_configs(&self) -> Result<HashMap<String, PathConfigSnapshot>> {
+        let response = self
+            .client
+            .get(format!("{}/v3/config/paths/list", self.api_url))
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::UpstreamUnknown("path configuration inventory did not complete".into())
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::Upstream(format!(
+                "path configuration inventory returned {}",
+                response.status()
+            )));
+        }
+        let value: Value = response.json().await.map_err(|_| {
+            AppError::Upstream("path configuration inventory response was invalid".into())
+        })?;
+        let mut paths = HashMap::new();
+        for item in value
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(name) = item.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let source_digest = item
+                .get("source")
+                .and_then(Value::as_str)
+                .map(source_digest);
+            paths.insert(
+                name.to_string(),
+                PathConfigSnapshot {
+                    source_digest,
+                    source_on_demand: item
+                        .get("sourceOnDemand")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    record: item.get("record").and_then(Value::as_bool).unwrap_or(false),
+                },
+            );
+        }
+        Ok(paths)
+    }
+
     pub async fn recordings(
         &self,
         path: &str,
@@ -177,7 +235,7 @@ impl MediaMtxClient {
             .query(&query)
             .send()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))?;
+            .map_err(|_| AppError::Upstream("recording list request failed".into()))?;
         if !response.status().is_success() {
             return Err(AppError::Upstream(format!(
                 "recording list returned {}",
@@ -187,7 +245,7 @@ impl MediaMtxClient {
         response
             .json()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))
+            .map_err(|_| AppError::Upstream("recording list response was invalid".into()))
     }
 
     pub async fn recording_stream(
@@ -215,6 +273,10 @@ impl MediaMtxClient {
         request
             .send()
             .await
-            .map_err(|error| AppError::Upstream(error.to_string()))
+            .map_err(|_| AppError::Upstream("recording stream request failed".into()))
     }
+}
+
+pub fn source_digest(source: &str) -> [u8; 32] {
+    Sha256::digest(source.as_bytes()).into()
 }

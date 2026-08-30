@@ -1,16 +1,15 @@
 use crate::{
-    error::{AppError, Result},
+    error::Result,
     models::{CameraRecord, EventRecord},
-    AppState,
+    reconciliation, AppState,
 };
 use serde_json::{json, Value};
 use tokio::time::{self, MissedTickBehavior};
-use url::Url;
 use uuid::Uuid;
 
 const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, \
     onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at \
-    FROM cameras";
+    FROM cameras WHERE deleted_at IS NULL";
 
 pub fn spawn(state: AppState) {
     let reconcile_state = state.clone();
@@ -19,8 +18,8 @@ pub fn spawn(state: AppState) {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(error) = reconcile_all(&reconcile_state).await {
-                tracing::warn!(%error, "camera reconciliation failed");
+            if let Err(error) = reconciliation::reconcile_available(&reconcile_state).await {
+                tracing::warn!(error = %error, "camera reconciliation cycle failed");
             }
         }
     });
@@ -40,47 +39,6 @@ pub fn spawn(state: AppState) {
 
 pub fn camera_path(id: Uuid, profile: &str) -> String {
     format!("cam_{}_{}", id.simple(), profile)
-}
-
-pub async fn sync_camera(state: &AppState, camera: &CameraRecord) -> Result<()> {
-    let main_path = camera_path(camera.id, "main");
-    let sub_path = camera_path(camera.id, "sub");
-    if !camera.enabled {
-        state.media.delete_path(&main_path).await?;
-        state.media.delete_path(&sub_path).await?;
-        return Ok(());
-    }
-
-    let password = camera
-        .password_enc
-        .as_deref()
-        .map(|value| state.secrets.decrypt(value))
-        .transpose()?;
-    let main_url = state.secrets.decrypt(&camera.main_stream_url_enc)?;
-    let main_source =
-        source_with_credentials(&main_url, camera.username.as_deref(), password.as_deref())?;
-    state
-        .media
-        .upsert_path(
-            &main_path,
-            &main_source,
-            !camera.record_enabled,
-            camera.record_enabled,
-        )
-        .await?;
-
-    if let Some(encrypted) = &camera.sub_stream_url_enc {
-        let sub_url = state.secrets.decrypt(encrypted)?;
-        let sub_source =
-            source_with_credentials(&sub_url, camera.username.as_deref(), password.as_deref())?;
-        state
-            .media
-            .upsert_path(&sub_path, &sub_source, true, false)
-            .await?;
-    } else {
-        state.media.delete_path(&sub_path).await?;
-    }
-    Ok(())
 }
 
 pub async fn emit_event(
@@ -108,24 +66,6 @@ pub async fn emit_event(
     .await?;
     let _ = state.events.send(event.clone());
     Ok(event)
-}
-
-async fn reconcile_all(state: &AppState) -> Result<()> {
-    let cameras = sqlx::query_as::<_, CameraRecord>(CAMERA_SELECT)
-        .fetch_all(&state.pool)
-        .await?;
-    for camera in cameras {
-        if let Err(error) = sync_camera(state, &camera).await {
-            tracing::warn!(camera_id = %camera.id, %error, "camera media sync failed");
-            sqlx::query(
-                "UPDATE cameras SET status = 'error', updated_at = datetime('now') WHERE id = ?",
-            )
-            .bind(camera.id)
-            .execute(&state.pool)
-            .await?;
-        }
-    }
-    Ok(())
 }
 
 async fn refresh_statuses(state: &AppState) -> Result<()> {
@@ -183,31 +123,4 @@ async fn refresh_statuses(state: &AppState) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn source_with_credentials(
-    source: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> Result<String> {
-    let mut url =
-        Url::parse(source).map_err(|_| AppError::Validation("RTSP地址格式无效".into()))?;
-    if !matches!(url.scheme(), "rtsp" | "rtsps") {
-        return Err(AppError::Validation(
-            "流地址必须使用rtsp://或rtsps://".into(),
-        ));
-    }
-    if url.username().is_empty() {
-        if let Some(username) = username.filter(|value| !value.is_empty()) {
-            url.set_username(username)
-                .map_err(|_| AppError::Validation("摄像头用户名无效".into()))?;
-        }
-    }
-    if url.password().is_none() {
-        if let Some(password) = password {
-            url.set_password(Some(password))
-                .map_err(|_| AppError::Validation("摄像头密码无效".into()))?;
-        }
-    }
-    Ok(url.to_string())
 }

@@ -4,10 +4,10 @@ use crate::{
         expired_session_cookie, hash_password, issue_media_token, issue_session, revoke_session,
         session_cookie, CurrentUser,
     },
-    background::{camera_path, sync_camera},
+    background::camera_path,
     error::{AppError, Result},
     models::*,
-    onvif, AppState,
+    onvif, reconciliation, AppState,
 };
 use async_stream::stream;
 use axum::{
@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{id}", put(update_user).delete(delete_user))
         .route("/cameras", get(list_cameras).post(create_camera))
         .route("/cameras/{id}", put(update_camera).delete(delete_camera))
+        .route("/media/operations/{id}", get(media_operation))
         .route("/cameras/{id}/stream-ticket", get(stream_ticket))
         .route("/cameras/{id}/ptz", post(ptz))
         .route("/discovery/onvif", post(discover_onvif))
@@ -272,9 +273,11 @@ async fn list_cameras(
     _user: CurrentUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CameraView>>> {
-    let cameras = sqlx::query_as::<_, CameraRecord>(&format!("{CAMERA_SELECT} ORDER BY name"))
-        .fetch_all(&state.pool)
-        .await?;
+    let cameras = sqlx::query_as::<_, CameraRecord>(&format!(
+        "{CAMERA_SELECT} WHERE deleted_at IS NULL ORDER BY name"
+    ))
+    .fetch_all(&state.pool)
+    .await?;
     Ok(Json(cameras.iter().map(CameraView::from).collect()))
 }
 
@@ -291,6 +294,7 @@ async fn create_camera(
         request.onvif_url.as_deref(),
     )?;
     let now = Utc::now();
+    let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, CameraRecord>(
         "INSERT INTO cameras (id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, created_by, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
@@ -323,17 +327,17 @@ async fn create_camera(
     .bind(user.id)
     .bind(now)
     .bind(now)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *transaction)
     .await?;
-
-    let sync_result = sync_camera(&state, &record).await;
-    let warning = sync_result.as_ref().err().map(ToString::to_string);
-    if warning.is_some() {
-        sqlx::query("UPDATE cameras SET status = 'error' WHERE id = ?")
-            .bind(record.id)
-            .execute(&state.pool)
-            .await?;
-    }
+    let operation = reconciliation::queue_camera_change(
+        &mut transaction,
+        &record,
+        record.enabled,
+        user.id,
+        "camera_created",
+    )
+    .await?;
+    transaction.commit().await?;
     write_audit(
         &state,
         Some(user.id),
@@ -347,8 +351,10 @@ async fn create_camera(
         StatusCode::CREATED,
         Json(CameraMutationResponse {
             camera: CameraView::from(&record),
-            media_synced: sync_result.is_ok(),
-            warning,
+            media_synced: false,
+            warning: None,
+            operation_id: operation.id,
+            operation_state: operation.state,
         }),
     ))
 }
@@ -411,8 +417,9 @@ async fn update_camera(
     }
 
     let updated_at = Utc::now();
+    let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, CameraRecord>(
-        "UPDATE cameras SET name = ?1, location = ?2, main_stream_url_enc = ?3, sub_stream_url_enc = ?4, onvif_url = ?5, username = ?6, password_enc = ?7, enabled = ?8, record_enabled = ?9, status = CASE WHEN ?8 THEN 'pending' ELSE 'disabled' END, updated_at = ?10 WHERE id = ?11 \
+        "UPDATE cameras SET name = ?1, location = ?2, main_stream_url_enc = ?3, sub_stream_url_enc = ?4, onvif_url = ?5, username = ?6, password_enc = ?7, enabled = ?8, record_enabled = ?9, status = CASE WHEN ?8 THEN 'pending' ELSE 'disabled' END, updated_at = ?10 WHERE id = ?11 AND deleted_at IS NULL \
          RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
     )
     .bind(name.trim())
@@ -426,17 +433,17 @@ async fn update_camera(
     .bind(record_enabled)
     .bind(updated_at)
     .bind(id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *transaction)
     .await?;
-
-    let sync_result = sync_camera(&state, &record).await;
-    let warning = sync_result.as_ref().err().map(ToString::to_string);
-    if warning.is_some() {
-        sqlx::query("UPDATE cameras SET status = 'error' WHERE id = ?")
-            .bind(id)
-            .execute(&state.pool)
-            .await?;
-    }
+    let operation = reconciliation::queue_camera_change(
+        &mut transaction,
+        &record,
+        record.enabled,
+        user.id,
+        "camera_updated",
+    )
+    .await?;
+    transaction.commit().await?;
     write_audit(
         &state,
         Some(user.id),
@@ -448,8 +455,10 @@ async fn update_camera(
     .await;
     Ok(Json(CameraMutationResponse {
         camera: CameraView::from(&record),
-        media_synced: sync_result.is_ok(),
-        warning,
+        media_synced: false,
+        warning: None,
+        operation_id: operation.id,
+        operation_state: operation.state,
     }))
 }
 
@@ -457,19 +466,29 @@ async fn delete_camera(
     user: CurrentUser,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<StatusCode> {
+) -> Result<(StatusCode, Json<reconciliation::MediaOperationView>)> {
     user.require_admin()?;
     let camera = load_camera(&state, id).await?;
-    sqlx::query("DELETE FROM cameras WHERE id = ?")
-        .bind(id)
-        .execute(&state.pool)
-        .await?;
-    if let Err(error) = state.media.delete_path(&camera_path(id, "main")).await {
-        tracing::warn!(%error, camera_id = %id, "main path cleanup failed");
-    }
-    if let Err(error) = state.media.delete_path(&camera_path(id, "sub")).await {
-        tracing::warn!(%error, camera_id = %id, "sub path cleanup failed");
-    }
+    let mut transaction = state.pool.begin().await?;
+    let now = Utc::now();
+    sqlx::query(
+        "UPDATE cameras SET deleted_at = ?, status = 'disabled', updated_at = ? \
+         WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    let operation = reconciliation::queue_camera_change(
+        &mut transaction,
+        &camera,
+        false,
+        user.id,
+        "camera_deleted",
+    )
+    .await?;
+    transaction.commit().await?;
     write_audit(
         &state,
         Some(user.id),
@@ -479,7 +498,15 @@ async fn delete_camera(
         json!({ "name": camera.name }),
     )
     .await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((StatusCode::ACCEPTED, Json(operation)))
+}
+
+async fn media_operation(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<reconciliation::MediaOperationView>> {
+    Ok(Json(reconciliation::get_operation(&state.pool, &id).await?))
 }
 
 async fn stream_ticket(
@@ -773,7 +800,9 @@ async fn list_audit(
 
 async fn system_status(_user: CurrentUser, State(state): State<AppState>) -> Result<Json<Value>> {
     let (total, online, recording): (i64, i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'online'), COUNT(*) FILTER (WHERE record_enabled AND enabled) FROM cameras",
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'online'), \
+         COUNT(*) FILTER (WHERE record_enabled AND enabled) \
+         FROM cameras WHERE deleted_at IS NULL",
     )
     .fetch_one(&state.pool)
     .await?;
@@ -837,11 +866,13 @@ async fn ready(State(state): State<AppState>) -> Response {
 }
 
 async fn load_camera(state: &AppState, id: Uuid) -> Result<CameraRecord> {
-    sqlx::query_as::<_, CameraRecord>(&format!("{CAMERA_SELECT} WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(|| AppError::NotFound("摄像头不存在".into()))
+    sqlx::query_as::<_, CameraRecord>(&format!(
+        "{CAMERA_SELECT} WHERE id = ? AND deleted_at IS NULL"
+    ))
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("摄像头不存在".into()))
 }
 
 async fn load_user(state: &AppState, id: Uuid) -> Result<UserRecord> {

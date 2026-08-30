@@ -7,6 +7,7 @@ mod login_security;
 mod mediamtx;
 mod models;
 mod onvif;
+mod reconciliation;
 mod routes;
 mod sqlite;
 
@@ -78,6 +79,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     auth::bootstrap_admin(&state).await?;
+    let recovered = reconciliation::recover_interrupted_operations(&state.pool).await?;
+    if recovered > 0 {
+        tracing::warn!(
+            recovered_operations = recovered,
+            "interrupted media operations were marked unknown for safe reconciliation"
+        );
+    }
     background::spawn(state.clone());
 
     let listener = TcpListener::bind(config.bind_addr).await?;
