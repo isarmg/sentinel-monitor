@@ -6,14 +6,16 @@ use crate::{
     background::emit_event,
     config::Config,
     crypto::SecretBox,
+    login_security::LoginProtection,
     mediamtx::MediaMtxClient,
     models::CameraRecord,
     routes, sqlite, AppState,
 };
 use axum::{
     body::{to_bytes, Body},
+    extract::ConnectInfo,
     http::{
-        header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE},
+        header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, RETRY_AFTER, SET_COOKIE},
         HeaderMap, Method, Request, StatusCode,
     },
     response::Response,
@@ -22,7 +24,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sqlx::{SqliteConnection, SqlitePool};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::broadcast, task::JoinHandle};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -66,6 +68,7 @@ struct BrowserRequestContext<'a> {
     csrf_token: Option<&'a str>,
     host: Option<&'a str>,
     origin: Option<&'a str>,
+    source: Option<SocketAddr>,
 }
 
 impl Drop for TestContext {
@@ -141,6 +144,14 @@ impl TestContext {
             development_mode: true,
             session_idle_ttl: Duration::from_secs(1_800),
             session_absolute_ttl: Duration::from_secs(3_600),
+            login_body_limit: 16_384,
+            login_rate_capacity: 4_096,
+            login_source_attempts: 30,
+            login_source_window: Duration::from_secs(60),
+            login_account_attempts: 10,
+            login_account_window: Duration::from_secs(300),
+            login_argon2_parallelism: 2,
+            login_argon2_timeout: Duration::from_secs(5),
             media_token_ttl: Duration::from_secs(120),
             mediamtx_api_url: media_url.clone(),
             mediamtx_playback_url: media_url,
@@ -170,6 +181,7 @@ impl TestContext {
             http,
             media,
             events,
+            login: LoginProtection::new(&config),
         };
 
         Self {
@@ -225,6 +237,7 @@ async fn send_request(
             csrf_token: Some(&credentials.csrf_token),
             host: Some("sentinel.test"),
             origin: Some("https://sentinel.test"),
+            source: None,
         },
         value,
     )
@@ -255,6 +268,9 @@ async fn send_custom_request(
         builder = builder.header("x-csrf-token", csrf_token);
     }
     let request = builder
+        .extension(ConnectInfo(context.source.unwrap_or_else(|| {
+            "192.0.2.10:41000".parse().expect("default test source")
+        })))
         .header("content-type", "application/json")
         .body(body)
         .expect("build test request");
@@ -282,6 +298,22 @@ fn set_cookie_value(headers: &HeaderMap, name: &str) -> String {
             Some(value.split(';').next().unwrap_or_default().to_string())
         })
         .unwrap_or_else(|| panic!("missing {name} Set-Cookie header"))
+}
+
+async fn send_login(app: &Router, email: &str, password: &str, source: SocketAddr) -> Response {
+    send_custom_request(
+        app,
+        Method::POST,
+        "/api/auth/login",
+        BrowserRequestContext {
+            host: Some("sentinel.test"),
+            origin: Some("https://sentinel.test"),
+            source: Some(source),
+            ..Default::default()
+        },
+        Some(json!({ "email": email, "password": password })),
+    )
+    .await
 }
 
 async fn response_json(response: Response) -> Value {
@@ -849,6 +881,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
             csrf_token: Some(&second.csrf_token),
             host: Some("sentinel.test"),
             origin: Some("https://sentinel.test"),
+            source: None,
         },
         None,
     )
@@ -863,6 +896,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
             csrf_token: Some(&first.csrf_token),
             host: Some("sentinel.test"),
             origin: Some("https://attacker.test"),
+            source: None,
         },
         None,
     )
@@ -877,6 +911,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
             csrf_token: Some(&first.csrf_token),
             host: Some("sentinel.test"),
             origin: None,
+            source: None,
         },
         None,
     )
@@ -996,6 +1031,98 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
             .status(),
         StatusCode::UNAUTHORIZED
     );
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn login_budget_limits_body_and_both_bounded_rate_dimensions() {
+    let mut context = TestContext::migrated().await;
+    bootstrap_admin(&context.state)
+        .await
+        .expect("bootstrap administrator");
+    context.state.login = LoginProtection::for_test(2, 10, 2, 2, Duration::from_secs(5));
+    let app = routes::router(context.state.clone());
+
+    let oversized = send_login(
+        &app,
+        &"x".repeat(context.state.config.login_body_limit + 1),
+        "irrelevant-password",
+        "192.0.2.1:41000".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    for source in ["192.0.2.11:41000", "192.0.2.12:41000"] {
+        let response = send_login(
+            &app,
+            "unknown@example.com",
+            "wrong-password",
+            source.parse().unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = send_login(
+        &app,
+        "UNKNOWN@example.com",
+        "wrong-password",
+        "192.0.2.13:41000".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().contains_key(RETRY_AFTER));
+
+    drop(app);
+    context.state.login = LoginProtection::for_test(2, 2, 10, 2, Duration::from_secs(5));
+    let app = routes::router(context.state.clone());
+    let source = "198.51.100.20:42000".parse().unwrap();
+    for account in ["one@example.com", "two@example.com"] {
+        let response = send_login(&app, account, "wrong-password", source).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = send_login(&app, "three@example.com", "wrong-password", source).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .expect("429 must include Retry-After")
+        .to_str()
+        .expect("Retry-After header value")
+        .parse::<u64>()
+        .expect("Retry-After seconds");
+    assert!(retry_after >= 1);
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn login_argon2_global_gate_times_out_with_retry_after() {
+    let mut context = TestContext::migrated().await;
+    bootstrap_admin(&context.state)
+        .await
+        .expect("bootstrap administrator");
+    context.state.login = LoginProtection::for_test(8, 100, 100, 0, Duration::from_millis(20));
+    let app = routes::router(context.state.clone());
+
+    let response = send_login(
+        &app,
+        "admin@example.com",
+        "bootstrap-password",
+        "203.0.113.10:43000".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("timeout must include Retry-After"),
+        "1"
+    );
+    let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM browser_sessions")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("count sessions after timed out verifier");
+    assert_eq!(session_count, 0);
     context.state.pool.close().await;
 }
 

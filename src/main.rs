@@ -3,6 +3,7 @@ mod background;
 mod config;
 mod crypto;
 mod error;
+mod login_security;
 mod mediamtx;
 mod models;
 mod onvif;
@@ -17,6 +18,7 @@ static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 
 use config::Config;
 use crypto::SecretBox;
+use login_security::LoginProtection;
 use mediamtx::MediaMtxClient;
 use models::EventRecord;
 use sqlx::SqlitePool;
@@ -32,6 +34,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub media: MediaMtxClient,
     pub events: broadcast::Sender<EventRecord>,
+    pub login: LoginProtection,
 }
 
 #[tokio::main]
@@ -71,6 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         http,
         media,
         events,
+        login: LoginProtection::new(&config),
     };
 
     auth::bootstrap_admin(&state).await?;
@@ -78,9 +82,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = TcpListener::bind(config.bind_addr).await?;
     tracing::info!(address = %config.bind_addr, "sentinel monitor started");
-    axum::serve(listener, routes::router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        routes::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 

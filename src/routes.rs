@@ -2,7 +2,7 @@ use crate::{
     auth::{
         csrf_cookie, decode_media_token, enforce_browser_security, expired_csrf_cookie,
         expired_session_cookie, hash_password, issue_media_token, issue_session, revoke_session,
-        session_cookie, verify_password, CurrentUser,
+        session_cookie, CurrentUser,
     },
     background::{camera_path, sync_camera},
     error::{AppError, Result},
@@ -12,7 +12,7 @@ use crate::{
 use async_stream::stream;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{
         header::{
             ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, time::Duration};
 use tower_http::{compression::CompressionLayer, services::ServeDir, trace::TraceLayer};
 use url::Url;
 use uuid::Uuid;
@@ -40,7 +40,10 @@ const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub
 pub fn router(state: AppState) -> Router {
     let static_dir = state.config.static_dir.clone();
     let api = Router::new()
-        .route("/auth/login", post(login))
+        .route(
+            "/auth/login",
+            post(login).layer(DefaultBodyLimit::max(state.config.login_body_limit)),
+        )
         .route("/auth/logout", post(logout))
         .route("/me", get(me))
         .route("/users", get(list_users).post(create_user))
@@ -74,19 +77,26 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn login(
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<impl IntoResponse> {
+    state
+        .login
+        .check_attempt(source.ip(), request.email.trim())?;
     let user =
         sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} WHERE LOWER(email) = LOWER(?)"))
             .bind(request.email.trim())
             .fetch_optional(&state.pool)
-            .await?
-            .filter(|user| user.active)
-            .ok_or(AppError::Unauthorized)?;
-    if !verify_password(&request.password, &user.password_hash) {
-        return Err(AppError::Unauthorized);
-    }
+            .await?;
+    let password_hash = user
+        .as_ref()
+        .map(|user| user.password_hash.clone())
+        .unwrap_or_else(|| state.login.dummy_password_hash().to_string());
+    let verified = state.login.verify(request.password, password_hash).await?;
+    let user = user
+        .filter(|user| user.active && verified)
+        .ok_or(AppError::Unauthorized)?;
 
     sqlx::query("UPDATE users SET last_login_at = datetime('now') WHERE id = ?")
         .bind(user.id)
