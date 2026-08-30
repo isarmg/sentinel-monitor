@@ -87,10 +87,8 @@ done
 
 if ! is_running "$RUNTIME_DIR/app.pid"; then
   cd "$ROOT_DIR"
-  # The inherited lock descriptor remains open after flock execs the Rust app.
-  nohup flock --no-fork --nonblock "$RUNTIME_DIR/app.lock" \
-    "$APP_BIN" >"$RUNTIME_DIR/logs/app.log" 2>&1 &
-  echo $! >"$RUNTIME_DIR/app.pid"
+  # The Rust process owns app.lock and app.pid itself for its full lifetime.
+  nohup "$APP_BIN" >"$RUNTIME_DIR/logs/app.log" 2>&1 &
 fi
 
 for _ in {1..60}; do

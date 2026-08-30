@@ -54,6 +54,7 @@ PUBLIC_HLS_BASE_URL=http://127.0.0.1:8888
 STATIC_DIR=/mnt/sarmg.org/sentinel-monitor/web/dist
 STATUS_INTERVAL_SECS=10
 RECONCILE_INTERVAL_SECS=60
+REQUEST_TIMEOUT_SECS=20
 RUST_LOG=info,tower_http=info
 EOF
   chmod 600 "$ENV_FILE"

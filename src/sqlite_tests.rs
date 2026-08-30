@@ -277,6 +277,7 @@ impl TestContext {
             database_url,
             jwt_secret: b"sentinel-test-jwt-secret-32-bytes".to_vec(),
             credentials_key: [7; 32],
+            runtime_directory: std::env::temp_dir(),
             bootstrap_admin_email: "admin@example.com".into(),
             bootstrap_admin_password: Some("bootstrap-password".into()),
             development_mode: true,
@@ -1516,7 +1517,7 @@ async fn media_failure_is_sanitized_and_retries_to_success() {
 }
 
 #[tokio::test]
-async fn media_restart_marks_running_unknown_then_safely_recovers() {
+async fn media_startup_preserves_active_leases_and_recovers_only_expired_work() {
     let context = TestContext::migrated().await;
     let (_admin_id, admin) = context.bootstrap().await;
     let app = routes::router(context.state.clone());
@@ -1535,28 +1536,73 @@ async fn media_restart_marks_running_unknown_then_safely_recovers() {
     .await;
     let payload = response_json(response).await;
     let operation_id = payload["operation_id"].as_str().unwrap().to_string();
+    let now = Utc::now();
+    let active_until = now + chrono::Duration::minutes(1);
     sqlx::query(
         "UPDATE media_operations SET state = 'running', attempt = 1, started_at = ?, \
-         lease_owner = 'dead-worker', lease_expires_at = ? WHERE id = ?",
+         lease_owner = 'healthy-worker', lease_expires_at = ? WHERE id = ?",
     )
-    .bind(Utc::now())
-    .bind(Utc::now() + chrono::Duration::minutes(1))
+    .bind(now)
+    .bind(active_until)
     .bind(&operation_id)
     .execute(&context.state.pool)
     .await
-    .expect("simulate interrupted worker");
+    .expect("simulate active worker");
+    sqlx::query(
+        "UPDATE media_reconciler_leases SET lease_owner = 'healthy-worker', \
+         lease_expires_at = ?, updated_at = ? WHERE scope = 'global'",
+    )
+    .bind(active_until)
+    .bind(now)
+    .execute(&context.state.pool)
+    .await
+    .expect("record active global lease");
 
     assert_eq!(
         reconciliation::recover_interrupted_operations(&context.state.pool)
             .await
-            .expect("recover interrupted operation"),
+            .expect("preserve active operation"),
+        0
+    );
+    let active: (String, Option<String>) =
+        sqlx::query_as("SELECT state, lease_owner FROM media_operations WHERE id = ?")
+            .bind(&operation_id)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("load active operation");
+    assert_eq!(active, ("running".into(), Some("healthy-worker".into())));
+    let global_owner: Option<String> = sqlx::query_scalar(
+        "SELECT lease_owner FROM media_reconciler_leases WHERE scope = 'global'",
+    )
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("load active global lease");
+    assert_eq!(global_owner.as_deref(), Some("healthy-worker"));
+
+    let expired_at = Utc::now() - chrono::Duration::seconds(1);
+    sqlx::query("UPDATE media_operations SET lease_expires_at = ? WHERE id = ?")
+        .bind(expired_at)
+        .bind(&operation_id)
+        .execute(&context.state.pool)
+        .await
+        .expect("expire operation lease");
+    assert_eq!(
+        reconciliation::recover_interrupted_operations(&context.state.pool)
+            .await
+            .expect("recover expired operation"),
         1
     );
     let unknown = reconciliation::get_operation(&context.state.pool, &operation_id)
         .await
         .expect("load unknown operation");
     assert_eq!(unknown.state, "unknown");
-    assert_eq!(unknown.error_code.as_deref(), Some("worker_restarted"));
+    assert_eq!(unknown.error_code.as_deref(), Some("worker_lease_expired"));
+
+    sqlx::query("UPDATE media_reconciler_leases SET lease_expires_at = ? WHERE scope = 'global'")
+        .bind(expired_at)
+        .execute(&context.state.pool)
+        .await
+        .expect("expire global lease for takeover");
 
     assert!(reconciliation::reconcile_once(&context.state)
         .await

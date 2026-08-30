@@ -10,6 +10,7 @@ mod models;
 mod onvif;
 mod reconciliation;
 mod routes;
+mod runtime_lock;
 mod sqlite;
 
 #[cfg(test)]
@@ -254,6 +255,7 @@ fn required_credentials_key() -> anyhow::Result<[u8; 32]> {
 async fn serve() -> anyhow::Result<()> {
     let config =
         Arc::new(Config::from_env().map_err(|error| anyhow::anyhow!("configuration: {error}"))?);
+    let _application_lock = runtime_lock::ApplicationLock::acquire(&config.runtime_directory)?;
     if config.development_mode {
         tracing::warn!(
             address = %config.bind_addr,
@@ -288,7 +290,7 @@ async fn serve() -> anyhow::Result<()> {
     if recovered > 0 {
         tracing::warn!(
             recovered_operations = recovered,
-            "interrupted media operations were marked unknown for safe reconciliation"
+            "expired media operation leases were marked unknown for safe reconciliation"
         );
     }
     background::spawn(state.clone());

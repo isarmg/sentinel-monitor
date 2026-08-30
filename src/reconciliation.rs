@@ -9,15 +9,20 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::json;
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use std::time::Duration as StdDuration;
 use url::Url;
 use uuid::Uuid;
+
+const GLOBAL_LEASE_REQUEST_BUDGET: u64 = 6;
+const OPERATION_LEASE_REQUEST_BUDGET: u64 = 4;
+const LEASE_SAFETY_MARGIN_SECONDS: u64 = 30;
 
 const CAMERA_SELECT_INTERNAL: &str = "SELECT id, name, location, main_stream_url_enc, \
     sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, \
     last_seen_at, created_at, updated_at FROM cameras";
 const OPERATION_SELECT: &str = "SELECT id, camera_id, generation, kind, state, reason, \
     requested_by, attempt, created_at, started_at, finished_at, retry_at, error_code, \
-    error_message FROM media_operations";
+    error_message, lease_owner, lease_expires_at FROM media_operations";
 
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]
 pub struct MediaOperationView {
@@ -35,6 +40,10 @@ pub struct MediaOperationView {
     pub retry_at: Option<DateTime<Utc>>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(skip_serializing)]
+    pub lease_owner: Option<String>,
+    #[serde(skip_serializing)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -128,20 +137,21 @@ pub async fn get_operation(pool: &SqlitePool, id: &str) -> Result<MediaOperation
 }
 
 pub async fn recover_interrupted_operations(pool: &SqlitePool) -> Result<u64> {
-    let now = Utc::now();
-    sqlx::query(
-        "UPDATE media_reconciler_leases SET lease_owner = NULL, lease_expires_at = NULL, \
-         updated_at = ? WHERE scope = 'global'",
-    )
-    .bind(now)
-    .execute(pool)
-    .await?;
+    recover_expired_operation_leases(pool).await
+}
+
+async fn recover_expired_operation_leases(pool: &SqlitePool) -> Result<u64> {
+    recover_expired_operation_leases_at(pool, Utc::now()).await
+}
+
+async fn recover_expired_operation_leases_at(pool: &SqlitePool, now: DateTime<Utc>) -> Result<u64> {
     let result = sqlx::query(
         "UPDATE media_operations SET state = 'unknown', finished_at = NULL, retry_at = ?, \
-         lease_owner = NULL, lease_expires_at = NULL, error_code = 'worker_restarted', \
-         error_message = 'The previous worker stopped before the outcome was recorded' \
-         WHERE state = 'running'",
+         lease_owner = NULL, lease_expires_at = NULL, error_code = 'worker_lease_expired', \
+         error_message = 'The worker lease expired before the outcome was recorded' \
+         WHERE state = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
     )
+    .bind(now)
     .bind(now)
     .execute(pool)
     .await?;
@@ -154,40 +164,31 @@ pub async fn reconcile_once(state: &AppState) -> Result<bool> {
     };
     let result = async {
         recover_expired_operation_leases(&state.pool).await?;
-        reconcile_once_with_lease(state).await
+        reconcile_once_with_lease(state, &lease_owner).await
     }
     .await;
     let release = release_reconciler_lease(&state.pool, &lease_owner).await;
     match (result, release) {
-        (Ok(processed), Ok(())) => Ok(processed),
+        (Ok(processed), Ok(_)) => Ok(processed),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
 }
 
-async fn recover_expired_operation_leases(pool: &SqlitePool) -> Result<u64> {
-    let now = Utc::now();
-    let result = sqlx::query(
-        "UPDATE media_operations SET state = 'unknown', finished_at = NULL, retry_at = ?, \
-         lease_owner = NULL, lease_expires_at = NULL, error_code = 'worker_lease_expired', \
-         error_message = 'The worker lease expired before the outcome was recorded' \
-         WHERE state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
-    )
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-async fn reconcile_once_with_lease(state: &AppState) -> Result<bool> {
-    if let Some(operation) = claim_next_operation(&state.pool).await? {
+async fn reconcile_once_with_lease(state: &AppState, lease_owner: &str) -> Result<bool> {
+    renew_global_lease(state, lease_owner).await?;
+    if let Some(operation) =
+        claim_next_operation(&state.pool, lease_owner, state.config.request_timeout).await?
+    {
         apply_claimed_operation(state, operation).await?;
         return Ok(true);
     }
 
     observe_and_schedule_drift(state).await?;
-    if let Some(operation) = claim_next_operation(&state.pool).await? {
+    renew_global_lease(state, lease_owner).await?;
+    if let Some(operation) =
+        claim_next_operation(&state.pool, lease_owner, state.config.request_timeout).await?
+    {
         apply_claimed_operation(state, operation).await?;
         return Ok(true);
     }
@@ -196,16 +197,16 @@ async fn reconcile_once_with_lease(state: &AppState) -> Result<bool> {
 
 async fn acquire_reconciler_lease(state: &AppState) -> Result<Option<String>> {
     let now = Utc::now();
-    let timeout_seconds = i64::try_from(state.config.request_timeout.as_secs())
-        .unwrap_or(i64::MAX / 8)
-        .saturating_mul(8)
-        .saturating_add(30)
-        .clamp(60, 3_600);
-    let lease_expires_at = now + Duration::seconds(timeout_seconds);
+    let lease_expires_at = lease_deadline(
+        now,
+        state.config.request_timeout,
+        GLOBAL_LEASE_REQUEST_BUDGET,
+    );
     let owner = Uuid::new_v4().to_string();
     sqlx::query_scalar::<_, String>(
         "UPDATE media_reconciler_leases SET lease_owner = ?, lease_expires_at = ?, updated_at = ? \
-         WHERE scope = 'global' AND (lease_owner IS NULL OR lease_expires_at <= ?) \
+         WHERE scope = 'global' AND (lease_owner IS NULL OR lease_expires_at IS NULL \
+             OR lease_expires_at <= ?) \
          RETURNING lease_owner",
     )
     .bind(&owner)
@@ -217,8 +218,33 @@ async fn acquire_reconciler_lease(state: &AppState) -> Result<Option<String>> {
     .map_err(AppError::from)
 }
 
-async fn release_reconciler_lease(pool: &SqlitePool, owner: &str) -> Result<()> {
-    sqlx::query(
+async fn renew_global_lease(state: &AppState, owner: &str) -> Result<()> {
+    let now = Utc::now();
+    let deadline = lease_deadline(
+        now,
+        state.config.request_timeout,
+        GLOBAL_LEASE_REQUEST_BUDGET,
+    );
+    let result = sqlx::query(
+        "UPDATE media_reconciler_leases SET lease_expires_at = ?, updated_at = ? \
+         WHERE scope = 'global' AND lease_owner = ? AND lease_expires_at > ?",
+    )
+    .bind(deadline)
+    .bind(now)
+    .bind(owner)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "媒体协调器租约已由其他执行器接管".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn release_reconciler_lease(pool: &SqlitePool, owner: &str) -> Result<bool> {
+    let result = sqlx::query(
         "UPDATE media_reconciler_leases SET lease_owner = NULL, lease_expires_at = NULL, \
          updated_at = ? WHERE scope = 'global' AND lease_owner = ?",
     )
@@ -226,7 +252,7 @@ async fn release_reconciler_lease(pool: &SqlitePool, owner: &str) -> Result<()> 
     .bind(owner)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn reconcile_available(state: &AppState) -> Result<()> {
@@ -238,10 +264,13 @@ pub async fn reconcile_available(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-async fn claim_next_operation(pool: &SqlitePool) -> Result<Option<MediaOperationView>> {
+async fn claim_next_operation(
+    pool: &SqlitePool,
+    global_owner: &str,
+    request_timeout: StdDuration,
+) -> Result<Option<MediaOperationView>> {
     let now = Utc::now();
-    let lease_expires_at = now + Duration::seconds(60);
-    let lease_owner = format!("sentinel-{}", Uuid::new_v4());
+    let lease_expires_at = lease_deadline(now, request_timeout, OPERATION_LEASE_REQUEST_BUDGET);
     let sql = format!(
         "UPDATE media_operations SET state = 'running', attempt = attempt + 1, started_at = ?, \
          finished_at = NULL, lease_owner = ?, lease_expires_at = ?, error_code = NULL, \
@@ -253,21 +282,89 @@ async fn claim_next_operation(pool: &SqlitePool) -> Result<Option<MediaOperation
                    WHERE active.camera_id = candidate.camera_id AND active.state = 'running') \
              ORDER BY candidate.created_at, candidate.attempt, candidate.id LIMIT 1 \
          ) AND (state = 'pending' OR (state IN ('failed', 'unknown') AND retry_at IS NOT NULL \
-         AND retry_at <= ?)) RETURNING {fields}",
+         AND retry_at <= ?)) AND EXISTS (SELECT 1 FROM media_reconciler_leases \
+             WHERE scope = 'global' AND lease_owner = ? AND lease_expires_at > ?) \
+         RETURNING {fields}",
         fields = operation_select_fields()
     );
     sqlx::query_as::<_, MediaOperationView>(&sql)
         .bind(now)
-        .bind(lease_owner)
+        .bind(global_owner)
         .bind(lease_expires_at)
         .bind(now)
+        .bind(now)
+        .bind(global_owner)
         .bind(now)
         .fetch_optional(pool)
         .await
         .map_err(AppError::from)
 }
 
+fn lease_deadline(
+    now: DateTime<Utc>,
+    request_timeout: StdDuration,
+    request_budget: u64,
+) -> DateTime<Utc> {
+    let seconds = request_timeout
+        .as_secs()
+        .saturating_mul(request_budget)
+        .saturating_add(LEASE_SAFETY_MARGIN_SECONDS)
+        .max(60);
+    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+    now.checked_add_signed(Duration::seconds(seconds))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+async fn renew_claimed_leases(state: &AppState, operation: &MediaOperationView) -> Result<()> {
+    let owner = operation_owner(operation)?;
+    let now = Utc::now();
+    let global_deadline = lease_deadline(
+        now,
+        state.config.request_timeout,
+        GLOBAL_LEASE_REQUEST_BUDGET,
+    );
+    let operation_deadline = lease_deadline(
+        now,
+        state.config.request_timeout,
+        OPERATION_LEASE_REQUEST_BUDGET,
+    );
+    let mut transaction = state.pool.begin().await?;
+    let global = sqlx::query(
+        "UPDATE media_reconciler_leases SET lease_expires_at = ?, updated_at = ? \
+         WHERE scope = 'global' AND lease_owner = ? AND lease_expires_at > ?",
+    )
+    .bind(global_deadline)
+    .bind(now)
+    .bind(owner)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await?;
+    let claimed = sqlx::query(
+        "UPDATE media_operations SET lease_expires_at = ? \
+         WHERE id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ?",
+    )
+    .bind(operation_deadline)
+    .bind(&operation.id)
+    .bind(owner)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await?;
+    if global.rows_affected() != 1 || claimed.rows_affected() != 1 {
+        return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+fn operation_owner(operation: &MediaOperationView) -> Result<&str> {
+    match (operation.lease_owner.as_deref(), operation.lease_expires_at) {
+        (Some(owner), Some(_)) => Ok(owner),
+        _ => Err(AppError::Conflict("媒体操作没有有效租约所有者".into())),
+    }
+}
+
 async fn apply_claimed_operation(state: &AppState, operation: MediaOperationView) -> Result<()> {
+    renew_claimed_leases(state, &operation).await?;
     let desired = load_desired(&state.pool, operation.camera_id).await?;
     if desired.generation != operation.generation {
         finish_superseded(&state.pool, &operation).await?;
@@ -352,6 +449,7 @@ async fn finish_success(
     desired: &DesiredState,
     applied: &AppliedSources,
 ) -> Result<()> {
+    let owner = operation_owner(operation)?;
     let now = Utc::now();
     let mut transaction = state.pool.begin().await?;
     let current_generation = sqlx::query_scalar::<_, i64>(
@@ -361,27 +459,42 @@ async fn finish_success(
     .fetch_one(&mut *transaction)
     .await?;
     if current_generation != desired.generation {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE media_operations SET state = 'succeeded', finished_at = ?, retry_at = NULL, \
              lease_owner = NULL, lease_expires_at = NULL, result_json = ?, error_code = NULL, \
-             error_message = NULL WHERE id = ? AND state = 'running'",
+             error_message = NULL WHERE id = ? AND state = 'running' AND lease_owner = ? \
+             AND lease_expires_at > ? AND EXISTS (SELECT 1 FROM media_reconciler_leases \
+                 WHERE scope = 'global' AND lease_owner = ? AND lease_expires_at > ?)",
         )
         .bind(now)
         .bind(json!({ "converged": false, "superseded_after_apply": true }))
         .bind(&operation.id)
+        .bind(owner)
+        .bind(now)
+        .bind(owner)
+        .bind(now)
         .execute(&mut *transaction)
         .await?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
+        }
         transaction.commit().await?;
         return Ok(());
     }
     let result = sqlx::query(
         "UPDATE media_operations SET state = 'succeeded', finished_at = ?, retry_at = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, result_json = ?, error_code = NULL, \
-         error_message = NULL WHERE id = ? AND state = 'running'",
+         error_message = NULL WHERE id = ? AND state = 'running' AND lease_owner = ? \
+         AND lease_expires_at > ? AND EXISTS (SELECT 1 FROM media_reconciler_leases \
+             WHERE scope = 'global' AND lease_owner = ? AND lease_expires_at > ?)",
     )
     .bind(now)
     .bind(json!({ "generation": desired.generation, "converged": true }))
     .bind(&operation.id)
+    .bind(owner)
+    .bind(now)
+    .bind(owner)
+    .bind(now)
     .execute(&mut *transaction)
     .await?;
     if result.rows_affected() != 1 {
@@ -474,14 +587,18 @@ async fn finish_failure(
     operation: &MediaOperationView,
     error: &AppError,
 ) -> Result<()> {
+    let owner = operation_owner(operation)?;
     let (operation_state, error_code, error_message, retryable) = sanitized_failure(error);
     let retry_at = retryable.then(|| Utc::now() + retry_delay(operation.attempt));
     let now = Utc::now();
     let finished_at = (operation_state != "unknown").then_some(now);
-    sqlx::query(
+    let mut transaction = state.pool.begin().await?;
+    let result = sqlx::query(
         "UPDATE media_operations SET state = ?, finished_at = ?, retry_at = ?, \
          lease_owner = NULL, lease_expires_at = NULL, error_code = ?, error_message = ? \
-         WHERE id = ? AND state = 'running'",
+         WHERE id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ? \
+         AND EXISTS (SELECT 1 FROM media_reconciler_leases WHERE scope = 'global' \
+             AND lease_owner = ? AND lease_expires_at > ?)",
     )
     .bind(operation_state)
     .bind(finished_at)
@@ -489,13 +606,21 @@ async fn finish_failure(
     .bind(error_code)
     .bind(error_message)
     .bind(&operation.id)
-    .execute(&state.pool)
+    .bind(owner)
+    .bind(now)
+    .bind(owner)
+    .bind(now)
+    .execute(&mut *transaction)
     .await?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
+    }
     sqlx::query("UPDATE cameras SET status = 'error', updated_at = ? WHERE id = ?")
         .bind(now)
         .bind(operation.camera_id)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await?;
+    transaction.commit().await?;
     tracing::warn!(
         operation_id = %operation.id,
         camera_id = %operation.camera_id,
@@ -540,16 +665,27 @@ fn retry_delay(attempt: i64) -> Duration {
 }
 
 async fn finish_superseded(pool: &SqlitePool, operation: &MediaOperationView) -> Result<()> {
-    sqlx::query(
+    let owner = operation_owner(operation)?;
+    let now = Utc::now();
+    let result = sqlx::query(
         "UPDATE media_operations SET state = 'succeeded', finished_at = ?, retry_at = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, result_json = ?, error_code = NULL, \
-         error_message = NULL WHERE id = ? AND state = 'running'",
+         error_message = NULL WHERE id = ? AND state = 'running' AND lease_owner = ? \
+         AND lease_expires_at > ? AND EXISTS (SELECT 1 FROM media_reconciler_leases \
+             WHERE scope = 'global' AND lease_owner = ? AND lease_expires_at > ?)",
     )
-    .bind(Utc::now())
+    .bind(now)
     .bind(json!({ "converged": false, "superseded": true }))
     .bind(&operation.id)
+    .bind(owner)
+    .bind(now)
+    .bind(owner)
+    .bind(now)
     .execute(pool)
     .await?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
+    }
     Ok(())
 }
 
@@ -786,12 +922,68 @@ fn source_with_credentials(
 
 const fn operation_select_fields() -> &'static str {
     "id, camera_id, generation, kind, state, reason, requested_by, attempt, created_at, \
-     started_at, finished_at, retry_at, error_code, error_message"
+     started_at, finished_at, retry_at, error_code, error_message, lease_owner, lease_expires_at"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn lease_test_database() -> (tempfile::TempDir, SqlitePool, String, String) {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("leases.sqlite3");
+        let database_url = format!("sqlite://{}", database.display());
+        let pool = crate::sqlite::open_pool(&database_url).await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let now = Utc::now();
+        let user = Uuid::new_v4();
+        let camera = Uuid::new_v4();
+        let operation = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, role, created_at, updated_at) \
+             VALUES (?, 'lease@example.test', 'hash', 'admin', ?, ?)",
+        )
+        .bind(user)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cameras (id, name, main_stream_url_enc, created_by, created_at, updated_at) \
+             VALUES (?, 'Lease Camera', ?, ?, ?, ?)",
+        )
+        .bind(camera)
+        .bind(vec![1u8; 32])
+        .bind(user)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_desired_states (camera_id, generation, desired_present, \
+             main_path, record_enabled, updated_at) VALUES (?, 1, 1, 'lease_main', 0, ?)",
+        )
+        .bind(camera)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_operations (id, camera_id, generation, kind, state, reason, \
+             attempt, created_at, retry_at) VALUES (?, ?, 1, 'reconcile_camera', 'pending', \
+             'drift_detected', 0, ?, ?)",
+        )
+        .bind(&operation)
+        .bind(camera)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        (temporary, pool, operation, database_url)
+    }
 
     #[test]
     fn retry_is_exponential_and_bounded() {
@@ -802,6 +994,20 @@ mod tests {
     }
 
     #[test]
+    fn lease_deadlines_cover_the_declared_external_request_budget() {
+        let now = Utc::now();
+        let timeout = StdDuration::from_secs(20);
+        assert_eq!(
+            lease_deadline(now, timeout, OPERATION_LEASE_REQUEST_BUDGET) - now,
+            Duration::seconds(110)
+        );
+        assert_eq!(
+            lease_deadline(now, timeout, GLOBAL_LEASE_REQUEST_BUDGET) - now,
+            Duration::seconds(150)
+        );
+    }
+
+    #[test]
     fn persisted_failures_never_include_upstream_or_camera_details() {
         let secret = "rtsp://admin:super-secret@camera.invalid/live";
         let error = AppError::Upstream(format!("rejected payload containing {secret}"));
@@ -809,5 +1015,141 @@ mod tests {
         assert_eq!(code, "media_request_failed");
         assert!(!message.contains("super-secret"));
         assert!(!message.contains("camera.invalid"));
+    }
+
+    #[tokio::test]
+    async fn expired_operation_is_fenced_and_a_new_owner_can_take_over() {
+        let (_temporary, pool, operation_id, _database_url) = lease_test_database().await;
+        let active_until = Utc::now() + Duration::minutes(5);
+        sqlx::query(
+            "UPDATE media_operations SET state = 'running', attempt = 1, started_at = ?, \
+             lease_owner = 'old-owner', lease_expires_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now())
+        .bind(active_until)
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let new_owner = "new-owner";
+        sqlx::query(
+            "UPDATE media_reconciler_leases SET lease_owner = ?, lease_expires_at = ?, \
+             updated_at = ? WHERE scope = 'global'",
+        )
+        .bind(new_owner)
+        .bind(active_until)
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let old_operation =
+            sqlx::query_as::<_, MediaOperationView>(&format!("{OPERATION_SELECT} WHERE id = ?"))
+                .bind(&operation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(finish_superseded(&pool, &old_operation).await.is_err());
+        let fenced_state: String =
+            sqlx::query_scalar("SELECT state FROM media_operations WHERE id = ?")
+                .bind(&operation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fenced_state, "running");
+
+        let expired = Utc::now() - Duration::seconds(1);
+        sqlx::query("UPDATE media_operations SET lease_expires_at = ? WHERE id = ?")
+            .bind(expired)
+            .bind(&operation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_expired_operation_leases_at(&pool, Utc::now())
+                .await
+                .unwrap(),
+            1
+        );
+        let claimed = claim_next_operation(&pool, new_owner, StdDuration::from_secs(1))
+            .await
+            .unwrap()
+            .expect("new owner claims expired operation");
+        assert_eq!(claimed.lease_owner.as_deref(), Some(new_owner));
+        assert_eq!(claimed.state, "running");
+
+        let mut stale = claimed.clone();
+        stale.lease_owner = Some("old-owner".into());
+        stale.lease_expires_at = Some(active_until);
+        assert!(finish_superseded(&pool, &stale).await.is_err());
+        let still_owned: (String, Option<String>) =
+            sqlx::query_as("SELECT state, lease_owner FROM media_operations WHERE id = ?")
+                .bind(&operation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_owned, ("running".into(), Some(new_owner.into())));
+
+        assert!(!release_reconciler_lease(&pool, "old-owner").await.unwrap());
+        let global_owner: Option<String> = sqlx::query_scalar(
+            "SELECT lease_owner FROM media_reconciler_leases WHERE scope = 'global'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(global_owner.as_deref(), Some(new_owner));
+
+        finish_superseded(&pool, &claimed).await.unwrap();
+        let state: String = sqlx::query_scalar("SELECT state FROM media_operations WHERE id = ?")
+            .bind(&operation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "succeeded");
+        assert!(release_reconciler_lease(&pool, new_owner).await.unwrap());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_from_another_pool_preserves_active_leases() {
+        let (_temporary, first, operation_id, database_url) = lease_test_database().await;
+        let active_until = Utc::now() + Duration::minutes(5);
+        sqlx::query(
+            "UPDATE media_reconciler_leases SET lease_owner = 'healthy-owner', \
+             lease_expires_at = ?, updated_at = ? WHERE scope = 'global'",
+        )
+        .bind(active_until)
+        .bind(Utc::now())
+        .execute(&first)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE media_operations SET state = 'running', started_at = ?, attempt = 1, \
+             lease_owner = 'healthy-owner', lease_expires_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now())
+        .bind(active_until)
+        .bind(&operation_id)
+        .execute(&first)
+        .await
+        .unwrap();
+
+        let second = crate::sqlite::open_pool(&database_url).await.unwrap();
+        assert_eq!(recover_interrupted_operations(&second).await.unwrap(), 0);
+        let operation: (String, Option<String>) =
+            sqlx::query_as("SELECT state, lease_owner FROM media_operations WHERE id = ?")
+                .bind(&operation_id)
+                .fetch_one(&first)
+                .await
+                .unwrap();
+        assert_eq!(operation, ("running".into(), Some("healthy-owner".into())));
+        let global: Option<String> = sqlx::query_scalar(
+            "SELECT lease_owner FROM media_reconciler_leases WHERE scope = 'global'",
+        )
+        .fetch_one(&first)
+        .await
+        .unwrap();
+        assert_eq!(global.as_deref(), Some("healthy-owner"));
+        second.close().await;
+        first.close().await;
     }
 }

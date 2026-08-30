@@ -2345,15 +2345,7 @@ mod tests {
     #[test]
     fn held_service_lock_refuses_backup() {
         let layout = TestLayout::new();
-        let lock_path = layout.runtime.join("app.lock");
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-            .unwrap();
-        lock_file_exclusive(&lock).unwrap();
+        let _lock = crate::runtime_lock::ApplicationLock::acquire(&layout.runtime).unwrap();
         assert!(create(&layout.create_options()).is_err());
         assert!(!layout.backup.exists());
     }

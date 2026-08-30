@@ -8,6 +8,7 @@ pub struct Config {
     pub database_url: String,
     pub jwt_secret: Vec<u8>,
     pub credentials_key: [u8; 32],
+    pub runtime_directory: PathBuf,
     pub bootstrap_admin_email: String,
     pub bootstrap_admin_password: Option<String>,
     pub development_mode: bool,
@@ -57,12 +58,17 @@ impl Config {
         let credentials_key: [u8; 32] = decoded_key
             .try_into()
             .map_err(|_| "CREDENTIALS_KEY must decode to exactly 32 bytes".to_string())?;
+        let runtime_directory = PathBuf::from(required("SENTINEL_RUNTIME_DIR")?);
+        if !runtime_directory.is_absolute() {
+            return Err("SENTINEL_RUNTIME_DIR must be an absolute path".into());
+        }
 
         Ok(Self {
             bind_addr,
             database_url: required("DATABASE_URL")?,
             jwt_secret,
             credentials_key,
+            runtime_directory,
             bootstrap_admin_email: value("BOOTSTRAP_ADMIN_EMAIL", "admin@example.com")
                 .trim()
                 .to_lowercase(),
@@ -103,7 +109,7 @@ impl Config {
             public_hls_base_url: trim_slash(value("PUBLIC_HLS_BASE_URL", "/media-hls")),
             status_interval: Duration::from_secs(parse_u64("STATUS_INTERVAL_SECS", 10)?),
             reconcile_interval: Duration::from_secs(parse_u64("RECONCILE_INTERVAL_SECS", 60)?),
-            request_timeout: Duration::from_secs(parse_u64("REQUEST_TIMEOUT_SECS", 20)?),
+            request_timeout: Duration::from_secs(bounded_u64("REQUEST_TIMEOUT_SECS", 20, 1, 300)?),
             onvif_discovery_timeout: Duration::from_millis(parse_u64(
                 "ONVIF_DISCOVERY_TIMEOUT_MS",
                 3000,
