@@ -1,11 +1,56 @@
 name: Independence gate
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   independence:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - run: |
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reject runtime coupling and container manifests
+        shell: bash
+        run: |
           set -euo pipefail
-          if grep -R -n -E --exclude-dir=.git --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.github 'UNION_|X-Union-|PluginManifest|ProcessContext|sarmg-platform|sarmg_platform' .; then exit 1; fi
-          if find . -maxdepth 4 \( -iname 'Dockerfile*' -o -iname 'docker-compose*.yml' -o -iname 'docker-compose*.yaml' \) | grep .; then exit 1; fi
+
+          coupling_pattern='UNION_|X-Union-|UnionGateway|ModuleManifest|PluginManifest|ProcessContext|sarmg[-_]platform|/modules/'
+          coupling_matches="$(
+            git grep -nE "$coupling_pattern" -- \
+              ':!.github/workflows/independence.yml' \
+              ':!docs/migration-history/**' \
+              ':!CHANGELOG.md' \
+              || true
+          )"
+          if [[ -n "$coupling_matches" ]]; then
+            printf '%s\n' "$coupling_matches"
+            exit 1
+          fi
+
+          container_matches="$(
+            git ls-files | awk '
+              {
+                depth = gsub("/", "/")
+                name = $0
+                sub(/^.*\//, "", name)
+                name = tolower(name)
+                if (depth <= 4 &&
+                    (name ~ /^dockerfile/ ||
+                     name ~ /^docker-compose.*\.ya?ml$/)) {
+                  print $0
+                }
+              }
+            '
+          )"
+          if [[ -n "$container_matches" ]]; then
+            printf '%s\n' "$container_matches"
+            exit 1
+          fi
