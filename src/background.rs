@@ -8,7 +8,7 @@ use tokio::time::{self, MissedTickBehavior};
 use uuid::Uuid;
 
 const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, \
-    onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at \
+    onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at \
     FROM cameras WHERE deleted_at IS NULL";
 
 pub fn spawn(state: AppState) {
@@ -69,6 +69,7 @@ pub async fn emit_event(
 }
 
 async fn refresh_statuses(state: &AppState) -> Result<()> {
+    reconciliation::validate_stored_camera_credentials(state).await?;
     let paths = state.media.paths().await?;
     let cameras = sqlx::query_as::<_, CameraRecord>(CAMERA_SELECT)
         .fetch_all(&state.pool)

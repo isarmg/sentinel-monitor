@@ -24,6 +24,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use rusqlite::Connection as RusqliteConnection;
 use serde_json::{json, Value};
 use sqlx::{SqliteConnection, SqlitePool};
 use std::{
@@ -45,6 +46,17 @@ struct TestContext {
     _network_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
+type OperationSideEffectState = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+    Option<String>,
+);
+type CameraEnvelopeBlobs = (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+
 #[derive(Clone, Default)]
 struct FakeMediaService {
     inner: Arc<Mutex<FakeMediaState>>,
@@ -53,6 +65,7 @@ struct FakeMediaService {
 #[derive(Default)]
 struct FakeMediaState {
     paths: HashMap<String, FakePathConfig>,
+    request_calls: usize,
     mutation_calls: usize,
     fail_mutations: usize,
 }
@@ -67,7 +80,7 @@ struct FakePathConfig {
 impl FakeMediaService {
     fn router(&self) -> Router {
         Router::new()
-            .route("/v3/info", get(|| async { StatusCode::OK }))
+            .route("/v3/info", get(fake_info))
             .route("/v3/config/paths/list", get(fake_config_list))
             .route("/v3/paths/list", get(fake_runtime_paths))
             .route("/v3/config/paths/get/{path}", get(fake_get_path))
@@ -86,6 +99,10 @@ impl FakeMediaService {
         self.inner.lock().unwrap().mutation_calls
     }
 
+    fn request_calls(&self) -> usize {
+        self.inner.lock().unwrap().request_calls
+    }
+
     fn path(&self, path: &str) -> Option<FakePathConfig> {
         self.inner.lock().unwrap().paths.get(path).cloned()
     }
@@ -95,8 +112,14 @@ impl FakeMediaService {
     }
 }
 
+async fn fake_info(State(fake): State<FakeMediaService>) -> StatusCode {
+    fake.inner.lock().unwrap().request_calls += 1;
+    StatusCode::OK
+}
+
 async fn fake_config_list(State(fake): State<FakeMediaService>) -> Json<Value> {
-    let inner = fake.inner.lock().unwrap();
+    let mut inner = fake.inner.lock().unwrap();
+    inner.request_calls += 1;
     Json(json!({
         "items": inner.paths.iter().map(|(name, config)| json!({
             "name": name,
@@ -108,7 +131,8 @@ async fn fake_config_list(State(fake): State<FakeMediaService>) -> Json<Value> {
 }
 
 async fn fake_runtime_paths(State(fake): State<FakeMediaService>) -> Json<Value> {
-    let inner = fake.inner.lock().unwrap();
+    let mut inner = fake.inner.lock().unwrap();
+    inner.request_calls += 1;
     Json(json!({
         "items": inner.paths.keys().map(|name| json!({
             "name": name,
@@ -123,7 +147,9 @@ async fn fake_get_path(
     State(fake): State<FakeMediaService>,
     Path(path): Path<String>,
 ) -> StatusCode {
-    if fake.inner.lock().unwrap().paths.contains_key(&path) {
+    let mut inner = fake.inner.lock().unwrap();
+    inner.request_calls += 1;
+    if inner.paths.contains_key(&path) {
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
@@ -136,6 +162,7 @@ async fn fake_upsert_path(
     Json(payload): Json<Value>,
 ) -> Response {
     let mut inner = fake.inner.lock().unwrap();
+    inner.request_calls += 1;
     inner.mutation_calls += 1;
     if inner.fail_mutations > 0 {
         inner.fail_mutations -= 1;
@@ -161,6 +188,7 @@ async fn fake_delete_path(
     Path(path): Path<String>,
 ) -> StatusCode {
     let mut inner = fake.inner.lock().unwrap();
+    inner.request_calls += 1;
     inner.mutation_calls += 1;
     if inner.fail_mutations > 0 {
         inner.fail_mutations -= 1;
@@ -520,6 +548,67 @@ async fn assert_connection_configuration(connection: &mut SqliteConnection) {
     assert_eq!(synchronous, 2);
 }
 
+async fn assert_invalid_credentials_are_side_effect_free(
+    context: &TestContext,
+    observer: &RusqliteConnection,
+) {
+    let data_version_before: i64 = observer
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .expect("read SQLite data version before rejection");
+    let lease_before: (Option<String>, Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT lease_owner, lease_expires_at, updated_at FROM media_reconciler_leases \
+         WHERE scope = 'global'",
+    )
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("read lease before credential rejection");
+    let operations_before: Vec<OperationSideEffectState> = sqlx::query_as(
+        "SELECT id, state, attempt, lease_owner, lease_expires_at, error_code, error_message \
+         FROM media_operations ORDER BY id",
+    )
+    .fetch_all(&context.state.pool)
+    .await
+    .expect("read operations before credential rejection");
+    let requests_before = context.fake_media.request_calls();
+    let mutations_before = context.fake_media.mutation_calls();
+
+    let error = reconciliation::reconcile_once(&context.state)
+        .await
+        .expect_err("invalid current credential envelope must stop reconciliation")
+        .to_string();
+    for sensitive in [
+        "camera-user",
+        "camera-password",
+        "rtsp://camera.example",
+        "sentinel-test-jwt-secret",
+    ] {
+        assert!(!error.contains(sensitive));
+    }
+
+    let data_version_after: i64 = observer
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .expect("read SQLite data version after rejection");
+    let lease_after: (Option<String>, Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT lease_owner, lease_expires_at, updated_at FROM media_reconciler_leases \
+         WHERE scope = 'global'",
+    )
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("read lease after credential rejection");
+    let operations_after: Vec<OperationSideEffectState> = sqlx::query_as(
+        "SELECT id, state, attempt, lease_owner, lease_expires_at, error_code, error_message \
+         FROM media_operations ORDER BY id",
+    )
+    .fetch_all(&context.state.pool)
+    .await
+    .expect("read operations after credential rejection");
+    assert_eq!(data_version_after, data_version_before);
+    assert_eq!(lease_after, lease_before);
+    assert_eq!(operations_after, operations_before);
+    assert_eq!(context.fake_media.request_calls(), requests_before);
+    assert_eq!(context.fake_media.mutation_calls(), mutations_before);
+}
+
 async fn assert_foreign_key_enforced(connection: &mut SqliteConnection) {
     let error = sqlx::query(
         "INSERT INTO audit_logs (id, user_id, action, entity_type, details, created_at) \
@@ -731,7 +820,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     assert_eq!(response["camera"]["status"], json!("disabled"));
 
     let camera = sqlx::query_as::<_, CameraRecord>(
-        "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at FROM cameras WHERE id = ?",
+        "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at FROM cameras WHERE id = ?",
     )
     .bind(target_id)
     .fetch_one(&context.state.pool)
@@ -739,40 +828,23 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     .expect("load updated camera");
     assert_eq!(camera.name, "Updated Camera");
     assert_eq!(camera.location, "Garage");
+    let credentials = camera
+        .decrypt_credentials(&context.state.secrets)
+        .expect("decrypt updated camera credentials");
     assert_eq!(
-        context
-            .state
-            .secrets
-            .decrypt(&camera.main_stream_url_enc)
-            .expect("decrypt main stream"),
+        credentials.main_stream_url,
         "rtsps://camera.example/updated-main"
     );
     assert_eq!(
-        context
-            .state
-            .secrets
-            .decrypt(
-                camera
-                    .sub_stream_url_enc
-                    .as_deref()
-                    .expect("updated sub stream"),
-            )
-            .expect("decrypt sub stream"),
-        "rtsp://camera.example/updated-sub"
+        credentials.sub_stream_url.as_deref(),
+        Some("rtsp://camera.example/updated-sub")
     );
     assert_eq!(
         camera.onvif_url.as_deref(),
         Some("https://camera.example/onvif/device_service")
     );
-    assert_eq!(camera.username.as_deref(), Some("camera-user"));
-    assert_eq!(
-        context
-            .state
-            .secrets
-            .decrypt(camera.password_enc.as_deref().expect("updated password"))
-            .expect("decrypt password"),
-        "camera-password"
-    );
+    assert_eq!(credentials.username.as_deref(), Some("camera-user"));
+    assert_eq!(credentials.password.as_deref(), Some("camera-password"));
     assert!(!camera.enabled);
     assert!(!camera.record_enabled);
     assert_eq!(camera.status, "disabled");
@@ -862,6 +934,270 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     expected.sort();
     assert_eq!(ids, expected);
 
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn invalid_camera_envelopes_fail_before_database_or_media_side_effects() {
+    let context = TestContext::current().await;
+    let (_, admin) = context.bootstrap().await;
+    let app = routes::router(context.state.clone());
+    let mut camera_ids = Vec::new();
+    for (name, suffix) in [("Envelope One", "one"), ("Envelope Two", "two")] {
+        let response = send_request(
+            &app,
+            Method::POST,
+            "/api/v2/cameras",
+            &admin,
+            Some(json!({
+                "name": name,
+                "main_stream_url": format!("rtsp://camera.example/{suffix}/main"),
+                "sub_stream_url": format!("rtsp://camera.example/{suffix}/sub"),
+                "username": format!("camera-user-{suffix}"),
+                "password": format!("camera-password-{suffix}")
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response_json(response).await;
+        assert_eq!(body["camera"]["username"], format!("camera-user-{suffix}"));
+        let serialized = body.to_string();
+        assert!(!serialized.contains(&format!("camera-password-{suffix}")));
+        assert!(!serialized.contains(&format!("rtsp://camera.example/{suffix}")));
+        camera_ids.push(
+            body["camera"]["id"]
+                .as_str()
+                .expect("camera ID")
+                .parse::<Uuid>()
+                .expect("camera UUID"),
+        );
+    }
+    let first = camera_ids[0];
+    let second = camera_ids[1];
+    let first_blobs: CameraEnvelopeBlobs = sqlx::query_as(
+        "SELECT main_stream_url_enc, sub_stream_url_enc, username_enc, password_enc \
+             FROM cameras WHERE id = ?",
+    )
+    .bind(first)
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("load first camera envelopes");
+    let second_main: Vec<u8> =
+        sqlx::query_scalar("SELECT main_stream_url_enc FROM cameras WHERE id = ?")
+            .bind(second)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("load second main envelope");
+
+    let envelope: Value = serde_json::from_slice(&first_blobs.0).expect("current envelope JSON");
+    assert_eq!(envelope["product"], "sentinel-monitor");
+    assert_eq!(envelope["application_version"], "0.2.0");
+    assert_eq!(envelope["envelope_revision"], 1);
+    assert_eq!(envelope["key_id"], "sentinel-credentials-0.2.0-key-1");
+    let keys = envelope
+        .as_object()
+        .expect("credential envelope object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "application_version",
+            "ciphertext",
+            "envelope_revision",
+            "key_id",
+            "nonce",
+            "product",
+        ])
+    );
+    for secret in [
+        "camera-user-one",
+        "camera-password-one",
+        "rtsp://camera.example/one",
+    ] {
+        assert!(!String::from_utf8_lossy(&first_blobs.0).contains(secret));
+        assert!(
+            !String::from_utf8_lossy(first_blobs.2.as_deref().expect("username envelope"))
+                .contains(secret)
+        );
+        assert!(
+            !String::from_utf8_lossy(first_blobs.3.as_deref().expect("password envelope"))
+                .contains(secret)
+        );
+    }
+
+    let observer = RusqliteConnection::open(&context._database.path)
+        .expect("open independent SQLite observer");
+    observer
+        .busy_timeout(Duration::from_secs(5))
+        .expect("configure SQLite observer");
+
+    let mut invalid_envelopes = vec![vec![0x11; 48]];
+    for (field, value) in [
+        ("product", json!("another-product")),
+        ("application_version", json!("0.1.0")),
+        ("envelope_revision", json!(2)),
+        ("key_id", json!("previous-key")),
+        ("unknown", json!(true)),
+    ] {
+        let mut invalid = envelope.clone();
+        invalid
+            .as_object_mut()
+            .expect("envelope object")
+            .insert(field.into(), value);
+        invalid_envelopes.push(serde_json::to_vec(&invalid).expect("serialize invalid envelope"));
+    }
+    let mut tampered = envelope.clone();
+    let ciphertext = tampered["ciphertext"]
+        .as_str()
+        .expect("ciphertext")
+        .as_bytes()
+        .to_vec();
+    let mut changed = ciphertext;
+    changed[0] = if changed[0] == b'A' { b'B' } else { b'A' };
+    tampered["ciphertext"] = String::from_utf8(changed)
+        .expect("base64 remains UTF-8")
+        .into();
+    invalid_envelopes.push(serde_json::to_vec(&tampered).expect("serialize tampered envelope"));
+
+    for invalid in invalid_envelopes {
+        sqlx::query("UPDATE cameras SET main_stream_url_enc = ? WHERE id = ?")
+            .bind(invalid)
+            .bind(first)
+            .execute(&context.state.pool)
+            .await
+            .expect("inject invalid envelope");
+        assert_invalid_credentials_are_side_effect_free(&context, &observer).await;
+    }
+    sqlx::query("UPDATE cameras SET main_stream_url_enc = ? WHERE id = ?")
+        .bind(&first_blobs.0)
+        .bind(first)
+        .execute(&context.state.pool)
+        .await
+        .expect("restore first main envelope");
+
+    sqlx::query(
+        "UPDATE cameras SET username_enc = password_enc, password_enc = username_enc WHERE id = ?",
+    )
+    .bind(first)
+    .execute(&context.state.pool)
+    .await
+    .expect("swap username and password envelopes");
+    assert_invalid_credentials_are_side_effect_free(&context, &observer).await;
+    let camera_before: (String, String, DateTime<Utc>) =
+        sqlx::query_as("SELECT name, status, updated_at FROM cameras WHERE id = ?")
+            .bind(first)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("snapshot camera before rejected update");
+    let generation_before: i64 =
+        sqlx::query_scalar("SELECT generation FROM media_desired_states WHERE camera_id = ?")
+            .bind(first)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("snapshot desired generation before rejected update");
+    let operation_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_operations")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("snapshot operation count before rejected update");
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("snapshot audit count before rejected update");
+    let media_requests_before = context.fake_media.request_calls();
+    let response = send_request(
+        &app,
+        Method::PUT,
+        &format!("/api/v2/cameras/{first}"),
+        &admin,
+        Some(json!({ "name": "must-not-be-written" })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error_body = response_json(response).await.to_string();
+    for sensitive in [
+        "camera-user-one",
+        "camera-password-one",
+        "rtsp://camera.example/one",
+    ] {
+        assert!(!error_body.contains(sensitive));
+    }
+    let camera_after: (String, String, DateTime<Utc>) =
+        sqlx::query_as("SELECT name, status, updated_at FROM cameras WHERE id = ?")
+            .bind(first)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("verify camera after rejected update");
+    let generation_after: i64 =
+        sqlx::query_scalar("SELECT generation FROM media_desired_states WHERE camera_id = ?")
+            .bind(first)
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("verify desired generation after rejected update");
+    let operation_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_operations")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("verify operation count after rejected update");
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("verify audit count after rejected update");
+    assert_eq!(camera_after, camera_before);
+    assert_eq!(generation_after, generation_before);
+    assert_eq!(operation_count_after, operation_count_before);
+    assert_eq!(audit_count_after, audit_count_before);
+    assert_eq!(context.fake_media.request_calls(), media_requests_before);
+    sqlx::query("UPDATE cameras SET username_enc = ?, password_enc = ? WHERE id = ?")
+        .bind(first_blobs.2.as_deref())
+        .bind(first_blobs.3.as_deref())
+        .bind(first)
+        .execute(&context.state.pool)
+        .await
+        .expect("restore username and password envelopes");
+
+    let mut transaction = context.state.pool.begin().await.expect("begin camera swap");
+    sqlx::query("UPDATE cameras SET main_stream_url_enc = ? WHERE id = ?")
+        .bind(&second_main)
+        .bind(first)
+        .execute(&mut *transaction)
+        .await
+        .expect("install second camera envelope on first camera");
+    sqlx::query("UPDATE cameras SET main_stream_url_enc = ? WHERE id = ?")
+        .bind(&first_blobs.0)
+        .bind(second)
+        .execute(&mut *transaction)
+        .await
+        .expect("install first camera envelope on second camera");
+    transaction.commit().await.expect("commit camera swap");
+    assert_invalid_credentials_are_side_effect_free(&context, &observer).await;
+
+    sqlx::query("UPDATE cameras SET main_stream_url_enc = ? WHERE id = ?")
+        .bind(&first_blobs.0)
+        .bind(first)
+        .execute(&context.state.pool)
+        .await
+        .expect("restore first camera envelope");
+    sqlx::query("UPDATE cameras SET main_stream_url_enc = ? WHERE id = ?")
+        .bind(&second_main)
+        .bind(second)
+        .execute(&context.state.pool)
+        .await
+        .expect("restore second camera envelope");
+    for camera_id in camera_ids {
+        let camera = sqlx::query_as::<_, CameraRecord>(&format!(
+            "{select} WHERE id = ?",
+            select = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at FROM cameras"
+        ))
+        .bind(camera_id)
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("reload restored camera");
+        camera
+            .decrypt_credentials(&context.state.secrets)
+            .expect("restored envelopes authenticate");
+    }
+    drop(observer);
     context.state.pool.close().await;
 }
 

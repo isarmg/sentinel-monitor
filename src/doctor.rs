@@ -1,4 +1,9 @@
-use crate::{crypto::SecretBox, protocol::CONTRACT, runtime_lock::DatabaseMaintenanceLock, sqlite};
+use crate::{
+    crypto::{CredentialField, SecretBox},
+    protocol::CONTRACT,
+    runtime_lock::DatabaseMaintenanceLock,
+    sqlite,
+};
 use anyhow::{ensure, Context};
 use chrono::Utc;
 use rusqlite::{Connection, OpenFlags};
@@ -123,20 +128,29 @@ fn verify_credentials(path: &Path, key: &[u8; 32]) -> anyhow::Result<()> {
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
     let secret_box = SecretBox::new(key);
-    let mut statement = connection
-        .prepare("SELECT main_stream_url_enc, sub_stream_url_enc, password_enc FROM cameras")?;
+    let mut statement = connection.prepare(
+        "SELECT id, main_stream_url_enc, sub_stream_url_enc, username_enc, password_enc \
+         FROM cameras",
+    )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let main: Vec<u8> = row.get(0)?;
-        let sub: Option<Vec<u8>> = row.get(1)?;
-        let password: Option<Vec<u8>> = row.get(2)?;
-        secret_box
-            .decrypt(&main)
-            .map_err(|_| anyhow::anyhow!("CREDENTIALS_KEY cannot decrypt camera credentials"))?;
-        for value in [sub, password].into_iter().flatten() {
-            secret_box.decrypt(&value).map_err(|_| {
-                anyhow::anyhow!("CREDENTIALS_KEY cannot decrypt camera credentials")
-            })?;
+        let camera_id = Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| anyhow::anyhow!("camera credential identity is invalid"))?;
+        let main: Vec<u8> = row.get(1)?;
+        let sub: Option<Vec<u8>> = row.get(2)?;
+        let username: Option<Vec<u8>> = row.get(3)?;
+        let password: Option<Vec<u8>> = row.get(4)?;
+        for (field, value) in [
+            (CredentialField::MainStreamUrl, Some(main)),
+            (CredentialField::SubStreamUrl, sub),
+            (CredentialField::Username, username),
+            (CredentialField::Password, password),
+        ] {
+            if let Some(value) = value {
+                secret_box.decrypt(camera_id, field, &value).map_err(|_| {
+                    anyhow::anyhow!("CREDENTIALS_KEY cannot authenticate current camera envelopes")
+                })?;
+            }
         }
     }
     Ok(())
@@ -433,8 +447,24 @@ mod tests {
         let key = [0x42; 32];
         let now = Utc::now().to_rfc3339();
         let user = Uuid::new_v4().to_string();
-        let encrypted = SecretBox::new(&key)
-            .encrypt("rtsp://camera.invalid/main")
+        let camera_id = Uuid::new_v4();
+        let secret_box = SecretBox::new(&key);
+        let encrypted = secret_box
+            .encrypt(
+                camera_id,
+                CredentialField::MainStreamUrl,
+                "rtsp://camera.invalid/main",
+            )
+            .unwrap();
+        let username = secret_box
+            .encrypt(camera_id, CredentialField::Username, "doctor-camera-user")
+            .unwrap();
+        let password = secret_box
+            .encrypt(
+                camera_id,
+                CredentialField::Password,
+                "doctor-camera-password",
+            )
             .unwrap();
         sqlx::query(
             "INSERT INTO users (id, email, password_hash, role, created_at, updated_at)
@@ -447,11 +477,13 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO cameras (id, name, main_stream_url_enc, created_by, created_at, updated_at)
-             VALUES (?, 'Doctor', ?, ?, ?, ?)",
+            "INSERT INTO cameras (id, name, main_stream_url_enc, username_enc, password_enc, \
+             created_by, created_at, updated_at) VALUES (?, 'Doctor', ?, ?, ?, ?, ?, ?)",
         )
-        .bind(Uuid::new_v4().to_string())
+        .bind(camera_id.to_string())
         .bind(encrypted)
+        .bind(username)
+        .bind(password)
         .bind(&user)
         .bind(&now)
         .bind(&now)
@@ -463,7 +495,15 @@ mod tests {
         let recordings = temporary.path().join("recordings");
         fs::create_dir(&recordings).unwrap();
         let binary = temporary.path().join("mediamtx");
-        fs::write(&binary, "#!/bin/sh\nprintf 'v1.20.0\\n'\n").unwrap();
+        let companion_marker = temporary.path().join("companion-executed");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf touched > '{}'\nprintf 'v1.20.0\\n'\n",
+                companion_marker.display()
+            ),
+        )
+        .unwrap();
         #[cfg(unix)]
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let contract = temporary.path().join("mediamtx.lock");
@@ -490,7 +530,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = run(&DoctorOptions {
+        let options = DoctorOptions {
             database_url: database_url.clone(),
             mediamtx_config: config.clone(),
             mediamtx_contract: contract.clone(),
@@ -500,10 +540,11 @@ mod tests {
             app_ready_url: "http://127.0.0.1:1/health/ready".to_string(),
             mediamtx_ready_url: "http://127.0.0.1:1/v3/info".to_string(),
             offline: true,
-        })
-        .await
-        .unwrap();
+        };
+        let report = run(&options).await.unwrap();
         assert_eq!(report.status, "ok");
+        assert!(companion_marker.exists());
+        fs::remove_file(&companion_marker).unwrap();
         assert!(!fs::read_dir(&recordings).unwrap().any(|entry| entry
             .unwrap()
             .file_name()
@@ -511,17 +552,35 @@ mod tests {
             .starts_with(".sentinel-doctor-")));
 
         let wrong_key = DoctorOptions {
-            database_url,
-            mediamtx_config: config,
-            mediamtx_contract: contract,
-            mediamtx_binary: binary,
-            recordings_directory: recordings,
             credentials_key: [0x99; 32],
-            app_ready_url: String::new(),
-            mediamtx_ready_url: String::new(),
-            offline: true,
+            ..options.clone()
         };
-        assert!(run(&wrong_key).await.is_err());
+        let wrong_key_error = run(&wrong_key).await.unwrap_err().to_string();
+        assert!(!wrong_key_error.contains("doctor-camera-user"));
+        assert!(!wrong_key_error.contains("doctor-camera-password"));
+        assert!(!wrong_key_error.contains("rtsp://"));
+        assert!(!companion_marker.exists());
+
+        let connection = Connection::open(&database).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .execute(
+                "UPDATE cameras SET username_enc = password_enc, password_enc = username_enc \
+                 WHERE id = ?",
+                [camera_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(connection);
+        let before = sha256_file(&database).unwrap();
+        let tampered_error = run(&options).await.unwrap_err().to_string();
+        assert_eq!(sha256_file(&database).unwrap(), before);
+        assert!(!tampered_error.contains("doctor-camera-user"));
+        assert!(!tampered_error.contains("doctor-camera-password"));
+        assert!(!tampered_error.contains("rtsp://"));
+        assert!(!companion_marker.exists());
         assert!(live_probe("http://example.com/health/ready").await.is_err());
     }
 }

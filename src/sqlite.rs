@@ -21,7 +21,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLICATION: &str = "sentinel-monitor";
 pub const CURRENT_SCHEMA_REVISION: i64 = 1;
 pub const CURRENT_SCHEMA_SHA256: &str =
-    "c06dde59a25ca34d4f64f38f0306822b649efefb6e063f2f964f43e34d014de4";
+    "2f5b978d8948b401c01fb6cf920d00b47a5e5c8aa1212136ce3c38064e71833f";
 const CURRENT_SCHEMA: &str = include_str!("current_schema.sql");
 const PRODUCT_METADATA_SQL: &str = "CREATE TABLE product_metadata (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),

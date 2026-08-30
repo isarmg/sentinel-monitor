@@ -184,6 +184,7 @@ async fn serve() -> anyhow::Result<()> {
         login: LoginProtection::new(&config),
     };
 
+    reconciliation::validate_stored_camera_credentials(&state).await?;
     auth::bootstrap_admin(&state).await?;
     let recovered = reconciliation::recover_interrupted_operations(&state.pool).await?;
     if recovered > 0 {

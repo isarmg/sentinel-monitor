@@ -5,6 +5,7 @@ use crate::{
         session_cookie, CurrentUser,
     },
     background::camera_path,
+    crypto::CredentialField,
     error::{AppError, Result},
     models::*,
     onvif,
@@ -37,7 +38,7 @@ use url::Url;
 use uuid::Uuid;
 
 const USER_SELECT: &str = "SELECT id, email, password_hash, role, active, session_version, last_login_at, created_at, updated_at FROM users";
-const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at FROM cameras";
+const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at FROM cameras";
 
 pub fn router(state: AppState) -> Router {
     let static_dir = state.config.static_dir.clone();
@@ -280,7 +281,14 @@ async fn list_cameras(
     ))
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(cameras.iter().map(CameraView::from).collect()))
+    let views = cameras
+        .iter()
+        .map(|camera| {
+            let credentials = camera.decrypt_credentials(&state.secrets)?;
+            Ok(CameraView::from_record(camera, &credentials))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Json(views))
 }
 
 async fn create_camera(
@@ -295,35 +303,51 @@ async fn create_camera(
         request.sub_stream_url.as_deref(),
         request.onvif_url.as_deref(),
     )?;
+    let camera_id = Uuid::new_v4();
+    let main_stream_url_enc = encrypt_camera_credential(
+        &state,
+        camera_id,
+        CredentialField::MainStreamUrl,
+        request.main_stream_url.trim(),
+    )?;
+    let sub_stream_url_enc = request
+        .sub_stream_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            encrypt_camera_credential(
+                &state,
+                camera_id,
+                CredentialField::SubStreamUrl,
+                value.trim(),
+            )
+        })
+        .transpose()?;
+    let username_enc = clean_optional(request.username)
+        .as_deref()
+        .map(|value| encrypt_camera_credential(&state, camera_id, CredentialField::Username, value))
+        .transpose()?;
+    let password_enc = request
+        .password
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| encrypt_camera_credential(&state, camera_id, CredentialField::Password, value))
+        .transpose()?;
     let now = Utc::now();
     let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, CameraRecord>(
-        "INSERT INTO cameras (id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, created_by, created_at, updated_at) \
+        "INSERT INTO cameras (id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, created_by, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
+         RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
     )
-    .bind(Uuid::new_v4())
+    .bind(camera_id)
     .bind(request.name.trim())
     .bind(request.location.trim())
-    .bind(state.secrets.encrypt(request.main_stream_url.trim())?)
-    .bind(
-        request
-            .sub_stream_url
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| state.secrets.encrypt(value.trim()))
-            .transpose()?,
-    )
+    .bind(main_stream_url_enc)
+    .bind(sub_stream_url_enc)
     .bind(clean_optional(request.onvif_url))
-    .bind(clean_optional(request.username))
-    .bind(
-        request
-            .password
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(|value| state.secrets.encrypt(value))
-            .transpose()?,
-    )
+    .bind(username_enc)
+    .bind(password_enc)
     .bind(request.enabled)
     .bind(request.record_enabled)
     .bind(user.id)
@@ -331,6 +355,7 @@ async fn create_camera(
     .bind(now)
     .fetch_one(&mut *transaction)
     .await?;
+    let credentials = record.decrypt_credentials(&state.secrets)?;
     let operation = reconciliation::queue_camera_change(
         &mut transaction,
         &record,
@@ -352,7 +377,7 @@ async fn create_camera(
     Ok((
         StatusCode::CREATED,
         Json(CameraMutationResponse {
-            camera: CameraView::from(&record),
+            camera: CameraView::from_record(&record, &credentials),
             media_synced: false,
             warning: None,
             operation_id: operation.id,
@@ -375,7 +400,7 @@ async fn update_camera(
     let main_stream_url_enc = match request.main_stream_url {
         Some(value) if !value.trim().is_empty() => {
             validate_rtsp(&value)?;
-            state.secrets.encrypt(value.trim())?
+            encrypt_camera_credential(&state, id, CredentialField::MainStreamUrl, value.trim())?
         }
         _ => existing.main_stream_url_enc,
     };
@@ -386,7 +411,12 @@ async fn update_camera(
         .filter(|value| !value.trim().is_empty())
     {
         validate_rtsp(&value)?;
-        Some(state.secrets.encrypt(value.trim())?)
+        Some(encrypt_camera_credential(
+            &state,
+            id,
+            CredentialField::SubStreamUrl,
+            value.trim(),
+        )?)
     } else {
         existing.sub_stream_url_enc
     };
@@ -401,14 +431,22 @@ async fn update_camera(
     if let Some(url) = &onvif_url {
         validate_http(url)?;
     }
-    let username = request
+    let username_enc = request
         .username
         .and_then(|value| clean_optional(Some(value)))
-        .or(existing.username);
+        .as_deref()
+        .map(|value| encrypt_camera_credential(&state, id, CredentialField::Username, value))
+        .transpose()?
+        .or(existing.username_enc);
     let password_enc = if request.clear_password {
         None
     } else if let Some(password) = request.password.filter(|value| !value.is_empty()) {
-        Some(state.secrets.encrypt(&password)?)
+        Some(encrypt_camera_credential(
+            &state,
+            id,
+            CredentialField::Password,
+            &password,
+        )?)
     } else {
         existing.password_enc
     };
@@ -421,15 +459,15 @@ async fn update_camera(
     let updated_at = Utc::now();
     let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, CameraRecord>(
-        "UPDATE cameras SET name = ?1, location = ?2, main_stream_url_enc = ?3, sub_stream_url_enc = ?4, onvif_url = ?5, username = ?6, password_enc = ?7, enabled = ?8, record_enabled = ?9, status = CASE WHEN ?8 THEN 'pending' ELSE 'disabled' END, updated_at = ?10 WHERE id = ?11 AND deleted_at IS NULL \
-         RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
+        "UPDATE cameras SET name = ?1, location = ?2, main_stream_url_enc = ?3, sub_stream_url_enc = ?4, onvif_url = ?5, username_enc = ?6, password_enc = ?7, enabled = ?8, record_enabled = ?9, status = CASE WHEN ?8 THEN 'pending' ELSE 'disabled' END, updated_at = ?10 WHERE id = ?11 AND deleted_at IS NULL \
+         RETURNING id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at",
     )
     .bind(name.trim())
     .bind(location.trim())
     .bind(main_stream_url_enc)
     .bind(sub_stream_url_enc)
     .bind(onvif_url)
-    .bind(username)
+    .bind(username_enc)
     .bind(password_enc)
     .bind(enabled)
     .bind(record_enabled)
@@ -437,6 +475,7 @@ async fn update_camera(
     .bind(id)
     .fetch_one(&mut *transaction)
     .await?;
+    let credentials = record.decrypt_credentials(&state.secrets)?;
     let operation = reconciliation::queue_camera_change(
         &mut transaction,
         &record,
@@ -456,7 +495,7 @@ async fn update_camera(
     )
     .await;
     Ok(Json(CameraMutationResponse {
-        camera: CameraView::from(&record),
+        camera: CameraView::from_record(&record, &credentials),
         media_synced: false,
         warning: None,
         operation_id: operation.id,
@@ -576,20 +615,15 @@ async fn ptz(
     {
         return Err(AppError::Validation("PTZ速度必须在-1到1之间".into()));
     }
-    let camera = load_camera(&state, id).await?;
+    let (camera, credentials) = load_camera_with_credentials(&state, id).await?;
     let onvif_url = camera
         .onvif_url
         .as_deref()
         .ok_or_else(|| AppError::Validation("摄像头没有配置ONVIF地址".into()))?;
-    let password = camera
-        .password_enc
-        .as_deref()
-        .map(|value| state.secrets.decrypt(value))
-        .transpose()?;
     onvif::ptz(
         onvif_url,
-        camera.username.as_deref(),
-        password.as_deref(),
+        credentials.username.as_deref(),
+        credentials.password.as_deref(),
         onvif::PtzCommand {
             action: &request.action,
             pan: values.0,
@@ -804,6 +838,7 @@ async fn list_audit(
 }
 
 async fn system_status(_user: CurrentUser, State(state): State<AppState>) -> Result<Json<Value>> {
+    reconciliation::validate_stored_camera_credentials(&state).await?;
     let (total, online, recording): (i64, i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'online'), \
          COUNT(*) FILTER (WHERE record_enabled AND enabled) \
@@ -877,11 +912,18 @@ async fn live() -> Json<Value> {
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
-    let database = sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
+    let database = reconciliation::validate_stored_camera_credentials(&state)
         .await
-        .is_ok();
-    let media = state.media.health().await;
+        .is_ok()
+        && sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&state.pool)
+            .await
+            .is_ok();
+    let media = if database {
+        state.media.health().await
+    } else {
+        false
+    };
     let status = if database && media {
         StatusCode::OK
     } else {
@@ -895,13 +937,34 @@ async fn ready(State(state): State<AppState>) -> Response {
 }
 
 async fn load_camera(state: &AppState, id: Uuid) -> Result<CameraRecord> {
-    sqlx::query_as::<_, CameraRecord>(&format!(
+    let (camera, _) = load_camera_with_credentials(state, id).await?;
+    Ok(camera)
+}
+
+async fn load_camera_with_credentials(
+    state: &AppState,
+    id: Uuid,
+) -> Result<(CameraRecord, CameraCredentials)> {
+    let camera = sqlx::query_as::<_, CameraRecord>(&format!(
         "{CAMERA_SELECT} WHERE id = ? AND deleted_at IS NULL"
     ))
     .bind(id)
     .fetch_optional(&state.pool)
     .await?
-    .ok_or_else(|| AppError::NotFound("摄像头不存在".into()))
+    .ok_or_else(|| AppError::NotFound("摄像头不存在".into()))?;
+    let credentials = camera.decrypt_credentials(&state.secrets)?;
+    Ok((camera, credentials))
+}
+
+fn encrypt_camera_credential(
+    state: &AppState,
+    camera_id: Uuid,
+    field: CredentialField,
+    plaintext: &str,
+) -> Result<Vec<u8>> {
+    let envelope = state.secrets.encrypt(camera_id, field, plaintext)?;
+    state.secrets.decrypt(camera_id, field, &envelope)?;
+    Ok(envelope)
 }
 
 async fn load_user(state: &AppState, id: Uuid) -> Result<UserRecord> {

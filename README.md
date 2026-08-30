@@ -101,6 +101,26 @@ Sentinel 0.2 的唯一浏览器/API 前缀是 `/api/v2`，唯一 MediaMTX 回调
 HKDF-SHA256 派生；原始密钥签发的 0.1 token 即使尚未过期也不能通过验证。不提供 previous secret、
 keyring 或协议 fallback；跨版本转换属于外部升级工具职责。
 
+## 当前摄像头凭据 envelope
+
+Sentinel 0.2 只接受一种摄像头密文：数据库 BLOB 必须是规范化 JSON，且恰好包含
+`product=sentinel-monitor`、`application_version=0.2.0`、`envelope_revision=1`、
+`key_id=sentinel-credentials-0.2.0-key-1`、`nonce` 和 `ciphertext`。后两项仅接受无填充
+URL-safe Base64；未知字段、非规范序列化、其他产品/版本/revision/key ID、旧版
+`nonce || ciphertext` 字节串、裸 Base64 和任何篡改都会 fail closed。
+
+AES-256-GCM 专用 key 由 `CREDENTIALS_KEY` 使用 HKDF-SHA256 派生，salt 为
+`sentinel-monitor/0.2.0/credential-envelope/key/v1`，info 为
+`sentinel-credential-envelope/aes-256-gcm`。AAD 把以下 UTF-8 字段逐项编码为
+`u64 big-endian 字节长度 || 原字节`：固定域
+`sentinel-monitor/0.2.0/credential-envelope/aad/v1`、产品、应用版本、envelope revision、key ID、
+小写连字符 UUID camera ID，以及精确数据库字段名 `main_stream_url_enc`、`sub_stream_url_enc`、
+`username_enc` 或 `password_enc`。因此密文不能跨摄像头或字段互换。
+
+产品没有 previous key、运行时 keyring、旧密文解析或自动改写。`username` 在当前 schema 中也只以
+`username_enc` 保存；密码和流 URL 不进入 API 响应、审计或日志。任何 0.1 到当前 envelope 的转换由
+外部升级工具在产品停止时完成。
+
 ## MediaMTX 一致性模型
 
 摄像头写接口不再把一次 HTTP 请求伪装成数据库与 MediaMTX 的原子事务：
@@ -173,7 +193,7 @@ Sentinel `0.2.0` 产品进程只理解并初始化一个当前 schema，不承�
 application=sentinel-monitor
 application_version=0.2.0
 schema_revision=1
-schema_sha256=c06dde59a25ca34d4f64f38f0306822b649efefb6e063f2f964f43e34d014de4
+schema_sha256=2f5b978d8948b401c01fb6cf920d00b47a5e5c8aa1212136ce3c38064e71833f
 ```
 
 指纹从 `sqlite_schema` 读取 `name NOT GLOB 'sqlite_*'` 且 `name <> 'product_metadata'` 的

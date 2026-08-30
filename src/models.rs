@@ -1,3 +1,7 @@
+use crate::{
+    crypto::{CredentialField, SecretBox},
+    error::Result,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,7 +76,7 @@ pub struct CameraRecord {
     pub main_stream_url_enc: Vec<u8>,
     pub sub_stream_url_enc: Option<Vec<u8>>,
     pub onvif_url: Option<String>,
-    pub username: Option<String>,
+    pub username_enc: Option<Vec<u8>>,
     pub password_enc: Option<Vec<u8>>,
     pub enabled: bool,
     pub record_enabled: bool,
@@ -80,6 +84,40 @@ pub struct CameraRecord {
     pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+pub struct CameraCredentials {
+    pub main_stream_url: String,
+    pub sub_stream_url: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl CameraRecord {
+    pub fn decrypt_credentials(&self, secrets: &SecretBox) -> Result<CameraCredentials> {
+        Ok(CameraCredentials {
+            main_stream_url: secrets.decrypt(
+                self.id,
+                CredentialField::MainStreamUrl,
+                &self.main_stream_url_enc,
+            )?,
+            sub_stream_url: self
+                .sub_stream_url_enc
+                .as_deref()
+                .map(|value| secrets.decrypt(self.id, CredentialField::SubStreamUrl, value))
+                .transpose()?,
+            username: self
+                .username_enc
+                .as_deref()
+                .map(|value| secrets.decrypt(self.id, CredentialField::Username, value))
+                .transpose()?,
+            password: self
+                .password_enc
+                .as_deref()
+                .map(|value| secrets.decrypt(self.id, CredentialField::Password, value))
+                .transpose()?,
+        })
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -98,15 +136,15 @@ pub struct CameraView {
     pub updated_at: DateTime<Utc>,
 }
 
-impl From<&CameraRecord> for CameraView {
-    fn from(value: &CameraRecord) -> Self {
+impl CameraView {
+    pub fn from_record(value: &CameraRecord, credentials: &CameraCredentials) -> Self {
         Self {
             id: value.id,
             name: value.name.clone(),
             location: value.location.clone(),
             has_sub_stream: value.sub_stream_url_enc.is_some(),
             onvif_configured: value.onvif_url.is_some(),
-            username: value.username.clone(),
+            username: credentials.username.clone(),
             enabled: value.enabled,
             record_enabled: value.record_enabled,
             status: value.status.clone(),

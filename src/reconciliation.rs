@@ -18,7 +18,7 @@ const OPERATION_LEASE_REQUEST_BUDGET: u64 = 4;
 const LEASE_SAFETY_MARGIN_SECONDS: u64 = 30;
 
 const CAMERA_SELECT_INTERNAL: &str = "SELECT id, name, location, main_stream_url_enc, \
-    sub_stream_url_enc, onvif_url, username, password_enc, enabled, record_enabled, status, \
+    sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, \
     last_seen_at, created_at, updated_at FROM cameras";
 const OPERATION_SELECT: &str = "SELECT id, camera_id, generation, kind, state, reason, \
     requested_by, attempt, created_at, started_at, finished_at, retry_at, error_code, \
@@ -159,6 +159,7 @@ async fn recover_expired_operation_leases_at(pool: &SqlitePool, now: DateTime<Ut
 }
 
 pub async fn reconcile_once(state: &AppState) -> Result<bool> {
+    validate_stored_camera_credentials(state).await?;
     let Some(lease_owner) = acquire_reconciler_lease(state).await? else {
         return Ok(false);
     };
@@ -173,6 +174,16 @@ pub async fn reconcile_once(state: &AppState) -> Result<bool> {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
+}
+
+pub async fn validate_stored_camera_credentials(state: &AppState) -> Result<()> {
+    let cameras = sqlx::query_as::<_, CameraRecord>(CAMERA_SELECT_INTERNAL)
+        .fetch_all(&state.pool)
+        .await?;
+    for camera in cameras {
+        camera.decrypt_credentials(&state.secrets)?;
+    }
+    Ok(())
 }
 
 async fn reconcile_once_with_lease(state: &AppState, lease_owner: &str) -> Result<bool> {
@@ -394,6 +405,7 @@ async fn apply_desired(
     camera: &CameraRecord,
     desired: &DesiredState,
 ) -> Result<AppliedSources> {
+    let credentials = camera.decrypt_credentials(&state.secrets)?;
     let standard_sub_path = camera_path(camera.id, "sub");
     if !desired.desired_present {
         state.media.delete_path(&desired.main_path).await?;
@@ -404,14 +416,11 @@ async fn apply_desired(
         });
     }
 
-    let password = camera
-        .password_enc
-        .as_deref()
-        .map(|value| state.secrets.decrypt(value))
-        .transpose()?;
-    let main_url = state.secrets.decrypt(&camera.main_stream_url_enc)?;
-    let main_source =
-        source_with_credentials(&main_url, camera.username.as_deref(), password.as_deref())?;
+    let main_source = source_with_credentials(
+        &credentials.main_stream_url,
+        credentials.username.as_deref(),
+        credentials.password.as_deref(),
+    )?;
     state
         .media
         .upsert_path(
@@ -423,11 +432,13 @@ async fn apply_desired(
         .await?;
 
     let mut sub_digest = None;
-    match (&desired.sub_path, &camera.sub_stream_url_enc) {
-        (Some(sub_path), Some(encrypted)) => {
-            let sub_url = state.secrets.decrypt(encrypted)?;
-            let sub_source =
-                source_with_credentials(&sub_url, camera.username.as_deref(), password.as_deref())?;
+    match (&desired.sub_path, &credentials.sub_stream_url) {
+        (Some(sub_path), Some(sub_url)) => {
+            let sub_source = source_with_credentials(
+                sub_url,
+                credentials.username.as_deref(),
+                credentials.password.as_deref(),
+            )?;
             state
                 .media
                 .upsert_path(sub_path, &sub_source, true, false)
@@ -771,31 +782,29 @@ fn expected_configs(
     camera: &CameraRecord,
     desired: &DesiredState,
 ) -> Result<ExpectedConfigs> {
+    let credentials = camera.decrypt_credentials(&state.secrets)?;
     if !desired.desired_present {
         return Ok(ExpectedConfigs {
             main: None,
             sub: None,
         });
     }
-    let password = camera
-        .password_enc
-        .as_deref()
-        .map(|value| state.secrets.decrypt(value))
-        .transpose()?;
-    let main_url = state.secrets.decrypt(&camera.main_stream_url_enc)?;
-    let main_source =
-        source_with_credentials(&main_url, camera.username.as_deref(), password.as_deref())?;
+    let main_source = source_with_credentials(
+        &credentials.main_stream_url,
+        credentials.username.as_deref(),
+        credentials.password.as_deref(),
+    )?;
     let main = Some(PathConfigSnapshot {
         source_digest: Some(source_digest(&main_source)),
         source_on_demand: !desired.record_enabled,
         record: desired.record_enabled,
     });
-    let sub = match (&desired.sub_path, &camera.sub_stream_url_enc) {
-        (Some(_), Some(encrypted)) => {
+    let sub = match (&desired.sub_path, &credentials.sub_stream_url) {
+        (Some(_), Some(sub_url)) => {
             let source = source_with_credentials(
-                &state.secrets.decrypt(encrypted)?,
-                camera.username.as_deref(),
-                password.as_deref(),
+                sub_url,
+                credentials.username.as_deref(),
+                credentials.password.as_deref(),
             )?;
             Some(PathConfigSnapshot {
                 source_digest: Some(source_digest(&source)),

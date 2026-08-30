@@ -27,7 +27,7 @@ CREATE TABLE cameras (
     main_stream_url_enc BLOB NOT NULL,
     sub_stream_url_enc BLOB,
     onvif_url TEXT,
-    username TEXT,
+    username_enc BLOB,
     password_enc BLOB,
     enabled INTEGER NOT NULL DEFAULT 1,
     record_enabled INTEGER NOT NULL DEFAULT 1,
