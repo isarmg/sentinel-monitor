@@ -25,6 +25,7 @@ struct TestContext {
     _database: TemporaryDatabase,
     state: AppState,
     media_task: JoinHandle<()>,
+    _network_guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for TestContext {
@@ -67,6 +68,7 @@ impl Drop for TemporaryDatabase {
 
 impl TestContext {
     async fn migrated() -> Self {
+        let network_guard = crate::NETWORK_TEST_LOCK.lock().await;
         let database = TemporaryDatabase::new();
         let database_url = database.url();
         let pool = sqlite::open_pool(&database_url)
@@ -107,6 +109,7 @@ impl TestContext {
             reconcile_interval: Duration::from_secs(60),
             request_timeout: Duration::from_millis(100),
             onvif_discovery_timeout: Duration::from_millis(100),
+            onvif_xaddr_allowlist: Vec::new(),
             static_dir: PathBuf::from("web/dist"),
         });
         let http = reqwest::Client::builder()
@@ -132,6 +135,7 @@ impl TestContext {
             _database: database,
             state,
             media_task,
+            _network_guard: network_guard,
         }
     }
 

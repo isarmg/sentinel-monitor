@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ipnet::IpNet;
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone)]
@@ -20,6 +21,7 @@ pub struct Config {
     pub reconcile_interval: Duration,
     pub request_timeout: Duration,
     pub onvif_discovery_timeout: Duration,
+    pub onvif_xaddr_allowlist: Vec<IpNet>,
     pub static_dir: PathBuf,
 }
 
@@ -65,6 +67,7 @@ impl Config {
                 "ONVIF_DISCOVERY_TIMEOUT_MS",
                 3000,
             )?),
+            onvif_xaddr_allowlist: parse_cidr_list("ONVIF_XADDR_ALLOWLIST")?,
             static_dir: PathBuf::from(value("STATIC_DIR", "web/dist")),
         })
     }
@@ -88,6 +91,20 @@ fn parse_bool(name: &str, default: bool) -> Result<bool, String> {
     value(name, if default { "true" } else { "false" })
         .parse()
         .map_err(|_| format!("{name} must be true or false"))
+}
+
+fn parse_cidr_list(name: &str) -> Result<Vec<IpNet>, String> {
+    env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| format!("{name} must be a comma-separated CIDR list"))
+        })
+        .collect()
 }
 
 fn trim_slash(mut value: String) -> String {

@@ -527,14 +527,16 @@ async fn ptz(
         .map(|value| state.secrets.decrypt(value))
         .transpose()?;
     onvif::ptz(
-        &state.http,
         onvif_url,
         camera.username.as_deref(),
         password.as_deref(),
-        &request.action,
-        values.0,
-        values.1,
-        values.2,
+        onvif::PtzCommand {
+            action: &request.action,
+            pan: values.0,
+            tilt: values.1,
+            zoom: values.2,
+        },
+        &state.config.onvif_xaddr_allowlist,
     )
     .await?;
     write_audit(
@@ -883,15 +885,7 @@ fn validate_rtsp(value: &str) -> Result<()> {
 }
 
 fn validate_http(value: &str) -> Result<()> {
-    let url =
-        Url::parse(value.trim()).map_err(|_| AppError::Validation("ONVIF地址格式无效".into()))?;
-    if matches!(url.scheme(), "http" | "https") && url.host().is_some() {
-        Ok(())
-    } else {
-        Err(AppError::Validation(
-            "ONVIF地址必须使用http://或https://".into(),
-        ))
-    }
+    onvif::validate_configured_url(value.trim())
 }
 
 fn clean_optional(value: Option<String>) -> Option<String> {

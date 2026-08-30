@@ -12,6 +12,9 @@ mod sqlite;
 #[cfg(test)]
 mod sqlite_tests;
 
+#[cfg(test)]
+static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use config::Config;
 use crypto::SecretBox;
 use mediamtx::MediaMtxClient;
