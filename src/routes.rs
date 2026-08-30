@@ -170,6 +170,7 @@ async fn create_user(
     validate_role(&request.role)?;
     validate_email(&request.email)?;
     let now = Utc::now();
+    let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, UserRecord>(
         "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
          VALUES (?, LOWER(?), ?, ?, 1, ?, ?) \
@@ -181,18 +182,19 @@ async fn create_user(
     .bind(&request.role)
     .bind(now)
     .bind(now)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(map_unique_email)?;
-    write_audit(
-        &state,
+    write_audit_in(
+        &mut transaction,
         Some(user.id),
         "user.create",
         "user",
         Some(record.id),
-        json!({ "role": record.role }),
+        json!({ "role": &record.role }),
     )
-    .await;
+    .await?;
+    transaction.commit().await?;
     Ok((StatusCode::CREATED, Json(UserView::from(record))))
 }
 
@@ -219,6 +221,7 @@ async fn update_user(
     };
     let invalidate_sessions =
         password_changed || role != existing.role || active != existing.active;
+    let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, UserRecord>(
         "UPDATE users SET role = ?, active = ?, password_hash = ?, \
          session_version = session_version + ?, updated_at = datetime('now') WHERE id = ? \
@@ -229,17 +232,18 @@ async fn update_user(
     .bind(password_hash)
     .bind(i64::from(invalidate_sessions))
     .bind(id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *transaction)
     .await?;
-    write_audit(
-        &state,
+    write_audit_in(
+        &mut transaction,
         Some(user.id),
         "user.update",
         "user",
         Some(id),
         json!({ "role": role, "active": active }),
     )
-    .await;
+    .await?;
+    transaction.commit().await?;
     Ok(Json(UserView::from(record)))
 }
 
@@ -256,19 +260,21 @@ async fn delete_user(
     if existing.role == "admin" {
         ensure_another_admin(&state, id).await?;
     }
-    sqlx::query("DELETE FROM users WHERE id = ?")
-        .bind(id)
-        .execute(&state.pool)
-        .await?;
-    write_audit(
-        &state,
+    let mut transaction = state.pool.begin().await?;
+    write_audit_in(
+        &mut transaction,
         Some(user.id),
         "user.delete",
         "user",
         Some(id),
         json!({ "email": existing.email }),
     )
-    .await;
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -364,16 +370,16 @@ async fn create_camera(
         "camera_created",
     )
     .await?;
-    transaction.commit().await?;
-    write_audit(
-        &state,
+    write_audit_in(
+        &mut transaction,
         Some(user.id),
         "camera.create",
         "camera",
         Some(record.id),
-        json!({ "name": record.name }),
+        json!({ "name": &record.name }),
     )
-    .await;
+    .await?;
+    transaction.commit().await?;
     Ok((
         StatusCode::CREATED,
         Json(CameraMutationResponse {
@@ -484,16 +490,16 @@ async fn update_camera(
         "camera_updated",
     )
     .await?;
-    transaction.commit().await?;
-    write_audit(
-        &state,
+    write_audit_in(
+        &mut transaction,
         Some(user.id),
         "camera.update",
         "camera",
         Some(id),
-        json!({ "name": record.name }),
+        json!({ "name": &record.name }),
     )
-    .await;
+    .await?;
+    transaction.commit().await?;
     Ok(Json(CameraMutationResponse {
         camera: CameraView::from_record(&record, &credentials),
         media_synced: false,
@@ -529,16 +535,16 @@ async fn delete_camera(
         "camera_deleted",
     )
     .await?;
-    transaction.commit().await?;
-    write_audit(
-        &state,
+    write_audit_in(
+        &mut transaction,
         Some(user.id),
         "camera.delete",
         "camera",
         Some(id),
         json!({ "name": camera.name }),
     )
-    .await;
+    .await?;
+    transaction.commit().await?;
     Ok((StatusCode::ACCEPTED, Json(operation)))
 }
 
@@ -804,7 +810,15 @@ async fn event_stream(
                         yield Ok(payload);
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Broadcast is only a notification channel; SQLite remains
+                    // authoritative. A lagged client must perform a full query
+                    // before subscribing again, never silently skip facts.
+                    yield Ok(Event::default()
+                        .event("resync-required")
+                        .data(format!("{{\"skipped\":{skipped}}}")));
+                    break;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -1082,6 +1096,30 @@ async fn write_audit(
     {
         tracing::warn!(%error, "audit log write failed");
     }
+}
+
+async fn write_audit_in(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: Option<Uuid>,
+    action: &str,
+    entity_type: &str,
+    entity_id: Option<Uuid>,
+    details: Value,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(action)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(details)
+    .bind(Utc::now())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

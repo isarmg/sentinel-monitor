@@ -22,7 +22,7 @@ const CAMERA_SELECT_INTERNAL: &str = "SELECT id, name, location, main_stream_url
     sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, \
     last_seen_at, created_at, updated_at FROM cameras";
 const OPERATION_SELECT: &str = "SELECT id, camera_id, generation, kind, state, reason, \
-    requested_by, attempt, created_at, started_at, finished_at, retry_at, error_code, \
+    requested_by, attempt, max_attempts, created_at, started_at, finished_at, retry_at, error_code, \
     error_message, lease_owner, lease_expires_at FROM media_operations";
 
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]
@@ -35,6 +35,7 @@ pub struct MediaOperationView {
     pub reason: String,
     pub requested_by: Option<Uuid>,
     pub attempt: i64,
+    pub max_attempts: i64,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -160,11 +161,16 @@ async fn recover_expired_operation_leases(pool: &SqlitePool) -> Result<u64> {
 
 async fn recover_expired_operation_leases_at(pool: &SqlitePool, now: DateTime<Utc>) -> Result<u64> {
     let result = sqlx::query(
-        "UPDATE media_operations SET state = 'unknown', finished_at = NULL, retry_at = ?, \
+        "UPDATE media_operations SET state = CASE WHEN attempt >= max_attempts THEN 'dead_letter' ELSE 'unknown' END, \
+         finished_at = CASE WHEN attempt >= max_attempts THEN ? ELSE NULL END, \
+         dead_letter_at = CASE WHEN attempt >= max_attempts THEN ? ELSE NULL END, \
+         retry_at = CASE WHEN attempt >= max_attempts THEN NULL ELSE ? END, \
          lease_owner = NULL, lease_expires_at = NULL, error_code = 'worker_lease_expired', \
          error_message = 'The worker lease expired before the outcome was recorded' \
          WHERE state = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
     )
+    .bind(now)
+    .bind(now)
     .bind(now)
     .bind(now)
     .execute(pool)
@@ -372,6 +378,7 @@ async fn claim_next_operation(
              SELECT candidate.id FROM media_operations candidate \
              WHERE (candidate.state = 'pending' OR (candidate.state IN ('failed', 'unknown') \
                     AND candidate.retry_at IS NOT NULL AND candidate.retry_at <= ?)) \
+               AND candidate.attempt < candidate.max_attempts \
                AND NOT EXISTS (SELECT 1 FROM media_operations active \
                    WHERE active.camera_id = candidate.camera_id AND active.state = 'running') \
              ORDER BY candidate.created_at, candidate.attempt, candidate.id LIMIT 1 \
@@ -693,13 +700,18 @@ async fn finish_failure(
     error: &AppError,
 ) -> Result<()> {
     let owner = operation_owner(operation)?;
-    let (operation_state, error_code, error_message, retryable) = sanitized_failure(error);
-    let retry_at = retryable.then(|| Utc::now() + retry_delay(operation.attempt));
+    let (mut operation_state, error_code, error_message, retryable) = sanitized_failure(error);
+    let exhausted = retryable && operation.attempt >= operation.max_attempts;
+    if exhausted {
+        operation_state = "dead_letter";
+    }
+    let retry_at = (retryable && !exhausted).then(|| Utc::now() + retry_delay(operation.attempt));
     let now = Utc::now();
     let finished_at = (operation_state != "unknown").then_some(now);
+    let dead_letter_at = exhausted.then_some(now);
     let mut transaction = state.pool.begin().await?;
     let result = sqlx::query(
-        "UPDATE media_operations SET state = ?, finished_at = ?, retry_at = ?, \
+        "UPDATE media_operations SET state = ?, finished_at = ?, retry_at = ?, dead_letter_at = ?, \
          lease_owner = NULL, lease_expires_at = NULL, error_code = ?, error_message = ? \
          WHERE id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ? \
          AND EXISTS (SELECT 1 FROM media_reconciler_leases WHERE singleton = 1 \
@@ -708,6 +720,7 @@ async fn finish_failure(
     .bind(operation_state)
     .bind(finished_at)
     .bind(retry_at)
+    .bind(dead_letter_at)
     .bind(error_code)
     .bind(error_message)
     .bind(&operation.id)
@@ -1024,7 +1037,7 @@ fn source_with_credentials(
 }
 
 const fn operation_select_fields() -> &'static str {
-    "id, camera_id, generation, kind, state, reason, requested_by, attempt, created_at, \
+    "id, camera_id, generation, kind, state, reason, requested_by, attempt, max_attempts, created_at, \
      started_at, finished_at, retry_at, error_code, error_message, lease_owner, lease_expires_at"
 }
 

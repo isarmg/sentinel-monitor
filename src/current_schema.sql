@@ -106,13 +106,14 @@ CREATE TABLE media_operations (
     generation INTEGER NOT NULL CHECK (generation > 0),
     kind TEXT NOT NULL CHECK (kind = 'reconcile_camera'),
     state TEXT NOT NULL CHECK (
-        state IN ('pending', 'running', 'succeeded', 'failed', 'unknown')
+        state IN ('pending', 'running', 'succeeded', 'failed', 'unknown', 'dead_letter', 'resolved')
     ),
     reason TEXT NOT NULL CHECK (
         reason IN ('camera_created', 'camera_updated', 'camera_deleted', 'drift_detected')
     ),
     requested_by TEXT REFERENCES users(id) ON DELETE SET NULL,
     attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 8 CHECK (max_attempts BETWEEN 1 AND 64),
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
@@ -121,7 +122,11 @@ CREATE TABLE media_operations (
     lease_expires_at TEXT,
     result_json TEXT,
     error_code TEXT,
-    error_message TEXT
+    error_message TEXT,
+    dead_letter_at TEXT,
+    resolved_at TEXT,
+    resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    resolution TEXT
 );
 
 CREATE INDEX media_operations_queue_idx
