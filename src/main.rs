@@ -255,7 +255,8 @@ fn required_credentials_key() -> anyhow::Result<[u8; 32]> {
 async fn serve() -> anyhow::Result<()> {
     let config =
         Arc::new(Config::from_env().map_err(|error| anyhow::anyhow!("configuration: {error}"))?);
-    let _application_lock = runtime_lock::ApplicationLock::acquire(&config.runtime_directory)?;
+    let application_lock =
+        runtime_lock::ApplicationLock::acquire(&config.database_url, &config.runtime_directory)?;
     if config.development_mode {
         tracing::warn!(
             address = %config.bind_addr,
@@ -263,6 +264,7 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
     let pool = sqlite::open_pool(&config.database_url).await?;
+    application_lock.validate_open_database()?;
     sqlx::migrate!().run(&pool).await?;
 
     let http = reqwest::Client::builder()

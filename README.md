@@ -96,10 +96,15 @@ STATIC_DIR=web/dist
 5. 周期性比较期望 Path 与 MediaMTX 的配置/Publisher/Recording 实际态，发现漂移会创建新的
    `drift_detected` 操作。
 
-`serve` 自身在访问数据库前即排他持有绝对路径 `SENTINEL_RUNTIME_DIR/app.lock`，并自行维护
-`app.pid` 到退出；同一 runtime 的第二实例会直接拒绝启动。数据库租约仍然是必要的第二道 fencing，
-用于防御误配到不同 runtime、共享数据库或旧 worker 超时返回等情况。请求超时限制为 1–300 秒，
-避免配置值超过可证明的租约预算。
+`serve` 在访问数据库前同时持有数据库同目录下的
+`.app.db.sentinel-monitor.instance.lock`（排他）与
+`.app.db.sentinel-monitor.maintenance.lock`（共享），并继续持有绝对路径
+`SENTINEL_RUNTIME_DIR/app.lock`、维护 `app.pid` 到退出。数据库锁按数据库路径身份锚定，所以即使把
+同一 `DATABASE_URL` 误配到两个 runtime，第二实例也会在打开 SQLite 前拒绝；数据库文件、数据库父
+目录或锁文件的符号链接，以及数据库/锁文件的硬链接别名同样 fail closed。维护操作统一先取得数据库
+maintenance 排他锁，再取得 runtime/MediaMTX 锁，避免跨身份锁顺序反转。数据库租约仍然是必要的
+第二道 fencing，用于防御旧 worker 超时返回等业务级并发。请求超时限制为 1–300 秒，避免配置值超过
+可证明的租约预算。
 
 创建和修改响应保留原有的 `camera`、`media_synced`、`warning` 字段，并增加：
 
@@ -142,9 +147,10 @@ Sentinel 的可恢复数据集是一个整包：SQLite Online Backup 一致快�
 摄像头凭据无法恢复。
 
 由于当前 MediaMTX 没有冻结录像文件集的快照 API，整包创建和恢复会 fail closed：必须先停止
-Sentinel 与 MediaMTX。Sentinel 进程自身全生命周期持有 `app.lock`，MediaMTX 由
-`native/start.sh` 的 `flock --no-fork` 持有 `mediamtx.lock`；运维命令取得两把锁并核对 PID 后才会
-继续。SQLite 即使处于 WAL 模式仍始终使用 Online Backup API，不会裸拷主 `.db` 文件。
+Sentinel 与 MediaMTX。Sentinel 进程自身全生命周期持有数据库 instance/shared-maintenance 锁和
+runtime `app.lock`，MediaMTX 由 `native/start.sh` 的 `flock --no-fork` 持有 `mediamtx.lock`；运维
+命令按数据库 maintenance、runtime、MediaMTX 的固定顺序取得排他锁并核对 PID 后才会继续。SQLite
+即使处于 WAL 模式仍始终使用 Online Backup API，不会裸拷主 `.db` 文件。
 
 ```bash
 set -a

@@ -47,10 +47,12 @@ SQLite 数据库、MediaMTX 配置/版本契约和录像目录共同构成可恢
 Online Backup API，并把录像文件本体、逐文件哈希与非秘密凭据 key ID 写入同一个不覆盖的整包。
 
 当前 MediaMTX 没有冻结录像目录的快照 API，所以创建与恢复整包前必须运行 `./native/stop.sh`。
-Rust `serve` 进程自身持有 `$SENTINEL_RUNTIME_DIR/app.lock` 并维护 `app.pid` 到退出，因此同 runtime
-第二实例会在打开数据库前被拒绝。MediaMTX 由 `native/start.sh` 使用 `flock --no-fork` 在同一 PID
-中 exec 并保留 `mediamtx.lock` 文件描述符。运维命令同时校验两把锁与 PID，并在服务未完全停止时
-拒绝继续。完整命令和恢复/Doctor 流程见项目
+Rust `serve` 进程自身持有数据库同目录的 instance/shared-maintenance 锁，并同时持有
+`$SENTINEL_RUNTIME_DIR/app.lock`、维护 `app.pid` 到退出；因此同一数据库即使误配不同 runtime，第二
+实例也会在打开 SQLite 前被拒绝。符号链接路径及数据库/锁文件硬链接别名均拒绝。MediaMTX 由
+`native/start.sh` 使用 `flock --no-fork` 在同一 PID 中 exec 并保留 `mediamtx.lock` 文件描述符。
+运维命令按数据库 maintenance、runtime、MediaMTX 的顺序校验锁与 PID，并在服务未完全停止时拒绝
+继续。完整命令和恢复/Doctor 流程见项目
 [`README.md`](../README.md) 的“运维”章节。
 
 服务日志：

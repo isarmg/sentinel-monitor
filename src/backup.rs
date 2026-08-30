@@ -1,4 +1,4 @@
-use crate::crypto::SecretBox;
+use crate::{crypto::SecretBox, runtime_lock::DatabaseMaintenanceLock};
 use anyhow::{bail, ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
@@ -18,7 +18,10 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+use std::os::{
+    fd::AsRawFd,
+    unix::fs::{MetadataExt, OpenOptionsExt},
+};
 
 const APPLICATION: &str = "sentinel-monitor";
 const FORMAT_VERSION: u32 = 1;
@@ -181,7 +184,7 @@ pub fn credentials_key_from_base64(value: &str) -> anyhow::Result<[u8; 32]> {
 
 pub fn create(options: &CreateOptions) -> anyhow::Result<BackupManifest> {
     validate_key_id(&options.credentials_key_id)?;
-    let _service_locks = ServiceLocks::acquire(&options.runtime_directory)?;
+    let _service_locks = ServiceLocks::acquire(&options.database_url, &options.runtime_directory)?;
     validate_source_layout(
         &options.mediamtx_config,
         &options.mediamtx_contract,
@@ -331,7 +334,7 @@ fn restore_inner(
         manifest.credentials_key.key_id == options.credentials_key_id,
         "the supplied credentials key ID does not match this backup"
     );
-    let _service_locks = ServiceLocks::acquire(&options.runtime_directory)?;
+    let _service_locks = ServiceLocks::acquire(&options.database_url, &options.runtime_directory)?;
     let deployed_contract =
         verify_binary_contract(&options.mediamtx_contract, &options.mediamtx_binary)?;
     ensure!(
@@ -419,6 +422,7 @@ fn restore_inner(
 }
 
 pub async fn doctor(options: &DoctorOptions) -> anyhow::Result<DoctorReport> {
+    let _maintenance = DatabaseMaintenanceLock::shared(&options.database_url)?;
     let database = database_path(&options.database_url)?;
     require_regular_file_without_symlinks(&database, "SQLite database")?;
     verify_database(&database)?;
@@ -1588,11 +1592,16 @@ impl Drop for StagedPaths {
 }
 
 struct ServiceLocks {
+    _database: DatabaseMaintenanceLock,
     _files: Vec<File>,
 }
 
 impl ServiceLocks {
-    fn acquire(runtime_directory: &Path) -> anyhow::Result<Self> {
+    fn acquire(database_url: &str, runtime_directory: &Path) -> anyhow::Result<Self> {
+        // Acquire database maintenance before runtime/companion locks everywhere
+        // to keep a single global order and fence a same-DB process that was
+        // accidentally configured with another runtime directory.
+        let database = DatabaseMaintenanceLock::exclusive(database_url)?;
         require_directory_without_symlinks(runtime_directory, "runtime directory")?;
         let mut files = Vec::new();
         for name in ["app.lock", "mediamtx.lock"] {
@@ -1601,10 +1610,19 @@ impl ServiceLocks {
             let mut options = OpenOptions::new();
             options.read(true).write(true).create(true);
             #[cfg(unix)]
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
             let file = options
                 .open(&path)
                 .with_context(|| format!("open service lock {}", path.display()))?;
+            let metadata = file.metadata()?;
+            ensure!(metadata.is_file(), "service lock must be a regular file");
+            #[cfg(unix)]
+            ensure!(
+                metadata.nlink() == 1,
+                "service lock must not have hard-link aliases"
+            );
             lock_file_exclusive(&file).with_context(|| {
                 format!(
                     "service lock {} is held; stop Sentinel and MediaMTX first",
@@ -1616,7 +1634,10 @@ impl ServiceLocks {
         for name in ["app.pid", "mediamtx.pid"] {
             ensure_pid_stopped(&runtime_directory.join(name))?;
         }
-        Ok(Self { _files: files })
+        Ok(Self {
+            _database: database,
+            _files: files,
+        })
     }
 }
 
@@ -1642,6 +1663,11 @@ fn ensure_pid_stopped(path: &Path) -> anyhow::Result<()> {
             ensure!(
                 !metadata.file_type().is_symlink() && metadata.is_file(),
                 "service PID path must be a regular file"
+            );
+            #[cfg(unix)]
+            ensure!(
+                metadata.nlink() == 1,
+                "service PID path must not have hard-link aliases"
             );
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2345,7 +2371,9 @@ mod tests {
     #[test]
     fn held_service_lock_refuses_backup() {
         let layout = TestLayout::new();
-        let _lock = crate::runtime_lock::ApplicationLock::acquire(&layout.runtime).unwrap();
+        let database_url = format!("sqlite://{}", layout.database.display());
+        let _lock =
+            crate::runtime_lock::ApplicationLock::acquire(&database_url, &layout.runtime).unwrap();
         assert!(create(&layout.create_options()).is_err());
         assert!(!layout.backup.exists());
     }
