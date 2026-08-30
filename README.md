@@ -193,12 +193,20 @@ Sentinel `0.2.0` 产品进程只理解并初始化一个当前 schema，不承�
 application=sentinel-monitor
 application_version=0.2.0
 schema_revision=1
-schema_sha256=2f5b978d8948b401c01fb6cf920d00b47a5e5c8aa1212136ce3c38064e71833f
+schema_sha256=73a26cfd0d8d55f1559407904fe6445e278310614750cc1c0f3306a2803b7df6
 ```
 
 指纹从 `sqlite_schema` 读取 `name NOT GLOB 'sqlite_*'` 且 `name <> 'product_metadata'` 的
 `(type,name,tbl_name,COALESCE(sql,''))`，按 `type,name,tbl_name` 排序；每个 UTF-8 字段先馈入 u64
 big-endian 字节长度，再馈入原字节，最终输出小写 SHA-256。启动会同时比对元数据和现场重新计算值。
+
+`media_reconciler_leases` 也是 Sentinel 0.2 当前状态契约的一部分：表必须是编译期固定形状，且恰好
+包含 `singleton=1` 一行。空闲态要求 `lease_owner` 与 `lease_expires_at` 同时为 `NULL`；持有态要求
+owner 是小写连字符 UUIDv4、两个时间字段都是规范 UTC RFC 3339，且 `lease_expires_at > updated_at`。
+启动先从 main/WAL/journal 原始字节复制出私有 generation，再只在私有副本验证表 SQL、列、约束和
+唯一状态行；缺行、额外行、旧 `scope='global'` 形状、未知列或非法状态都不会打开生产连接或创建/改写
+SQLite sidecar。产品不会补行、删行或修复旧状态；协调器运行中发现损坏会立即返回错误并等待下一次有
+间隔的调度，不会把损坏误判为“另一 worker 正忙”或在内部忙循环。
 
 ## 运维
 

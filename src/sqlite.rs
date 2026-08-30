@@ -1,4 +1,5 @@
 use anyhow::{ensure, Context};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -12,6 +13,7 @@ use std::{
     str::FromStr,
     time::Duration,
 };
+use uuid::{Uuid, Version};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -21,7 +23,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLICATION: &str = "sentinel-monitor";
 pub const CURRENT_SCHEMA_REVISION: i64 = 1;
 pub const CURRENT_SCHEMA_SHA256: &str =
-    "2f5b978d8948b401c01fb6cf920d00b47a5e5c8aa1212136ce3c38064e71833f";
+    "73a26cfd0d8d55f1559407904fe6445e278310614750cc1c0f3306a2803b7df6";
 const CURRENT_SCHEMA: &str = include_str!("current_schema.sql");
 const PRODUCT_METADATA_SQL: &str = "CREATE TABLE product_metadata (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -30,6 +32,41 @@ const PRODUCT_METADATA_SQL: &str = "CREATE TABLE product_metadata (
     schema_revision INTEGER NOT NULL,
     schema_sha256 TEXT NOT NULL
 )";
+const GLOBAL_LEASE_SQL: &str = "CREATE TABLE media_reconciler_leases (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
+    CHECK (julianday(updated_at) IS NOT NULL),
+    CHECK (
+        lease_owner IS NULL OR (
+            length(lease_owner) = 36
+            AND lease_owner = lower(lease_owner)
+            AND substr(lease_owner, 9, 1) = '-'
+            AND substr(lease_owner, 14, 1) = '-'
+            AND substr(lease_owner, 15, 1) = '4'
+            AND substr(lease_owner, 19, 1) = '-'
+            AND substr(lease_owner, 20, 1) GLOB '[89ab]'
+            AND substr(lease_owner, 24, 1) = '-'
+            AND lease_owner NOT GLOB '*[^0-9a-f-]*'
+            AND length(replace(lease_owner, '-', '')) = 32
+        )
+    ),
+    CHECK (
+        lease_expires_at IS NULL OR (
+            julianday(lease_expires_at) IS NOT NULL
+            AND julianday(lease_expires_at) > julianday(updated_at)
+        )
+    )
+)";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GlobalLeaseState {
+    pub owner: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
 
 pub async fn open_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     prepare_current_database(database_url)?;
@@ -392,6 +429,7 @@ fn validate_current_connection(connection: &Connection) -> anyhow::Result<()> {
         expected_fingerprint == CURRENT_SCHEMA_SHA256,
         "database schema fingerprint metadata is not exactly current"
     );
+    validate_global_lease_table(connection)?;
     let actual = schema_fingerprint(connection)?;
     ensure!(
         actual == CURRENT_SCHEMA_SHA256,
@@ -436,6 +474,161 @@ fn validate_product_metadata_table(connection: &Connection) -> anyhow::Result<()
         "product_metadata columns do not match the current contract"
     );
     Ok(())
+}
+
+fn validate_global_lease_table(connection: &Connection) -> anyhow::Result<GlobalLeaseState> {
+    let sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'table' AND name = 'media_reconciler_leases'",
+            [],
+            |row| row.get(0),
+        )
+        .context("database has no current media_reconciler_leases table")?;
+    validate_global_lease_schema_sql(&sql)?;
+
+    let mut columns = connection.prepare("PRAGMA table_info('media_reconciler_leases')")?;
+    let actual = columns
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = vec![
+        ("singleton".to_string(), "INTEGER".to_string(), 1, 1),
+        ("lease_owner".to_string(), "TEXT".to_string(), 0, 0),
+        ("lease_expires_at".to_string(), "TEXT".to_string(), 0, 0),
+        ("updated_at".to_string(), "TEXT".to_string(), 1, 0),
+    ];
+    ensure!(
+        actual == expected,
+        "media_reconciler_leases columns do not match the current contract"
+    );
+
+    let mut statement = connection.prepare(
+        "SELECT typeof(singleton), singleton, typeof(lease_owner), lease_owner,
+                typeof(lease_expires_at), lease_expires_at, typeof(updated_at), updated_at
+         FROM media_reconciler_leases ORDER BY singleton",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    ensure!(
+        rows.len() == 1,
+        "media_reconciler_leases must contain exactly one current row"
+    );
+    let (
+        singleton_storage,
+        singleton,
+        owner_storage,
+        owner,
+        expiry_storage,
+        expiry,
+        updated_storage,
+        updated,
+    ) = rows.into_iter().next().expect("one lease row was required");
+    validate_global_lease_values(
+        &singleton_storage,
+        singleton,
+        &owner_storage,
+        owner.as_deref(),
+        &expiry_storage,
+        expiry.as_deref(),
+        &updated_storage,
+        &updated,
+    )
+}
+
+pub(crate) fn validate_global_lease_schema_sql(sql: &str) -> anyhow::Result<()> {
+    ensure!(
+        normalize_sql(sql) == normalize_sql(GLOBAL_LEASE_SQL),
+        "media_reconciler_leases table does not match the current contract"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_global_lease_values(
+    singleton_storage: &str,
+    singleton: i64,
+    owner_storage: &str,
+    owner: Option<&str>,
+    expiry_storage: &str,
+    expiry: Option<&str>,
+    updated_storage: &str,
+    updated: &str,
+) -> anyhow::Result<GlobalLeaseState> {
+    ensure!(
+        singleton_storage == "integer" && singleton == 1,
+        "global lease singleton is not exactly current"
+    );
+    ensure!(
+        updated_storage == "text",
+        "global lease updated_at storage is not exactly current"
+    );
+    let updated_at = parse_canonical_utc(updated, "global lease updated_at")?;
+
+    let (owner, lease_expires_at) = match (owner, expiry) {
+        (None, None) => {
+            ensure!(
+                owner_storage == "null" && expiry_storage == "null",
+                "free global lease storage is not exactly current"
+            );
+            (None, None)
+        }
+        (Some(owner), Some(expiry)) => {
+            ensure!(
+                owner_storage == "text" && expiry_storage == "text",
+                "owned global lease storage is not exactly current"
+            );
+            let owner_id = Uuid::parse_str(owner).context("global lease owner is not a UUID")?;
+            ensure!(
+                owner_id.hyphenated().to_string() == owner
+                    && owner_id.get_version() == Some(Version::Random),
+                "global lease owner is not a canonical lowercase UUIDv4"
+            );
+            let lease_expires_at = parse_canonical_utc(expiry, "global lease lease_expires_at")?;
+            ensure!(
+                lease_expires_at > updated_at,
+                "global lease expiry must be later than updated_at"
+            );
+            (Some(owner.to_string()), Some(lease_expires_at))
+        }
+        _ => anyhow::bail!("global lease owner and expiry must be present or absent together"),
+    };
+
+    Ok(GlobalLeaseState {
+        owner,
+        lease_expires_at,
+        updated_at,
+    })
+}
+
+fn parse_canonical_utc(value: &str, label: &str) -> anyhow::Result<DateTime<Utc>> {
+    let parsed =
+        DateTime::parse_from_rfc3339(value).with_context(|| format!("{label} is not RFC 3339"))?;
+    ensure!(parsed.offset().local_minus_utc() == 0, "{label} is not UTC");
+    let parsed = parsed.with_timezone(&Utc);
+    ensure!(
+        parsed.to_rfc3339_opts(SecondsFormat::AutoSi, false) == value,
+        "{label} is not canonical"
+    );
+    Ok(parsed)
 }
 
 fn schema_fingerprint(connection: &Connection) -> anyhow::Result<String> {
@@ -612,6 +805,83 @@ mod tests {
         drop(connection);
     }
 
+    #[tokio::test]
+    async fn corrupt_global_lease_wal_generations_are_read_only_restart_rejections() {
+        let cases = [
+            ("missing-row", "DELETE FROM media_reconciler_leases;"),
+            (
+                "extra-row",
+                "INSERT INTO media_reconciler_leases (singleton, updated_at)
+                 VALUES (2, '1970-01-01T00:00:00+00:00');",
+            ),
+            (
+                "owner-without-expiry",
+                "UPDATE media_reconciler_leases
+                 SET lease_owner = '00000000-0000-4000-8000-000000000001';",
+            ),
+            (
+                "noncanonical-owner",
+                "UPDATE media_reconciler_leases
+                 SET lease_owner = '00000000-0000-1000-8000-000000000001',
+                     lease_expires_at = '2030-01-01T00:01:00+00:00',
+                     updated_at = '2030-01-01T00:00:00+00:00';",
+            ),
+            (
+                "invalid-time-relation",
+                "UPDATE media_reconciler_leases
+                 SET lease_owner = '00000000-0000-4000-8000-000000000001',
+                     lease_expires_at = '2030-01-01T00:00:00+00:00',
+                     updated_at = '2030-01-01T00:00:00+00:00';",
+            ),
+            (
+                "unknown-shape",
+                "ALTER TABLE media_reconciler_leases ADD COLUMN unexpected TEXT;",
+            ),
+            (
+                "old-scope-shape",
+                "DROP TABLE media_reconciler_leases;
+                 CREATE TABLE media_reconciler_leases (
+                     scope TEXT PRIMARY KEY CHECK (scope = 'global'),
+                     lease_owner TEXT,
+                     lease_expires_at TEXT,
+                     updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO media_reconciler_leases (scope, updated_at)
+                 VALUES ('global', datetime('now'));",
+            ),
+        ];
+
+        for (name, mutation) in cases {
+            let temporary = tempfile::tempdir().unwrap();
+            let database = temporary.path().join(format!("{name}.sqlite3"));
+            initialize_current_database(&database).unwrap();
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA wal_autocheckpoint=0;
+                     PRAGMA ignore_check_constraints=ON;",
+                )
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            assert!(sqlite_sidecar(&database, "-wal").exists());
+
+            // The second row is possible only because this fixture deliberately
+            // models an out-of-protocol writer bypassing SQLite CHECK constraints.
+            if name == "extra-row" {
+                let count: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM media_reconciler_leases", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 2);
+            }
+            assert_rejected_without_byte_changes(&database).await;
+            drop(connection);
+            assert_rejected_without_byte_changes(&database).await;
+        }
+    }
+
     #[test]
     fn current_schema_committed_only_in_wal_is_validated_without_changes() {
         let temporary = tempfile::tempdir().unwrap();
@@ -686,7 +956,8 @@ mod tests {
         assert!(
             format!("{error:#}").contains("database")
                 || format!("{error:#}").contains("product_metadata")
-                || format!("{error:#}").contains("schema"),
+                || format!("{error:#}").contains("schema")
+                || format!("{error:#}").contains("lease"),
             "rejection must identify the current-state boundary: {error:#}"
         );
         assert!(

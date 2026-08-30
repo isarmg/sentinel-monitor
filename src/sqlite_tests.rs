@@ -557,7 +557,7 @@ async fn assert_invalid_credentials_are_side_effect_free(
         .expect("read SQLite data version before rejection");
     let lease_before: (Option<String>, Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
         "SELECT lease_owner, lease_expires_at, updated_at FROM media_reconciler_leases \
-         WHERE scope = 'global'",
+         WHERE singleton = 1",
     )
     .fetch_one(&context.state.pool)
     .await
@@ -590,7 +590,7 @@ async fn assert_invalid_credentials_are_side_effect_free(
         .expect("read SQLite data version after rejection");
     let lease_after: (Option<String>, Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
         "SELECT lease_owner, lease_expires_at, updated_at FROM media_reconciler_leases \
-         WHERE scope = 'global'",
+         WHERE singleton = 1",
     )
     .fetch_one(&context.state.pool)
     .await
@@ -1198,6 +1198,183 @@ async fn invalid_camera_envelopes_fail_before_database_or_media_side_effects() {
             .expect("restored envelopes authenticate");
     }
     drop(observer);
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn corrupt_global_lease_fails_fast_without_side_effects_and_recovers() {
+    let context = TestContext::current().await;
+    let (_, admin) = context.bootstrap().await;
+    let app = routes::router(context.state.clone());
+    let response = send_request(
+        &app,
+        Method::POST,
+        "/api/v2/cameras",
+        &admin,
+        Some(json!({
+            "name": "Lease Contract Camera",
+            "main_stream_url": "rtsp://camera.example/lease-contract",
+            "enabled": true,
+            "record_enabled": false
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let mut corrupter =
+        RusqliteConnection::open(&context._database.path).expect("open raw global lease corrupter");
+    corrupter
+        .busy_timeout(Duration::from_secs(5))
+        .expect("configure raw global lease corrupter");
+    corrupter
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             PRAGMA ignore_check_constraints=ON;",
+        )
+        .expect("model an out-of-protocol SQLite writer");
+    let original: (Option<String>, Option<String>, String) = corrupter
+        .query_row(
+            "SELECT lease_owner, lease_expires_at, updated_at
+             FROM media_reconciler_leases WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("snapshot the current global lease row");
+    assert!(original.0.is_none());
+    assert!(original.1.is_none());
+
+    let observer = RusqliteConnection::open(&context._database.path)
+        .expect("open independent global lease observer");
+    observer
+        .busy_timeout(Duration::from_secs(5))
+        .expect("configure independent global lease observer");
+    let corruptions = [
+        (
+            "missing singleton row",
+            "DELETE FROM media_reconciler_leases;",
+        ),
+        (
+            "extra singleton row",
+            "INSERT INTO media_reconciler_leases (singleton, updated_at)
+             VALUES (2, '1970-01-01T00:00:00+00:00');",
+        ),
+        (
+            "owner without expiry",
+            "UPDATE media_reconciler_leases
+             SET lease_owner = '00000000-0000-4000-8000-000000000001',
+                 lease_expires_at = NULL WHERE singleton = 1;",
+        ),
+        (
+            "noncanonical lease timestamp",
+            "UPDATE media_reconciler_leases
+             SET lease_owner = '00000000-0000-4000-8000-000000000001',
+                 lease_expires_at = '2030-01-01 00:01:00',
+                 updated_at = '2030-01-01 00:00:00' WHERE singleton = 1;",
+        ),
+    ];
+
+    for (name, mutation) in corruptions {
+        corrupter
+            .execute_batch(mutation)
+            .unwrap_or_else(|error| panic!("inject {name}: {error}"));
+        let wal = PathBuf::from(format!("{}-wal", context._database.path.display()));
+        assert!(wal.exists(), "{name} must be committed through real WAL");
+
+        let data_version_before: i64 = observer
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .expect("read data version before corrupt lease rejection");
+        let operations_before: Vec<OperationSideEffectState> = sqlx::query_as(
+            "SELECT id, state, attempt, lease_owner, lease_expires_at, error_code, error_message
+             FROM media_operations ORDER BY id",
+        )
+        .fetch_all(&context.state.pool)
+        .await
+        .expect("snapshot operations before corrupt lease rejection");
+        let desired_before: Vec<(Uuid, i64, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT camera_id, generation, updated_at FROM media_desired_states ORDER BY camera_id",
+        )
+        .fetch_all(&context.state.pool)
+        .await
+        .expect("snapshot desired state before corrupt lease rejection");
+        let cameras_before: Vec<(Uuid, String, DateTime<Utc>)> =
+            sqlx::query_as("SELECT id, status, updated_at FROM cameras ORDER BY id")
+                .fetch_all(&context.state.pool)
+                .await
+                .expect("snapshot cameras before corrupt lease rejection");
+        let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("snapshot audit rows before corrupt lease rejection");
+        let media_requests_before = context.fake_media.request_calls();
+        let media_mutations_before = context.fake_media.mutation_calls();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            reconciliation::reconcile_available(&context.state),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} caused a reconciler block or busy loop"));
+        let error = result
+            .expect_err("corrupt global lease must fail closed")
+            .to_string();
+        assert!(error.contains("global lease"));
+
+        let data_version_after: i64 = observer
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .expect("read data version after corrupt lease rejection");
+        let operations_after: Vec<OperationSideEffectState> = sqlx::query_as(
+            "SELECT id, state, attempt, lease_owner, lease_expires_at, error_code, error_message
+             FROM media_operations ORDER BY id",
+        )
+        .fetch_all(&context.state.pool)
+        .await
+        .expect("verify operations after corrupt lease rejection");
+        let desired_after: Vec<(Uuid, i64, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT camera_id, generation, updated_at FROM media_desired_states ORDER BY camera_id",
+        )
+        .fetch_all(&context.state.pool)
+        .await
+        .expect("verify desired state after corrupt lease rejection");
+        let cameras_after: Vec<(Uuid, String, DateTime<Utc>)> =
+            sqlx::query_as("SELECT id, status, updated_at FROM cameras ORDER BY id")
+                .fetch_all(&context.state.pool)
+                .await
+                .expect("verify cameras after corrupt lease rejection");
+        let audit_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("verify audit rows after corrupt lease rejection");
+        assert_eq!(data_version_after, data_version_before, "{name}");
+        assert_eq!(operations_after, operations_before, "{name}");
+        assert_eq!(desired_after, desired_before, "{name}");
+        assert_eq!(cameras_after, cameras_before, "{name}");
+        assert_eq!(audit_after, audit_before, "{name}");
+        assert_eq!(context.fake_media.request_calls(), media_requests_before);
+        assert_eq!(context.fake_media.mutation_calls(), media_mutations_before);
+
+        let restore = corrupter
+            .transaction()
+            .expect("begin raw global lease restore transaction");
+        restore
+            .execute("DELETE FROM media_reconciler_leases", [])
+            .expect("remove corrupt global lease rows");
+        restore
+            .execute(
+                "INSERT INTO media_reconciler_leases
+                     (singleton, lease_owner, lease_expires_at, updated_at)
+                 VALUES (1, ?1, ?2, ?3)",
+                rusqlite::params![original.0.as_deref(), original.1.as_deref(), &original.2],
+            )
+            .expect("restore exact current global lease row");
+        restore.commit().expect("commit global lease row restore");
+    }
+
+    assert!(reconciliation::reconcile_once(&context.state)
+        .await
+        .expect("reconciler resumes when exact current state returns"));
+    assert!(context.fake_media.mutation_calls() > 0);
+    drop(observer);
+    drop(corrupter);
     context.state.pool.close().await;
 }
 
@@ -2094,20 +2271,23 @@ async fn media_startup_preserves_active_leases_and_recovers_only_expired_work() 
     let operation_id = payload["operation_id"].as_str().unwrap().to_string();
     let now = Utc::now();
     let active_until = now + chrono::Duration::minutes(1);
+    let healthy_owner = Uuid::new_v4().to_string();
     sqlx::query(
         "UPDATE media_operations SET state = 'running', attempt = 1, started_at = ?, \
-         lease_owner = 'healthy-worker', lease_expires_at = ? WHERE id = ?",
+         lease_owner = ?, lease_expires_at = ? WHERE id = ?",
     )
     .bind(now)
+    .bind(&healthy_owner)
     .bind(active_until)
     .bind(&operation_id)
     .execute(&context.state.pool)
     .await
     .expect("simulate active worker");
     sqlx::query(
-        "UPDATE media_reconciler_leases SET lease_owner = 'healthy-worker', \
-         lease_expires_at = ?, updated_at = ? WHERE scope = 'global'",
+        "UPDATE media_reconciler_leases SET lease_owner = ?, \
+         lease_expires_at = ?, updated_at = ? WHERE singleton = 1",
     )
+    .bind(&healthy_owner)
     .bind(active_until)
     .bind(now)
     .execute(&context.state.pool)
@@ -2126,14 +2306,13 @@ async fn media_startup_preserves_active_leases_and_recovers_only_expired_work() 
             .fetch_one(&context.state.pool)
             .await
             .expect("load active operation");
-    assert_eq!(active, ("running".into(), Some("healthy-worker".into())));
-    let global_owner: Option<String> = sqlx::query_scalar(
-        "SELECT lease_owner FROM media_reconciler_leases WHERE scope = 'global'",
-    )
-    .fetch_one(&context.state.pool)
-    .await
-    .expect("load active global lease");
-    assert_eq!(global_owner.as_deref(), Some("healthy-worker"));
+    assert_eq!(active, ("running".into(), Some(healthy_owner.clone())));
+    let global_owner: Option<String> =
+        sqlx::query_scalar("SELECT lease_owner FROM media_reconciler_leases WHERE singleton = 1")
+            .fetch_one(&context.state.pool)
+            .await
+            .expect("load active global lease");
+    assert_eq!(global_owner.as_deref(), Some(healthy_owner.as_str()));
 
     let expired_at = Utc::now() - chrono::Duration::seconds(1);
     sqlx::query("UPDATE media_operations SET lease_expires_at = ? WHERE id = ?")
@@ -2154,11 +2333,15 @@ async fn media_startup_preserves_active_leases_and_recovers_only_expired_work() 
     assert_eq!(unknown.state, "unknown");
     assert_eq!(unknown.error_code.as_deref(), Some("worker_lease_expired"));
 
-    sqlx::query("UPDATE media_reconciler_leases SET lease_expires_at = ? WHERE scope = 'global'")
-        .bind(expired_at)
-        .execute(&context.state.pool)
-        .await
-        .expect("expire global lease for takeover");
+    sqlx::query(
+        "UPDATE media_reconciler_leases SET lease_expires_at = ?, updated_at = ? \
+         WHERE singleton = 1",
+    )
+    .bind(expired_at)
+    .bind(expired_at - chrono::Duration::minutes(1))
+    .execute(&context.state.pool)
+    .await
+    .expect("expire global lease for takeover");
 
     assert!(reconciliation::reconcile_once(&context.state)
         .await

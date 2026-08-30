@@ -152,11 +152,33 @@ CREATE INDEX media_actual_paths_camera_idx
     ON media_actual_paths (camera_id, profile);
 
 CREATE TABLE media_reconciler_leases (
-    scope TEXT PRIMARY KEY CHECK (scope = 'global'),
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
     lease_owner TEXT,
     lease_expires_at TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
+    CHECK (julianday(updated_at) IS NOT NULL),
+    CHECK (
+        lease_owner IS NULL OR (
+            length(lease_owner) = 36
+            AND lease_owner = lower(lease_owner)
+            AND substr(lease_owner, 9, 1) = '-'
+            AND substr(lease_owner, 14, 1) = '-'
+            AND substr(lease_owner, 15, 1) = '4'
+            AND substr(lease_owner, 19, 1) = '-'
+            AND substr(lease_owner, 20, 1) GLOB '[89ab]'
+            AND substr(lease_owner, 24, 1) = '-'
+            AND lease_owner NOT GLOB '*[^0-9a-f-]*'
+            AND length(replace(lease_owner, '-', '')) = 32
+        )
+    ),
+    CHECK (
+        lease_expires_at IS NULL OR (
+            julianday(lease_expires_at) IS NOT NULL
+            AND julianday(lease_expires_at) > julianday(updated_at)
+        )
+    )
 );
 
-INSERT INTO media_reconciler_leases (scope, updated_at)
-VALUES ('global', datetime('now'));
+INSERT INTO media_reconciler_leases (singleton, updated_at)
+VALUES (1, '1970-01-01T00:00:00+00:00');
