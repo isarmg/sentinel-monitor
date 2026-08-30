@@ -7,7 +7,9 @@ use crate::{
     background::camera_path,
     error::{AppError, Result},
     models::*,
-    onvif, reconciliation, AppState,
+    onvif,
+    protocol::CONTRACT,
+    reconciliation, AppState,
 };
 use async_stream::stream;
 use axum::{
@@ -69,8 +71,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
-        .route("/internal/media/auth", post(media_auth))
-        .nest("/api", api)
+        .route(&CONTRACT.media_auth_path, post(media_auth))
+        .nest(&CONTRACT.api_prefix, api)
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -610,6 +612,7 @@ async fn ptz(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecordingQuery {
     camera_id: Uuid,
     profile: Option<String>,
@@ -647,6 +650,7 @@ async fn list_recordings(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PlayRecordingQuery {
     camera_id: Uuid,
     start: DateTime<Utc>,
@@ -779,6 +783,7 @@ async fn event_stream(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuditQuery {
     limit: Option<i64>,
 }
@@ -817,18 +822,42 @@ async fn system_status(_user: CurrentUser, State(state): State<AppState>) -> Res
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MediaAuthRequest {
-    #[serde(default)]
+    user: String,
+    password: String,
     token: String,
+    ip: String,
     action: String,
-    #[serde(default)]
     path: String,
+    protocol: String,
+    id: String,
+    query: String,
+    #[serde(rename = "userAgent")]
+    user_agent: String,
 }
 
 async fn media_auth(
     State(state): State<AppState>,
     Json(request): Json<MediaAuthRequest>,
 ) -> StatusCode {
+    if [
+        &request.user,
+        &request.password,
+        &request.token,
+        &request.ip,
+        &request.action,
+        &request.path,
+        &request.protocol,
+        &request.id,
+        &request.query,
+        &request.user_agent,
+    ]
+    .iter()
+    .any(|value| value.len() > 4_096)
+    {
+        return StatusCode::BAD_REQUEST;
+    }
     let Ok(claims) = decode_media_token(&request.token, &state.config) else {
         return StatusCode::UNAUTHORIZED;
     };
@@ -989,5 +1018,62 @@ async fn write_audit(
     .await
     {
         tracing::warn!(%error, "audit log write failed");
+    }
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use super::*;
+    use serde::de::DeserializeOwned;
+
+    fn rejects_unknown<T: DeserializeOwned>(value: Value) {
+        assert!(serde_json::from_value::<T>(value).is_err());
+    }
+
+    #[test]
+    fn route_local_request_dtos_reject_unknown_fields() {
+        let camera_id = Uuid::new_v4();
+        rejects_unknown::<RecordingQuery>(json!({
+            "camera_id": camera_id,
+            "unknown": true
+        }));
+        rejects_unknown::<PlayRecordingQuery>(json!({
+            "camera_id": camera_id,
+            "start": Utc::now(),
+            "duration": 1.0,
+            "unknown": true
+        }));
+        rejects_unknown::<AuditQuery>(json!({ "unknown": true }));
+        rejects_unknown::<MediaAuthRequest>(json!({
+            "user": "",
+            "password": "",
+            "token": "token",
+            "ip": "127.0.0.1",
+            "action": "read",
+            "path": "camera/main",
+            "protocol": "webrtc",
+            "id": Uuid::new_v4(),
+            "query": "",
+            "userAgent": "test",
+            "unknown": true
+        }));
+    }
+
+    #[test]
+    fn route_local_required_fields_cannot_be_omitted() {
+        assert!(serde_json::from_value::<RecordingQuery>(json!({})).is_err());
+        assert!(serde_json::from_value::<PlayRecordingQuery>(json!({})).is_err());
+        assert!(serde_json::from_value::<MediaAuthRequest>(json!({
+            "user": "",
+            "password": "",
+            "token": "token",
+            "ip": "127.0.0.1",
+            "action": "read",
+            "path": "camera/main",
+            "protocol": "webrtc",
+            "id": Uuid::new_v4(),
+            "query": ""
+        }))
+        .is_err());
     }
 }

@@ -1,4 +1,5 @@
 import Hls from "hls.js";
+import { apiPath } from "./protocol.js";
 import { WhepPlayer } from "./whep.js";
 import "../vendor/sarmg-design/reset.css";
 import "../vendor/sarmg-design/accessibility.css";
@@ -21,7 +22,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 async function api(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
   const csrfToken = readCookie("__Host-sentinel_csrf") || readCookie("sentinel_csrf");
-  const response = await fetch(path, {
+  const response = await fetch(apiPath(path), {
     credentials: "same-origin",
     ...options,
     headers: {
@@ -57,7 +58,7 @@ async function boot() {
   tickClock();
   setInterval(tickClock, 1000);
   try {
-    state.me = await api("/api/me");
+    state.me = await api("/me");
     await enterApp();
   } catch (_) {
     showLogin();
@@ -99,7 +100,7 @@ async function login(event) {
   $("#login-error").textContent = "";
   const data = Object.fromEntries(new FormData(event.currentTarget));
   try {
-    state.me = await api("/api/auth/login", { method: "POST", body: JSON.stringify(data) });
+    state.me = await api("/auth/login", { method: "POST", body: JSON.stringify(data) });
     event.currentTarget.reset();
     await enterApp();
   } catch (error) {
@@ -110,7 +111,7 @@ async function login(event) {
 async function logout() {
   closeAllPlayers();
   state.eventSource?.close();
-  await api("/api/auth/logout", { method: "POST" }).catch(() => {});
+  await api("/auth/logout", { method: "POST" }).catch(() => {});
   state.me = null;
   showLogin();
 }
@@ -148,7 +149,7 @@ function switchView(view) {
 }
 
 async function loadCameras() {
-  state.cameras = await api("/api/cameras");
+  state.cameras = await api("/cameras");
   renderCameras();
   populateCameraSelect();
   updateSummary();
@@ -192,14 +193,14 @@ async function startStream(camera, video, profile, key) {
   const stateLabel = video.parentElement.querySelector(".video-state");
   try {
     stateLabel.textContent = "正在连接";
-    const ticket = await api(`/api/cameras/${camera.id}/stream-ticket?profile=${profile}`);
+    const ticket = await api(`/cameras/${camera.id}/stream-ticket?profile=${profile}`);
     const player = new WhepPlayer(video, ticket.whep_url, ticket.token);
     state.players.set(key, { close: () => player.close() });
     await player.start();
     stateLabel.classList.add("hidden");
   } catch (webrtcError) {
     try {
-      const ticket = await api(`/api/cameras/${camera.id}/stream-ticket?profile=${profile}`);
+      const ticket = await api(`/cameras/${camera.id}/stream-ticket?profile=${profile}`);
       const hls = new Hls({
         lowLatencyMode: true,
         xhrSetup: (xhr) => xhr.setRequestHeader("Authorization", `Bearer ${ticket.token}`),
@@ -254,7 +255,7 @@ async function saveCamera(event) {
     if (values[key]) payload[key] = values[key];
   });
   try {
-    const result = await api(id ? `/api/cameras/${id}` : "/api/cameras", { method: id ? "PUT" : "POST", body: JSON.stringify(payload) });
+    const result = await api(id ? `/cameras/${id}` : "/cameras", { method: id ? "PUT" : "POST", body: JSON.stringify(payload) });
     $("#camera-dialog").close();
     if (result.warning) toast(`设备已保存，但媒体同步失败：${result.warning}`, "warning");
     else if (result.operation_state === "pending") toast("摄像头已保存，媒体配置正在后台应用", "success");
@@ -265,7 +266,7 @@ async function saveCamera(event) {
 
 async function deleteCamera(camera) {
   if (!confirm(`确认删除“${camera.name}”？已有录像文件不会立即删除。`)) return;
-  try { await api(`/api/cameras/${camera.id}`, { method: "DELETE" }); toast("摄像头已删除", "success"); await loadCameras(); }
+  try { await api(`/cameras/${camera.id}`, { method: "DELETE" }); toast("摄像头已删除", "success"); await loadCameras(); }
   catch (error) { toast(error.message, "error"); }
 }
 
@@ -273,7 +274,7 @@ async function discoverDevices() {
   const button = $("#discover-button");
   button.disabled = true; button.textContent = "正在扫描局域网…";
   try {
-    const devices = await api("/api/discovery/onvif", { method: "POST" });
+    const devices = await api("/discovery/onvif", { method: "POST" });
     if (!devices.length) toast("没有发现ONVIF设备；可改用手动添加", "warning");
     else {
       openCameraDialog();
@@ -306,7 +307,7 @@ function closeDrawer() {
 async function sendPtz(action, vector = "0,0,0") {
   if (!state.drawerCamera) return;
   const [pan, tilt, zoom] = vector.split(",").map(Number);
-  try { await api(`/api/cameras/${state.drawerCamera.id}/ptz`, { method: "POST", body: JSON.stringify({ action, pan, tilt, zoom }) }); }
+  try { await api(`/cameras/${state.drawerCamera.id}/ptz`, { method: "POST", body: JSON.stringify({ action, pan, tilt, zoom }) }); }
   catch (error) { if (action !== "stop") toast(error.message, "error"); }
 }
 
@@ -333,7 +334,7 @@ async function searchRecordings() {
   if ($("#record-end").value) params.set("end", new Date($("#record-end").value).toISOString());
   const list = $("#record-list"); list.className = "record-list empty-state"; list.textContent = "正在检索录像…";
   try {
-    const spans = await api(`/api/recordings?${params}`);
+    const spans = await api(`/recordings?${params}`);
     $("#record-count").textContent = `${spans.length} 条`;
     if (!spans.length) { list.textContent = "所选时间范围内没有录像"; return; }
     list.className = "record-list";
@@ -345,7 +346,7 @@ async function searchRecordings() {
 function playRecording(cameraId, span) {
   const params = new URLSearchParams({ camera_id: cameraId, start: span.start, duration: String(span.duration), format: "mp4" });
   const video = $("#playback-video");
-  video.src = `/api/recordings/play?${params}`;
+  video.src = apiPath(`/recordings/play?${params}`);
   video.play().catch(() => {});
   $("#playback-caption").textContent = `${formatDate(span.start)} · ${formatDuration(span.duration)}`;
 }
@@ -354,17 +355,17 @@ async function loadEvents() {
   if (!state.me) return;
   const query = $("#unacked-only").checked ? "?unacknowledged=true" : "";
   try {
-    const events = await api(`/api/events${query}`);
+    const events = await api(`/events${query}`);
     const cameraNames = new Map(state.cameras.map((camera) => [camera.id, camera.name]));
     $("#event-table").innerHTML = events.length ? events.map((event) => `
       <tr><td><span class="severity ${event.severity}">${severityLabel(event.severity)}</span></td><td><strong>${esc(event.message)}</strong><small>${esc(event.kind)}</small></td><td>${esc(cameraNames.get(event.camera_id) || "系统")}</td><td>${formatDate(event.created_at)}</td><td>${event.acknowledged_at ? "已确认" : (state.me.role !== "viewer" ? `<button class="text-button" data-ack="${event.id}">确认</button>` : "待确认")}</td></tr>`).join("") : `<tr><td colspan="5" class="empty-state">没有事件</td></tr>`;
-    $$('[data-ack]').forEach((button) => button.addEventListener("click", async () => { await api(`/api/events/${button.dataset.ack}/ack`, { method: "POST" }); loadEvents(); }));
+    $$('[data-ack]').forEach((button) => button.addEventListener("click", async () => { await api(`/events/${button.dataset.ack}/ack`, { method: "POST" }); loadEvents(); }));
   } catch (error) { if (error.status !== 401) toast(error.message, "error"); }
 }
 
 function connectEvents() {
   state.eventSource?.close();
-  state.eventSource = new EventSource("/api/events/stream");
+  state.eventSource = new EventSource(apiPath("/events/stream"));
   state.eventSource.addEventListener("system-event", (message) => {
     const event = JSON.parse(message.data);
     toast(event.message, event.severity === "critical" ? "error" : event.severity);
@@ -374,7 +375,7 @@ function connectEvents() {
 
 async function loadSystem() {
   try {
-    const status = await api("/api/system/status");
+    const status = await api("/system/status");
     $("#system-cards").innerHTML = `
       <article><span>媒体服务</span><strong class="${status.media_service === "ok" ? "good" : "bad"}">${status.media_service === "ok" ? "运行正常" : "连接失败"}</strong><small>MediaMTX</small></article>
       <article><span>在线设备</span><strong>${status.cameras.online}<i> / ${status.cameras.total}</i></strong><small>当前主码流状态</small></article>
@@ -385,7 +386,7 @@ async function loadSystem() {
 }
 
 async function loadUsers() {
-  state.users = await api("/api/users");
+  state.users = await api("/users");
   $("#user-table").innerHTML = state.users.map((user) => `<tr><td><strong>${esc(user.email)}</strong></td><td>${roleLabel(user.role)}</td><td>${user.active ? "可用" : "已停用"}</td><td>${user.last_login_at ? formatDate(user.last_login_at) : "从未登录"}</td><td><button class="text-button" data-user-edit="${user.id}">编辑</button>${user.id !== state.me.id ? `<button class="text-button danger-link" data-user-delete="${user.id}">删除</button>` : ""}</td></tr>`).join("");
   $$('[data-user-edit]').forEach((button) => button.addEventListener("click", () => openUserDialog(state.users.find((user) => user.id === button.dataset.userEdit))));
   $$('[data-user-delete]').forEach((button) => button.addEventListener("click", () => deleteUser(state.users.find((user) => user.id === button.dataset.userDelete))));
@@ -412,20 +413,20 @@ async function saveUser(event) {
   if (!id) payload.email = values.email;
   if (values.password) payload.password = values.password;
   try {
-    await api(id ? `/api/users/${id}` : "/api/users", { method: id ? "PUT" : "POST", body: JSON.stringify(payload) });
+    await api(id ? `/users/${id}` : "/users", { method: id ? "PUT" : "POST", body: JSON.stringify(payload) });
     $("#user-dialog").close(); toast("账号已保存", "success"); await loadUsers();
   } catch (error) { toast(error.message, "error"); }
 }
 
 async function deleteUser(user) {
   if (!confirm(`确认删除账号 ${user.email}？`)) return;
-  try { await api(`/api/users/${user.id}`, { method: "DELETE" }); toast("账号已删除", "success"); await loadUsers(); }
+  try { await api(`/users/${user.id}`, { method: "DELETE" }); toast("账号已删除", "success"); await loadUsers(); }
   catch (error) { toast(error.message, "error"); }
 }
 
 async function loadAudit() {
   try {
-    const rows = await api("/api/audit?limit=30");
+    const rows = await api("/audit?limit=30");
     $("#audit-list").innerHTML = rows.length ? rows.map((row) => `<div><span>${esc(row.action)}</span><small>${formatDate(row.created_at)}</small><code>${esc(row.entity_type)}${row.entity_id ? ` / ${row.entity_id.slice(0, 8)}` : ""}</code></div>`).join("") : `<div class="empty-state">暂无审计记录</div>`;
   } catch (error) { toast(error.message, "error"); }
 }

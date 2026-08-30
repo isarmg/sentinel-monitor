@@ -26,7 +26,6 @@ jobs:
           coupling_matches="$(
             git grep -nE "$coupling_pattern" -- \
               ':!.github/workflows/independence.yml' \
-              ':!docs/migration-history/**' \
               ':!CHANGELOG.md' \
               || true
           )"

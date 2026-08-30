@@ -4,7 +4,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://127.0.0.1:8080",
+      "/api/v2": "http://127.0.0.1:8080",
       "/health": "http://127.0.0.1:8080",
       "/media-webrtc": {
         target: "http://127.0.0.1:8889",
@@ -17,4 +17,3 @@ export default defineConfig({
     },
   },
 });
-

@@ -2,7 +2,7 @@ logLevel: info
 logDestinations: [stdout]
 
 authMethod: http
-authHTTPAddress: http://127.0.0.1:8080/internal/media/auth
+authHTTPAddress: http://127.0.0.1:8080/internal/v2/media/auth
 authHTTPExclude:
   - action: api
   - action: metrics

@@ -2,7 +2,7 @@ logLevel: info
 logDestinations: [stdout]
 
 authMethod: http
-authHTTPAddress: http://app:8080/internal/media/auth
+authHTTPAddress: http://app:8080/internal/v2/media/auth
 authHTTPExclude:
   - action: api
   - action: metrics
@@ -42,4 +42,3 @@ pathDefaults:
   recordDeleteAfter: 168h
 
 paths: {}
-

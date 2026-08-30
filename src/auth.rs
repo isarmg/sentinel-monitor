@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     error::{AppError, Result},
     models::UserView,
+    protocol::CONTRACT,
     AppState,
 };
 use argon2::{
@@ -22,6 +23,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use hkdf::Hkdf;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,8 @@ const PRODUCTION_CSRF_COOKIE: &str = "__Host-sentinel_csrf";
 const DEVELOPMENT_CSRF_COOKIE: &str = "sentinel_csrf";
 const TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_LENGTH: usize = 128;
+const MEDIA_JWT_KEY_SALT: &[u8] = b"sentinel-monitor/0.2.0/media-jwt/signing-key";
+const MEDIA_JWT_KEY_INFO: &[u8] = b"sentinel-media-jwt-v2/HS256";
 
 #[derive(Clone)]
 pub struct CurrentUser {
@@ -81,14 +85,20 @@ impl CurrentUser {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MediaClaims {
-    pub sub: String,
+    pub protocol: String,
+    pub iss: String,
+    pub aud: String,
+    pub kind: String,
+    pub sub: Uuid,
     pub camera_id: Uuid,
     pub path: String,
     pub actions: Vec<String>,
-    pub kind: String,
-    pub iat: usize,
-    pub exp: usize,
+    pub jti: Uuid,
+    pub iat: u64,
+    pub nbf: u64,
+    pub exp: u64,
 }
 
 pub struct IssuedBrowserSession {
@@ -140,7 +150,7 @@ pub async fn enforce_browser_security(
     }
 
     validate_same_origin(request.headers())?;
-    if !matches!(request.uri().path(), "/auth/login" | "/api/auth/login") {
+    if request.uri().path() != "/auth/login" {
         let session = authenticate_browser_session(request.headers(), &state).await?;
         validate_csrf(request.headers(), &session.csrf_digest)?;
         request.extensions_mut().insert(session.user);
@@ -240,35 +250,82 @@ pub fn issue_media_token(
         + ChronoDuration::from_std(config.media_token_ttl)
             .map_err(|_| AppError::Internal("invalid media token duration".into()))?;
     let claims = MediaClaims {
-        sub: user_id.to_string(),
+        protocol: CONTRACT.media_jwt_protocol.clone(),
+        iss: CONTRACT.media_jwt_issuer.clone(),
+        aud: CONTRACT.media_jwt_audience.clone(),
+        kind: CONTRACT.media_jwt_kind.clone(),
+        sub: user_id,
         camera_id,
         path,
         actions,
-        kind: "media".into(),
-        iat: now.timestamp() as usize,
-        exp: expires_at.timestamp() as usize,
+        jti: Uuid::new_v4(),
+        iat: now.timestamp() as u64,
+        nbf: now.timestamp() as u64,
+        exp: expires_at.timestamp() as u64,
     };
+    let signing_key = media_signing_key(config);
     let token = encode(
-        &Header::default(),
+        &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(&config.jwt_secret),
+        &EncodingKey::from_secret(&signing_key),
     )
     .map_err(|error| AppError::Internal(format!("media token failed: {error}")))?;
     Ok((token, expires_at))
 }
 
 pub fn decode_media_token(token: &str, config: &Config) -> Result<MediaClaims> {
-    let claims = decode::<MediaClaims>(
-        token,
-        &DecodingKey::from_secret(&config.jwt_secret),
-        &Validation::new(Algorithm::HS256),
-    )
-    .map_err(|_| AppError::Unauthorized)?
-    .claims;
-    if claims.kind != "media" {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.leeway = 0;
+    validation.validate_nbf = true;
+    validation.set_required_spec_claims(&["exp", "nbf", "aud", "iss", "sub"]);
+    validation.set_audience(&[&CONTRACT.media_jwt_audience]);
+    validation.set_issuer(&[&CONTRACT.media_jwt_issuer]);
+    let signing_key = media_signing_key(config);
+    let claims = decode::<MediaClaims>(token, &DecodingKey::from_secret(&signing_key), &validation)
+        .map_err(|_| AppError::Unauthorized)?
+        .claims;
+    let now = u64::try_from(Utc::now().timestamp()).map_err(|_| AppError::Unauthorized)?;
+    if claims.protocol != CONTRACT.media_jwt_protocol
+        || claims.iss != CONTRACT.media_jwt_issuer
+        || claims.aud != CONTRACT.media_jwt_audience
+        || claims.kind != CONTRACT.media_jwt_kind
+        || claims.sub.is_nil()
+        || claims.camera_id.is_nil()
+        || claims.jti.is_nil()
+        || claims.path.is_empty()
+        || claims.path.len() > 512
+        || claims.actions.is_empty()
+        || claims.actions.len() > 4
+        || claims
+            .actions
+            .iter()
+            .any(|action| !matches!(action.as_str(), "read" | "playback"))
+        || claims.nbf != claims.iat
+        || claims.iat > now
+        || claims.exp.checked_sub(claims.iat) != Some(config.media_token_ttl.as_secs())
+    {
         return Err(AppError::Unauthorized);
     }
     Ok(claims)
+}
+
+fn media_signing_key(config: &Config) -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    Hkdf::<Sha256>::new(Some(MEDIA_JWT_KEY_SALT), &config.jwt_secret)
+        .expand(MEDIA_JWT_KEY_INFO, &mut key)
+        .expect("32-byte HKDF output is valid");
+    key
+}
+
+#[cfg(test)]
+pub(crate) fn encode_media_claims_for_test<T: Serialize>(claims: &T, config: &Config) -> String {
+    let signing_key = media_signing_key(config);
+    encode(
+        &Header::new(Algorithm::HS256),
+        claims,
+        &EncodingKey::from_secret(&signing_key),
+    )
+    .expect("encode test media claims")
 }
 
 pub fn session_cookie(token: &str, config: &Config) -> String {
@@ -512,4 +569,45 @@ fn state_cookie_max_age(config: &Config) -> u64 {
 fn chrono_duration(duration: Duration) -> Result<ChronoDuration> {
     ChronoDuration::from_std(duration)
         .map_err(|_| AppError::Internal("invalid session duration".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MediaClaims;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn current_claims() -> serde_json::Value {
+        json!({
+            "protocol": "sentinel-media-jwt-v2",
+            "iss": "sentinel-monitor/0.2.0",
+            "aud": "sentinel-mediamtx/1.20.0",
+            "kind": "media",
+            "sub": Uuid::new_v4(),
+            "camera_id": Uuid::new_v4(),
+            "path": "camera/main",
+            "actions": ["read"],
+            "jti": Uuid::new_v4(),
+            "iat": 1,
+            "nbf": 1,
+            "exp": 121
+        })
+    }
+
+    #[test]
+    fn media_claims_reject_unknown_and_missing_protocol_fields() {
+        let mut unknown = current_claims();
+        unknown
+            .as_object_mut()
+            .expect("claims object")
+            .insert("legacy".into(), json!(true));
+        assert!(serde_json::from_value::<MediaClaims>(unknown).is_err());
+
+        let mut missing = current_claims();
+        missing
+            .as_object_mut()
+            .expect("claims object")
+            .remove("jti");
+        assert!(serde_json::from_value::<MediaClaims>(missing).is_err());
+    }
 }

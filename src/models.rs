@@ -42,12 +42,14 @@ impl From<UserRecord> for UserView {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
     pub email: String,
     pub password: String,
@@ -55,6 +57,7 @@ pub struct CreateUserRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateUserRequest {
     pub role: Option<String>,
     pub password: Option<String>,
@@ -115,6 +118,7 @@ impl From<&CameraRecord> for CameraView {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCameraRequest {
     pub name: String,
     #[serde(default)]
@@ -131,6 +135,7 @@ pub struct CreateCameraRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateCameraRequest {
     pub name: Option<String>,
     pub location: Option<String>,
@@ -163,6 +168,7 @@ pub struct CameraMutationResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamTicketQuery {
     pub profile: Option<String>,
 }
@@ -177,6 +183,7 @@ pub struct StreamTicket {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PtzRequest {
     pub action: String,
     pub pan: Option<f64>,
@@ -198,6 +205,7 @@ pub struct EventRecord {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventQuery {
     pub camera_id: Option<Uuid>,
     pub unacknowledged: Option<bool>,
@@ -213,4 +221,58 @@ pub struct AuditRecord {
     pub entity_id: Option<Uuid>,
     pub details: Value,
     pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
+
+    fn rejects_unknown<T: DeserializeOwned>(value: Value) {
+        assert!(serde_json::from_value::<T>(value).is_err());
+    }
+
+    #[test]
+    fn every_public_request_dto_rejects_unknown_fields() {
+        rejects_unknown::<LoginRequest>(json!({
+            "email": "user@example.test",
+            "password": "a-password",
+            "unknown": true
+        }));
+        rejects_unknown::<CreateUserRequest>(json!({
+            "email": "user@example.test",
+            "password": "a-password",
+            "role": "viewer",
+            "unknown": true
+        }));
+        rejects_unknown::<UpdateUserRequest>(json!({ "unknown": true }));
+        rejects_unknown::<CreateCameraRequest>(json!({
+            "name": "Camera",
+            "main_stream_url": "rtsp://camera.invalid/main",
+            "unknown": true
+        }));
+        rejects_unknown::<UpdateCameraRequest>(json!({ "unknown": true }));
+        rejects_unknown::<StreamTicketQuery>(json!({ "unknown": true }));
+        rejects_unknown::<PtzRequest>(json!({ "action": "stop", "unknown": true }));
+        rejects_unknown::<EventQuery>(json!({ "unknown": true }));
+    }
+
+    #[test]
+    fn required_public_request_fields_cannot_be_omitted() {
+        assert!(serde_json::from_value::<LoginRequest>(json!({
+            "email": "user@example.test"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<CreateUserRequest>(json!({
+            "email": "user@example.test",
+            "password": "a-password"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<CreateCameraRequest>(json!({
+            "main_stream_url": "rtsp://camera.invalid/main"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<PtzRequest>(json!({})).is_err());
+    }
 }

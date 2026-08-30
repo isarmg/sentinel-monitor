@@ -1,7 +1,8 @@
 use crate::{
     auth::{
-        bootstrap_admin, csrf_cookie, csrf_cookie_name, issue_media_token, issue_session,
-        session_cookie, session_cookie_name, IssuedBrowserSession,
+        bootstrap_admin, csrf_cookie, csrf_cookie_name, decode_media_token,
+        encode_media_claims_for_test, issue_media_token, issue_session, session_cookie,
+        session_cookie_name, IssuedBrowserSession,
     },
     background::{camera_path, emit_event},
     config::Config,
@@ -440,7 +441,7 @@ async fn send_login(app: &Router, email: &str, password: &str, source: SocketAdd
     send_custom_request(
         app,
         Method::POST,
-        "/api/auth/login",
+        "/api/v2/auth/login",
         BrowserRequestContext {
             host: Some("sentinel.test"),
             origin: Some("https://sentinel.test"),
@@ -450,6 +451,21 @@ async fn send_login(app: &Router, email: &str, password: &str, source: SocketAdd
         Some(json!({ "email": email, "password": password })),
     )
     .await
+}
+
+fn media_auth_payload(token: impl Into<String>, action: &str, path: &str) -> Value {
+    json!({
+        "user": "",
+        "password": "",
+        "token": token.into(),
+        "ip": "127.0.0.1",
+        "action": action,
+        "path": path,
+        "protocol": "webrtc",
+        "id": Uuid::new_v4().to_string(),
+        "query": "",
+        "userAgent": "sentinel-test"
+    })
 }
 
 async fn response_json(response: Response) -> Value {
@@ -550,7 +566,7 @@ async fn current_database_accepts_all_required_creation_timestamps() {
         send_json(
             &app,
             Method::POST,
-            "/api/users",
+            "/api/v2/users",
             &token,
             json!({
                 "email": "operator@example.com",
@@ -574,7 +590,7 @@ async fn current_database_accepts_all_required_creation_timestamps() {
         send_json(
             &app,
             Method::POST,
-            "/api/cameras",
+            "/api/v2/cameras",
             &token,
             json!({
                 "name": "Front Door",
@@ -638,7 +654,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     .expect("set recognizable persisted user values");
     let app = routes::router(context.state.clone());
 
-    let response = send_request(&app, Method::GET, "/api/me", &token, None).await;
+    let response = send_request(&app, Method::GET, "/api/v2/me", &token, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let current_user = response_json(response).await;
     assert_eq!(current_user["id"], json!(admin_id));
@@ -655,7 +671,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
             send_json(
                 &app,
                 Method::POST,
-                "/api/cameras",
+                "/api/v2/cameras",
                 &token,
                 json!({
                     "name": name,
@@ -689,7 +705,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     let response = send_request(
         &app,
         Method::PUT,
-        &format!("/api/cameras/{target_id}"),
+        &format!("/api/v2/cameras/{target_id}"),
         &token,
         Some(json!({
             "name": "Updated Camera",
@@ -796,7 +812,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     let response = send_request(
         &app,
         Method::POST,
-        &format!("/api/events/{}/ack", acknowledged.id),
+        &format!("/api/v2/events/{}/ack", acknowledged.id),
         &token,
         None,
     )
@@ -814,7 +830,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     let response = send_request(
         &app,
         Method::GET,
-        &format!("/api/events?camera_id={target_id}&unacknowledged=true&limit=10"),
+        &format!("/api/v2/events?camera_id={target_id}&unacknowledged=true&limit=10"),
         &token,
         None,
     )
@@ -828,7 +844,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     let response = send_request(
         &app,
         Method::GET,
-        &format!("/api/events?camera_id={target_id}&limit=10"),
+        &format!("/api/v2/events?camera_id={target_id}&limit=10"),
         &token,
         None,
     )
@@ -868,7 +884,7 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
     let response = send_custom_request(
         &app,
         Method::POST,
-        "/api/auth/login",
+        "/api/v2/auth/login",
         BrowserRequestContext {
             host: Some("sentinel.test"),
             ..Default::default()
@@ -880,7 +896,7 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
     let response = send_custom_request(
         &app,
         Method::POST,
-        "/api/auth/login",
+        "/api/v2/auth/login",
         BrowserRequestContext {
             host: Some("sentinel.test"),
             origin: Some("https://attacker.test"),
@@ -894,7 +910,7 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
     let response = send_custom_request(
         &app,
         Method::POST,
-        "/api/auth/login",
+        "/api/v2/auth/login",
         BrowserRequestContext {
             host: Some("sentinel.test"),
             origin: Some("https://sentinel.test"),
@@ -941,7 +957,7 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
 
     let bearer_only = Request::builder()
         .method(Method::GET)
-        .uri("/api/me")
+        .uri("/api/v2/me")
         .header(AUTHORIZATION, format!("Bearer {}", credentials.token))
         .body(Body::empty())
         .expect("build bearer-only browser request");
@@ -964,19 +980,15 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
     let response = send_custom_request(
         &app,
         Method::POST,
-        "/internal/media/auth",
+        "/internal/v2/media/auth",
         BrowserRequestContext::default(),
-        Some(json!({
-            "token": machine_token,
-            "action": "read",
-            "path": "camera/main"
-        })),
+        Some(media_auth_payload(machine_token, "read", "camera/main")),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     assert_eq!(
-        send_request(&app, Method::GET, "/api/me", &credentials, None)
+        send_request(&app, Method::GET, "/api/v2/me", &credentials, None)
             .await
             .status(),
         StatusCode::OK
@@ -988,11 +1000,227 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
         .expect("reopen session database after simulated restart");
     let restarted_app = routes::router(context.state.clone());
     assert_eq!(
-        send_request(&restarted_app, Method::GET, "/api/me", &credentials, None,)
-            .await
-            .status(),
+        send_request(
+            &restarted_app,
+            Method::GET,
+            "/api/v2/me",
+            &credentials,
+            None,
+        )
+        .await
+        .status(),
         StatusCode::OK
     );
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
+async fn protocol_v1_routes_json_and_tokens_are_rejected_without_side_effects() {
+    let context = TestContext::current().await;
+    bootstrap_admin(&context.state)
+        .await
+        .expect("bootstrap administrator");
+    let admin_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE role = 'admin'")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("load administrator id");
+    let app = routes::router(context.state.clone());
+    let before: (i64, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM browser_sessions), \
+                (SELECT COUNT(*) FROM audit_logs), \
+                (SELECT last_login_at FROM users WHERE id = ?)",
+    )
+    .bind(admin_id)
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("capture protocol side effects");
+
+    let old_login = send_custom_request(
+        &app,
+        Method::POST,
+        "/api/auth/login",
+        BrowserRequestContext {
+            host: Some("sentinel.test"),
+            origin: Some("https://sentinel.test"),
+            ..Default::default()
+        },
+        Some(json!({
+            "email": "admin@example.com",
+            "password": "bootstrap-password"
+        })),
+    )
+    .await;
+    assert!(!old_login.status().is_success());
+    let old_me = send_custom_request(
+        &app,
+        Method::GET,
+        "/api/me",
+        BrowserRequestContext::default(),
+        None,
+    )
+    .await;
+    assert!(!old_me.status().is_success());
+
+    for malformed_login in [
+        json!({
+            "email": "admin@example.com",
+            "password": "bootstrap-password",
+            "remember": true
+        }),
+        json!({ "email": "admin@example.com" }),
+    ] {
+        let response = send_custom_request(
+            &app,
+            Method::POST,
+            "/api/v2/auth/login",
+            BrowserRequestContext {
+                host: Some("sentinel.test"),
+                origin: Some("https://sentinel.test"),
+                ..Default::default()
+            },
+            Some(malformed_login),
+        )
+        .await;
+        assert!(response.status().is_client_error());
+    }
+
+    let camera_id = Uuid::new_v4();
+    let (current_token, _) = issue_media_token(
+        admin_id,
+        camera_id,
+        "camera/main".into(),
+        vec!["read".into()],
+        &context.state.config,
+    )
+    .expect("issue current media token");
+    let current_claims = decode_media_token(&current_token, &context.state.config)
+        .expect("decode current media token");
+    assert_eq!(current_claims.sub, admin_id);
+    assert!(!current_claims.jti.is_nil());
+    assert_eq!(current_claims.nbf, current_claims.iat);
+    assert_eq!(
+        current_claims.exp - current_claims.iat,
+        context.state.config.media_token_ttl.as_secs()
+    );
+
+    let current_payload = media_auth_payload(current_token.clone(), "read", "camera/main");
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/internal/v2/media/auth",
+        BrowserRequestContext::default(),
+        Some(current_payload.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/internal/media/auth",
+        BrowserRequestContext::default(),
+        Some(current_payload.clone()),
+    )
+    .await;
+    assert!(!response.status().is_success());
+
+    let now = Utc::now().timestamp() as u64;
+    let legacy_token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &json!({
+            "sub": admin_id.to_string(),
+            "camera_id": camera_id,
+            "path": "camera/main",
+            "actions": ["read"],
+            "kind": "media",
+            "iat": now,
+            "exp": now + 300
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(&context.state.config.jwt_secret),
+    )
+    .expect("encode pre-0.2 media token");
+    let response = send_custom_request(
+        &app,
+        Method::POST,
+        "/internal/v2/media/auth",
+        BrowserRequestContext::default(),
+        Some(media_auth_payload(legacy_token, "read", "camera/main")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let mut invalid_id_claims = current_claims.clone();
+    invalid_id_claims.jti = Uuid::nil();
+    let mut invalid_time_claims = current_claims.clone();
+    invalid_time_claims.exp += 1;
+    let mut unknown_claims = serde_json::to_value(&current_claims).expect("serialize claims");
+    unknown_claims
+        .as_object_mut()
+        .expect("claims object")
+        .insert("legacy".into(), json!(true));
+    let mut missing_claims = serde_json::to_value(&current_claims).expect("serialize claims");
+    missing_claims
+        .as_object_mut()
+        .expect("claims object")
+        .remove("jti");
+    for invalid_claims in [
+        serde_json::to_value(invalid_id_claims).expect("serialize invalid ID claims"),
+        serde_json::to_value(invalid_time_claims).expect("serialize invalid time claims"),
+        unknown_claims,
+        missing_claims,
+    ] {
+        let token = encode_media_claims_for_test(&invalid_claims, &context.state.config);
+        let response = send_custom_request(
+            &app,
+            Method::POST,
+            "/internal/v2/media/auth",
+            BrowserRequestContext::default(),
+            Some(media_auth_payload(token, "read", "camera/main")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let mut unknown_media_json = current_payload.clone();
+    unknown_media_json
+        .as_object_mut()
+        .expect("media payload object")
+        .insert("legacy".into(), json!(true));
+    let mut missing_media_json = current_payload;
+    missing_media_json
+        .as_object_mut()
+        .expect("media payload object")
+        .remove("userAgent");
+    for malformed_media_json in [
+        json!({
+            "token": current_token,
+            "action": "read",
+            "path": "camera/main"
+        }),
+        unknown_media_json,
+        missing_media_json,
+    ] {
+        let response = send_custom_request(
+            &app,
+            Method::POST,
+            "/internal/v2/media/auth",
+            BrowserRequestContext::default(),
+            Some(malformed_media_json),
+        )
+        .await;
+        assert!(response.status().is_client_error());
+    }
+
+    let after: (i64, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM browser_sessions), \
+                (SELECT COUNT(*) FROM audit_logs), \
+                (SELECT last_login_at FROM users WHERE id = ?)",
+    )
+    .bind(admin_id)
+    .fetch_one(&context.state.pool)
+    .await
+    .expect("verify protocol side effects");
+    assert_eq!(after, before);
     context.state.pool.close().await;
 }
 
@@ -1015,7 +1243,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
     let response = send_custom_request(
         &app,
         Method::POST,
-        "/api/auth/logout",
+        "/api/v2/auth/logout",
         BrowserRequestContext {
             credentials: Some(&first),
             csrf_token: Some(&second.csrf_token),
@@ -1030,7 +1258,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
     let response = send_custom_request(
         &app,
         Method::POST,
-        "/api/auth/logout",
+        "/api/v2/auth/logout",
         BrowserRequestContext {
             credentials: Some(&first),
             csrf_token: Some(&first.csrf_token),
@@ -1045,7 +1273,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
     let response = send_custom_request(
         &app,
         Method::POST,
-        "/api/auth/logout",
+        "/api/v2/auth/logout",
         BrowserRequestContext {
             credentials: Some(&first),
             csrf_token: Some(&first.csrf_token),
@@ -1058,7 +1286,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let response = send_request(&app, Method::POST, "/api/auth/logout", &first, None).await;
+    let response = send_request(&app, Method::POST, "/api/v2/auth/logout", &first, None).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let revoked: bool =
         sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM browser_sessions WHERE id = ?")
@@ -1068,7 +1296,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
             .expect("load revoked session state");
     assert!(revoked);
     assert_eq!(
-        send_request(&app, Method::GET, "/api/me", &first, None)
+        send_request(&app, Method::GET, "/api/v2/me", &first, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1082,7 +1310,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
         .await
         .expect("expire idle session deadline");
     assert_eq!(
-        send_request(&app, Method::GET, "/api/me", &second, None)
+        send_request(&app, Method::GET, "/api/v2/me", &second, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1102,7 +1330,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
     .await
     .expect("expire absolute session deadline");
     assert_eq!(
-        send_request(&app, Method::GET, "/api/me", &absolute, None)
+        send_request(&app, Method::GET, "/api/v2/me", &absolute, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1119,7 +1347,7 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
         send_json(
             &app,
             Method::POST,
-            "/api/users",
+            "/api/v2/users",
             &admin,
             json!({
                 "email": "session-operator@example.com",
@@ -1141,7 +1369,7 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
         .expect("issue operator session")
         .into();
     assert_eq!(
-        send_request(&app, Method::GET, "/api/me", &operator, None)
+        send_request(&app, Method::GET, "/api/v2/me", &operator, None)
             .await
             .status(),
         StatusCode::OK
@@ -1151,7 +1379,7 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
         send_json(
             &app,
             Method::PUT,
-            &format!("/api/users/{operator_id}"),
+            &format!("/api/v2/users/{operator_id}"),
             &admin,
             json!({ "password": "replacement-password" }),
         )
@@ -1166,7 +1394,7 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
             .expect("load updated operator session version");
     assert_eq!(updated_version, version + 1);
     assert_eq!(
-        send_request(&app, Method::GET, "/api/me", &operator, None)
+        send_request(&app, Method::GET, "/api/v2/me", &operator, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1329,7 +1557,7 @@ async fn media_write_persists_desired_operation_before_side_effect_and_tracks_ac
     let response = send_request(
         &app,
         Method::POST,
-        "/api/cameras",
+        "/api/v2/cameras",
         &admin,
         Some(json!({
             "name": "Queued Camera",
@@ -1400,7 +1628,7 @@ async fn media_write_persists_desired_operation_before_side_effect_and_tracks_ac
     let operation_response = send_request(
         &app,
         Method::GET,
-        &format!("/api/media/operations/{operation_id}"),
+        &format!("/api/v2/media/operations/{operation_id}"),
         &admin,
         None,
     )
@@ -1413,7 +1641,7 @@ async fn media_write_persists_desired_operation_before_side_effect_and_tracks_ac
     let delete_response = send_request(
         &app,
         Method::DELETE,
-        &format!("/api/cameras/{camera_id}"),
+        &format!("/api/v2/cameras/{camera_id}"),
         &admin,
         None,
     )
@@ -1424,7 +1652,7 @@ async fn media_write_persists_desired_operation_before_side_effect_and_tracks_ac
     let delete_operation_id = delete_operation["id"].as_str().unwrap().to_string();
     assert!(context.fake_media.path(&path).is_some());
     let cameras =
-        response_json(send_request(&app, Method::GET, "/api/cameras", &admin, None).await).await;
+        response_json(send_request(&app, Method::GET, "/api/v2/cameras", &admin, None).await).await;
     assert!(cameras.as_array().unwrap().is_empty());
     assert!(reconciliation::reconcile_once(&context.state)
         .await
@@ -1455,7 +1683,7 @@ async fn media_failure_is_sanitized_and_retries_to_success() {
     let response = send_request(
         &app,
         Method::POST,
-        "/api/cameras",
+        "/api/v2/cameras",
         &admin,
         Some(json!({
             "name": "Retry Camera",
@@ -1516,7 +1744,7 @@ async fn media_startup_preserves_active_leases_and_recovers_only_expired_work() 
     let response = send_request(
         &app,
         Method::POST,
-        "/api/cameras",
+        "/api/v2/cameras",
         &admin,
         Some(json!({
             "name": "Restart Camera",
@@ -1615,7 +1843,7 @@ async fn media_claim_is_concurrent_safe_and_stable_state_is_idempotent() {
     let response = send_request(
         &app,
         Method::POST,
-        "/api/cameras",
+        "/api/v2/cameras",
         &admin,
         Some(json!({
             "name": "Concurrent Camera",

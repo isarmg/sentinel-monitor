@@ -1,4 +1,4 @@
-use crate::{crypto::SecretBox, runtime_lock::DatabaseMaintenanceLock, sqlite};
+use crate::{crypto::SecretBox, protocol::CONTRACT, runtime_lock::DatabaseMaintenanceLock, sqlite};
 use anyhow::{ensure, Context};
 use chrono::Utc;
 use rusqlite::{Connection, OpenFlags};
@@ -267,12 +267,10 @@ fn parse_contract(path: &Path) -> anyhow::Result<ParsedContract> {
 fn verify_media_config(path: &Path, recordings_directory: &Path) -> anyhow::Result<()> {
     let content = String::from_utf8(read_limited(path, 1024 * 1024)?)
         .context("MediaMTX config is not UTF-8")?;
+    let auth_address = format!("http://127.0.0.1:8080{}", CONTRACT.media_auth_path);
     for (key, expected) in [
         ("authMethod", "http"),
-        (
-            "authHTTPAddress",
-            "http://127.0.0.1:8080/internal/media/auth",
-        ),
+        ("authHTTPAddress", auth_address.as_str()),
         ("apiAddress", "127.0.0.1:9997"),
         ("playbackAddress", "127.0.0.1:9996"),
         ("recordFormat", "fmp4"),
@@ -482,7 +480,7 @@ mod tests {
             &config,
             format!(
                 "authMethod: http\n\
-                 authHTTPAddress: http://127.0.0.1:8080/internal/media/auth\n\
+                 authHTTPAddress: http://127.0.0.1:8080/internal/v2/media/auth\n\
                  apiAddress: 127.0.0.1:9997\n\
                  playbackAddress: 127.0.0.1:9996\n\
                  recordFormat: fmp4\n\

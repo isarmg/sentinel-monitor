@@ -8,6 +8,7 @@ mod login_security;
 mod mediamtx;
 mod models;
 mod onvif;
+mod protocol;
 mod reconciliation;
 mod routes;
 mod runtime_lock;

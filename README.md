@@ -89,6 +89,18 @@ SHA-256 已嵌入二进制；服务在任何数据库访问前拒绝缺失、增
 生产模式始终使用 `__Host-sentinel_session` Secure/HttpOnly/SameSite Cookie。仅本机开发可设置 `APP_ENV=development`，且服务会拒绝绑定非 loopback 地址。
 登录入口同时按连接来源和规范化账户名执行有界 Token Bucket 限流；Argon2 并发与超时参数应按主机内存和 CPU 预算调整。
 
+## 当前协议边界
+
+Sentinel 0.2 的唯一浏览器/API 前缀是 `/api/v2`，唯一 MediaMTX 回调是
+`/internal/v2/media/auth`；产品不注册 0.1 路由或别名。Rust 路由、Web 客户端与 MediaMTX 配置共享
+[`web/src/protocol-contract.json`](web/src/protocol-contract.json) 中的当前协议身份，静态测试会阻止三者
+漂移。所有请求 DTO 都拒绝未知字段，缺少当前协议必需字段的请求在进入业务处理前失败。
+
+媒体 JWT 固定为 Sentinel 0.2 的 `protocol`、`iss`、`aud`、`kind`，并要求非空当前
+`sub/camera_id/jti` 与严格 `iat/nbf/exp`。签名密钥从 `APP_JWT_SECRET` 通过带 Sentinel 0.2 域标签的
+HKDF-SHA256 派生；原始密钥签发的 0.1 token 即使尚未过期也不能通过验证。不提供 previous secret、
+keyring 或协议 fallback；跨版本转换属于外部升级工具职责。
+
 ## MediaMTX 一致性模型
 
 摄像头写接口不再把一次 HTTP 请求伪装成数据库与 MediaMTX 的原子事务：
@@ -124,7 +136,7 @@ maintenance 排他锁，再取得 runtime/MediaMTX 锁，避免跨身份锁顺�
 ```
 
 其中 `media_synced=false` 表示已可靠排队而非失败。可通过
-`GET /api/media/operations/{operation_id}` 查询
+`GET /api/v2/media/operations/{operation_id}` 查询
 `pending/running/succeeded/failed/unknown`。删除接口改为 `202 Accepted` 并返回同一操作对象；
 摄像头会立即从产品 API 隐藏，但 MediaMTX Path 的异步清理状态仍可追踪。
 
