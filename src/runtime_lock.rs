@@ -78,6 +78,7 @@ impl DatabaseMaintenanceLock {
             .context("exclusive Sentinel database maintenance is active")
     }
 
+    #[allow(dead_code)] // Reserved for current-state offline maintenance; serve holds shared.
     pub fn exclusive(database_url: &str) -> anyhow::Result<Self> {
         Self::acquire(database_url, LockKind::Exclusive)
             .context("Sentinel is running or another database maintenance command is active")

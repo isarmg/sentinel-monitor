@@ -1,8 +1,8 @@
 mod auth;
 mod background;
-mod backup;
 mod config;
 mod crypto;
+mod doctor;
 mod error;
 mod login_security;
 mod mediamtx;
@@ -19,6 +19,7 @@ mod sqlite_tests;
 #[cfg(test)]
 static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use config::Config;
 use crypto::SecretBox;
@@ -56,59 +57,8 @@ struct Cli {
 enum Command {
     /// Serve the HTTP control plane (the default command).
     Serve,
-    /// Create or verify a complete Sentinel backup bundle.
-    Backup {
-        #[command(subcommand)]
-        command: BackupCommand,
-    },
-    /// Atomically restore a verified bundle while Sentinel and MediaMTX are stopped.
-    Restore(RestoreArgs),
     /// Check database read/write, credential, storage, readiness and companion contracts.
     Doctor(DoctorArgs),
-}
-
-#[derive(Subcommand)]
-enum BackupCommand {
-    /// Create a non-overwriting SQLite, MediaMTX and recording backup bundle.
-    Create(CreateBackupArgs),
-    /// Verify hashes, schema, foreign keys, recording inventory and a temporary restore.
-    Verify(VerifyBackupArgs),
-}
-
-#[derive(Args)]
-struct CreateBackupArgs {
-    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
-    database_url: String,
-    #[arg(long)]
-    output: PathBuf,
-    #[command(flatten)]
-    media: MediaPaths,
-    #[arg(long, env = "SENTINEL_RUNTIME_DIR")]
-    runtime_dir: PathBuf,
-    /// Non-secret identifier for the separately escrowed CREDENTIALS_KEY.
-    #[arg(long, env = "CREDENTIALS_KEY_ID", hide_env_values = true)]
-    credentials_key_id: String,
-}
-
-#[derive(Args)]
-struct VerifyBackupArgs {
-    #[arg(long)]
-    input: PathBuf,
-}
-
-#[derive(Args)]
-struct RestoreArgs {
-    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
-    database_url: String,
-    #[arg(long)]
-    input: PathBuf,
-    #[command(flatten)]
-    media: MediaPaths,
-    #[arg(long, env = "SENTINEL_RUNTIME_DIR")]
-    runtime_dir: PathBuf,
-    /// Non-secret identifier for the separately escrowed CREDENTIALS_KEY.
-    #[arg(long, env = "CREDENTIALS_KEY_ID", hide_env_values = true)]
-    credentials_key_id: String,
 }
 
 #[derive(Args)]
@@ -158,76 +108,9 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command.unwrap_or(Command::Serve) {
         Command::Serve => serve().await,
-        Command::Backup {
-            command: BackupCommand::Create(args),
-        } => {
-            let key = required_credentials_key()?;
-            let manifest = backup::create(&backup::CreateOptions {
-                database_url: args.database_url,
-                output: args.output,
-                mediamtx_config: args.media.mediamtx_config,
-                mediamtx_contract: args.media.mediamtx_contract,
-                mediamtx_binary: args.media.mediamtx_binary,
-                recordings_directory: args.media.recordings_dir,
-                runtime_directory: args.runtime_dir,
-                credentials_key_id: args.credentials_key_id,
-                credentials_key: key,
-            })?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "backup-created",
-                    "application": manifest.application,
-                    "schema": manifest.database_schema,
-                    "recording_files": manifest.data_files,
-                    "recording_bytes": manifest.data_bytes
-                })
-            );
-            Ok(())
-        }
-        Command::Backup {
-            command: BackupCommand::Verify(args),
-        } => {
-            let manifest = backup::verify(&args.input)?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "backup-verified",
-                    "application": manifest.application,
-                    "schema": manifest.database_schema,
-                    "recording_files": manifest.data_files,
-                    "recording_bytes": manifest.data_bytes
-                })
-            );
-            Ok(())
-        }
-        Command::Restore(args) => {
-            let key = required_credentials_key()?;
-            let manifest = backup::restore(&backup::RestoreOptions {
-                database_url: args.database_url,
-                input: args.input,
-                mediamtx_config: args.media.mediamtx_config,
-                mediamtx_contract: args.media.mediamtx_contract,
-                mediamtx_binary: args.media.mediamtx_binary,
-                recordings_directory: args.media.recordings_dir,
-                runtime_directory: args.runtime_dir,
-                credentials_key_id: args.credentials_key_id,
-                credentials_key: key,
-            })?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "restored",
-                    "application": manifest.application,
-                    "schema": manifest.database_schema,
-                    "recording_files": manifest.data_files
-                })
-            );
-            Ok(())
-        }
         Command::Doctor(args) => {
             let key = required_credentials_key()?;
-            let report = backup::doctor(&backup::DoctorOptions {
+            let report = doctor::run(&doctor::DoctorOptions {
                 database_url: args.database_url,
                 mediamtx_config: args.media.mediamtx_config,
                 mediamtx_contract: args.media.mediamtx_contract,
@@ -247,9 +130,14 @@ async fn main() -> anyhow::Result<()> {
 
 fn required_credentials_key() -> anyhow::Result<[u8; 32]> {
     let encoded = std::env::var("CREDENTIALS_KEY").map_err(|_| {
-        anyhow::anyhow!("CREDENTIALS_KEY is required and must remain outside backups")
+        anyhow::anyhow!("CREDENTIALS_KEY is required and must remain in secret management")
     })?;
-    backup::credentials_key_from_base64(&encoded)
+    let decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_| anyhow::anyhow!("CREDENTIALS_KEY must be valid base64"))?;
+    decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("CREDENTIALS_KEY must decode to exactly 32 bytes"))
 }
 
 async fn serve() -> anyhow::Result<()> {
@@ -265,7 +153,6 @@ async fn serve() -> anyhow::Result<()> {
     }
     let pool = sqlite::open_pool(&config.database_url).await?;
     application_lock.validate_open_database()?;
-    sqlx::migrate!().run(&pool).await?;
 
     let http = reqwest::Client::builder()
         .timeout(config.request_timeout)

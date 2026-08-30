@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-monitor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Maintainable Rust control plane for browser-based camera monitoring"
 
@@ -21,12 +21,12 @@ libc = "0.2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 roxmltree = "0.20"
-rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "migrate", "macros", "derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "derive"] }
 subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

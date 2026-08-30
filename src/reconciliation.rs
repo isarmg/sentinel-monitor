@@ -934,7 +934,6 @@ mod tests {
         let database = temporary.path().join("leases.sqlite3");
         let database_url = format!("sqlite://{}", database.display());
         let pool = crate::sqlite::open_pool(&database_url).await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
         let now = Utc::now();
         let user = Uuid::new_v4();
         let camera = Uuid::new_v4();

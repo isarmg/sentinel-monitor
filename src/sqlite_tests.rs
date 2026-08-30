@@ -246,17 +246,13 @@ impl Drop for TemporaryDatabase {
 }
 
 impl TestContext {
-    async fn migrated() -> Self {
+    async fn current() -> Self {
         let network_guard = crate::NETWORK_TEST_LOCK.lock().await;
         let database = TemporaryDatabase::new();
         let database_url = database.url();
         let pool = sqlite::open_pool(&database_url)
             .await
             .expect("open temporary SQLite database");
-        sqlx::migrate!()
-            .run(&pool)
-            .await
-            .expect("run the real migrations");
 
         let media_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -541,8 +537,8 @@ async fn assert_database_integrity(pool: &SqlitePool) {
 }
 
 #[tokio::test]
-async fn migrated_database_accepts_all_required_creation_timestamps() {
-    let context = TestContext::migrated().await;
+async fn current_database_accepts_all_required_creation_timestamps() {
+    let context = TestContext::current().await;
     let (admin_id, token) = context.bootstrap().await;
     let app = routes::router(context.state.clone());
 
@@ -627,8 +623,8 @@ async fn migrated_database_accepts_all_required_creation_timestamps() {
 }
 
 #[tokio::test]
-async fn migrated_database_updates_cameras_filters_and_acknowledges_events() {
-    let context = TestContext::migrated().await;
+async fn current_database_updates_cameras_filters_and_acknowledges_events() {
+    let context = TestContext::current().await;
     let (admin_id, token) = context.bootstrap().await;
     sqlx::query(
         "UPDATE users SET active = 1, last_login_at = ?, created_at = ?, updated_at = ? WHERE id = ?",
@@ -855,7 +851,7 @@ async fn migrated_database_updates_cameras_filters_and_acknowledges_events() {
 
 #[tokio::test]
 async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separate() {
-    let mut context = TestContext::migrated().await;
+    let mut context = TestContext::current().await;
     bootstrap_admin(&context.state)
         .await
         .expect("bootstrap administrator");
@@ -1002,7 +998,7 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
 
 #[tokio::test]
 async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries() {
-    let context = TestContext::migrated().await;
+    let context = TestContext::current().await;
     let (admin_id, first) = context.bootstrap().await;
     let session_version =
         sqlx::query_scalar::<_, i64>("SELECT session_version FROM users WHERE id = ?")
@@ -1116,7 +1112,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
 
 #[tokio::test]
 async fn password_reset_advances_version_and_invalidates_existing_sessions() {
-    let context = TestContext::migrated().await;
+    let context = TestContext::current().await;
     let (_admin_id, admin) = context.bootstrap().await;
     let app = routes::router(context.state.clone());
     assert_eq!(
@@ -1180,7 +1176,7 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
 
 #[tokio::test]
 async fn login_budget_limits_body_and_both_bounded_rate_dimensions() {
-    let mut context = TestContext::migrated().await;
+    let mut context = TestContext::current().await;
     bootstrap_admin(&context.state)
         .await
         .expect("bootstrap administrator");
@@ -1240,7 +1236,7 @@ async fn login_budget_limits_body_and_both_bounded_rate_dimensions() {
 
 #[tokio::test]
 async fn login_argon2_global_gate_times_out_with_retry_after() {
-    let mut context = TestContext::migrated().await;
+    let mut context = TestContext::current().await;
     bootstrap_admin(&context.state)
         .await
         .expect("bootstrap administrator");
@@ -1280,10 +1276,6 @@ async fn production_pool_configures_every_connection_and_persists_after_reopen()
         .await
         .expect("open production-configured SQLite pool");
     assert!(database.path.exists());
-    sqlx::migrate!()
-        .run(&pool)
-        .await
-        .expect("run the real migrations");
 
     let mut first = pool.acquire().await.expect("acquire first connection");
     let mut second = pool.acquire().await.expect("acquire second connection");
@@ -1330,7 +1322,7 @@ async fn production_pool_configures_every_connection_and_persists_after_reopen()
 
 #[tokio::test]
 async fn media_write_persists_desired_operation_before_side_effect_and_tracks_actual() {
-    let context = TestContext::migrated().await;
+    let context = TestContext::current().await;
     let (_admin_id, admin) = context.bootstrap().await;
     let app = routes::router(context.state.clone());
 
@@ -1457,7 +1449,7 @@ async fn media_write_persists_desired_operation_before_side_effect_and_tracks_ac
 
 #[tokio::test]
 async fn media_failure_is_sanitized_and_retries_to_success() {
-    let context = TestContext::migrated().await;
+    let context = TestContext::current().await;
     let (_admin_id, admin) = context.bootstrap().await;
     let app = routes::router(context.state.clone());
     let response = send_request(
@@ -1518,7 +1510,7 @@ async fn media_failure_is_sanitized_and_retries_to_success() {
 
 #[tokio::test]
 async fn media_startup_preserves_active_leases_and_recovers_only_expired_work() {
-    let context = TestContext::migrated().await;
+    let context = TestContext::current().await;
     let (_admin_id, admin) = context.bootstrap().await;
     let app = routes::router(context.state.clone());
     let response = send_request(
@@ -1617,7 +1609,7 @@ async fn media_startup_preserves_active_leases_and_recovers_only_expired_work() 
 
 #[tokio::test]
 async fn media_claim_is_concurrent_safe_and_stable_state_is_idempotent() {
-    let context = TestContext::migrated().await;
+    let context = TestContext::current().await;
     let (_admin_id, admin) = context.bootstrap().await;
     let app = routes::router(context.state.clone());
     let response = send_request(
