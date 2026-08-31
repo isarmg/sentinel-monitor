@@ -52,7 +52,7 @@ APP_LOG="$TEST_ROOT/app.log"
     DATABASE_URL="sqlite://$STATE_ROOT/db/app.db" \
     APP_JWT_SECRET="relocated-smoke-jwt-secret-at-least-32-bytes" \
     CREDENTIALS_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" \
-    BOOTSTRAP_ADMIN_EMAIL="smoke@example.invalid" \
+    BOOTSTRAP_ADMIN_USERNAME="smoke-admin" \
     BOOTSTRAP_ADMIN_PASSWORD="relocated-smoke-bootstrap-password" \
     APP_ENV=production \
     SENTINEL_RUNTIME_DIR="$RUNTIME_ROOT" \

@@ -17,7 +17,7 @@ use crate::crypto::{credential_contract_sha256, CREDENTIAL_ENVELOPE_REVISION};
 const MANIFEST_FORMAT: &str = "sentinel-release-v2";
 const PRODUCT: &str = "sentinel-monitor";
 const VERSION: &str = "0.2.0";
-const TARGET: &str = "x86_64-unknown-linux-gnu";
+const TARGET: &str = sarmg_server_target::SERVER_TARGET_TRIPLE;
 const SERVER_BINARY: &str = "bin/sentinel-monitor";
 const MANIFEST_NAME: &str = "RELEASE-MANIFEST";
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;

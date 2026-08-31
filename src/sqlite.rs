@@ -23,7 +23,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLICATION: &str = "sentinel-monitor";
 pub const CURRENT_SCHEMA_REVISION: i64 = 1;
 pub const CURRENT_SCHEMA_SHA256: &str =
-    "b089342e00e672d6e6c679e15f331c90e599129371042a37948a4b53e5f8e49e";
+    "f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0";
 const CURRENT_SCHEMA: &str = include_str!("current_schema.sql");
 const PRODUCT_METADATA_SQL: &str = "CREATE TABLE product_metadata (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
@@ -768,15 +768,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_database_without_metadata_is_rejected_without_changing_bytes() {
+    async fn foreign_database_without_metadata_is_rejected_without_changing_bytes() {
         let temporary = tempfile::tempdir().unwrap();
-        let database = temporary.path().join("old-0.1.sqlite3");
+        let database = temporary.path().join("foreign.sqlite3");
         let connection = Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE _sqlx_migrations(version INTEGER PRIMARY KEY, success INTEGER);
-                 INSERT INTO _sqlx_migrations VALUES(1, 1), (2, 1), (3, 1);
-                 CREATE TABLE users(id TEXT PRIMARY KEY, email TEXT NOT NULL);",
+                "CREATE TABLE unrelated_records(id TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO unrelated_records VALUES('record', 'foreign');",
             )
             .unwrap();
         drop(connection);
@@ -787,14 +786,14 @@ mod tests {
     #[tokio::test]
     async fn noncurrent_wal_generation_is_rejected_without_changing_bytes() {
         let temporary = tempfile::tempdir().unwrap();
-        let database = temporary.path().join("old-wal.sqlite3");
+        let database = temporary.path().join("noncurrent-wal.sqlite3");
         let connection = Connection::open(&database).unwrap();
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
                  PRAGMA wal_autocheckpoint=0;
-                 CREATE TABLE users(id TEXT PRIMARY KEY, email TEXT NOT NULL);
-                 INSERT INTO users VALUES('old-user', 'old@example.invalid');",
+                 CREATE TABLE users(id TEXT PRIMARY KEY, username TEXT NOT NULL);
+                 INSERT INTO users VALUES('unknown-user', 'unknown-admin');",
             )
             .unwrap();
         assert!(sqlite_sidecar(&database, "-wal").exists());
@@ -836,18 +835,6 @@ mod tests {
             (
                 "unknown-shape",
                 "ALTER TABLE media_reconciler_leases ADD COLUMN unexpected TEXT;",
-            ),
-            (
-                "old-scope-shape",
-                "DROP TABLE media_reconciler_leases;
-                 CREATE TABLE media_reconciler_leases (
-                     scope TEXT PRIMARY KEY CHECK (scope = 'global'),
-                     lease_owner TEXT,
-                     lease_expires_at TEXT,
-                     updated_at TEXT NOT NULL
-                 );
-                 INSERT INTO media_reconciler_leases (scope, updated_at)
-                 VALUES ('global', datetime('now'));",
             ),
         ];
 
@@ -924,8 +911,8 @@ mod tests {
                 "UPDATE product_metadata SET application = 'another-product'",
             ),
             (
-                "old-version",
-                "UPDATE product_metadata SET application_version = '0.1.0'",
+                "noncurrent-version",
+                "UPDATE product_metadata SET application_version = 'noncurrent-version'",
             ),
             (
                 "wrong-revision",

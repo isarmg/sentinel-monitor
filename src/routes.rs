@@ -1,8 +1,8 @@
 use crate::{
     auth::{
-        csrf_cookie, decode_media_token, enforce_browser_security, expired_csrf_cookie,
-        expired_session_cookie, hash_password, issue_media_token, issue_session, revoke_session,
-        session_cookie, CurrentUser,
+        decode_media_token, enforce_browser_security, expired_session_cookie,
+        hash_administrator_password, issue_media_token, issue_session, revoke_session,
+        rotate_csrf_token, session_cookie, CurrentUser,
     },
     background::camera_path,
     crypto::CredentialField,
@@ -15,7 +15,7 @@ use crate::{
 use async_stream::stream;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
+    extract::{rejection::JsonRejection, ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{
         header::{
             ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
@@ -30,6 +30,11 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use futures_util::Stream;
+use sarmg_admin_auth::normalize_administrator_username;
+use sarmg_contracts::{
+    AdministratorLoginRequest, AdministratorSession, ADMIN_LOGIN_PATH, ADMIN_LOGOUT_PATH,
+    ADMIN_SESSION_PATH,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{convert::Infallible, net::SocketAddr, time::Duration};
@@ -37,18 +42,18 @@ use tower_http::{compression::CompressionLayer, services::ServeDir, trace::Trace
 use url::Url;
 use uuid::Uuid;
 
-const USER_SELECT: &str = "SELECT id, email, password_hash, role, active, session_version, last_login_at, created_at, updated_at FROM users";
+const USER_SELECT: &str = "SELECT id, username, password_hash, active, session_version, last_login_at, created_at, updated_at FROM users";
 const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at FROM cameras";
 
 pub fn router(state: AppState) -> Router {
     let static_dir = state.config.static_dir.clone();
     let api = Router::new()
         .route(
-            "/auth/login",
+            admin_api_relative_path(ADMIN_LOGIN_PATH),
             post(login).layer(DefaultBodyLimit::max(state.config.login_body_limit)),
         )
-        .route("/auth/logout", post(logout))
-        .route("/me", get(me))
+        .route(admin_api_relative_path(ADMIN_SESSION_PATH), get(session))
+        .route(admin_api_relative_path(ADMIN_LOGOUT_PATH), post(logout))
         .route("/users", get(list_users).post(create_user))
         .route("/users/{id}", put(update_user).delete(delete_user))
         .route("/cameras", get(list_cameras).post(create_camera))
@@ -83,16 +88,29 @@ pub fn router(state: AppState) -> Router {
 async fn login(
     ConnectInfo(source): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    Json(request): Json<LoginRequest>,
+    request: std::result::Result<Json<AdministratorLoginRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse> {
+    let Json(request) = request.map_err(|error| {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            AppError::PayloadTooLarge
+        } else {
+            AppError::Validation(error.to_string())
+        }
+    })?;
+    request
+        .validate()
+        .map_err(|error| AppError::Validation(error.to_string()))?;
+    let normalized_username = normalize_administrator_username(&request.username)
+        .map_err(|error| AppError::Validation(error.to_string()))?;
+    sarmg_admin_auth::validate_password(&request.password)
+        .map_err(|error| AppError::Validation(error.to_string()))?;
     state
         .login
-        .check_attempt(source.ip(), request.email.trim())?;
-    let user =
-        sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} WHERE LOWER(email) = LOWER(?)"))
-            .bind(request.email.trim())
-            .fetch_optional(&state.pool)
-            .await?;
+        .check_attempt(source.ip(), &normalized_username)?;
+    let user = sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} WHERE username = ?"))
+        .bind(normalized_username)
+        .fetch_optional(&state.pool)
+        .await?;
     let password_hash = user
         .as_ref()
         .map(|user| user.password_hash.clone())
@@ -113,10 +131,9 @@ async fn login(
         HeaderValue::from_str(&session_cookie(&session.token, &state.config))
             .map_err(|_| AppError::Internal("session cookie failed".into()))?,
     );
-    headers.append(
-        SET_COOKIE,
-        HeaderValue::from_str(&csrf_cookie(&session.csrf_token, &state.config))
-            .map_err(|_| AppError::Internal("csrf cookie failed".into()))?,
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private, max-age=0"),
     );
     write_audit(
         &state,
@@ -127,7 +144,34 @@ async fn login(
         json!({}),
     )
     .await;
-    Ok((headers, Json(UserView::from(user))))
+    Ok((
+        headers,
+        Json(
+            AdministratorSession::new(user.id.to_string(), user.username, session.csrf_token)
+                .map_err(|error| AppError::Internal(format!("session contract failed: {error}")))?,
+        ),
+    ))
+}
+
+async fn session(user: CurrentUser, State(state): State<AppState>) -> Result<impl IntoResponse> {
+    let csrf_token = rotate_csrf_token(&state, user.session_id).await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private, max-age=0"),
+    );
+    Ok((
+        headers,
+        Json(
+            AdministratorSession::new(user.id.to_string(), user.username, csrf_token)
+                .map_err(|error| AppError::Internal(format!("session contract failed: {error}")))?,
+        ),
+    ))
+}
+
+fn admin_api_relative_path(path: &'static str) -> &'static str {
+    path.strip_prefix(CONTRACT.api_prefix.as_str())
+        .expect("Foundation administrator path must use Sentinel API prefix")
 }
 
 async fn logout(user: CurrentUser, State(state): State<AppState>) -> Result<impl IntoResponse> {
@@ -138,23 +182,17 @@ async fn logout(user: CurrentUser, State(state): State<AppState>) -> Result<impl
         HeaderValue::from_str(&expired_session_cookie(&state.config))
             .map_err(|_| AppError::Internal("session cookie failed".into()))?,
     );
-    headers.append(
-        SET_COOKIE,
-        HeaderValue::from_str(&expired_csrf_cookie(&state.config))
-            .map_err(|_| AppError::Internal("csrf cookie failed".into()))?,
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private, max-age=0"),
     );
     Ok((headers, StatusCode::NO_CONTENT))
 }
 
-async fn me(user: CurrentUser) -> Json<UserView> {
-    Json(user.view())
-}
-
 async fn list_users(
-    user: CurrentUser,
+    _user: CurrentUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<UserView>>> {
-    user.require_admin()?;
     let records = sqlx::query_as::<_, UserRecord>(&format!("{USER_SELECT} ORDER BY created_at"))
         .fetch_all(&state.pool)
         .await?;
@@ -166,32 +204,30 @@ async fn create_user(
     State(state): State<AppState>,
     Json(request): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserView>)> {
-    user.require_admin()?;
-    validate_role(&request.role)?;
-    validate_email(&request.email)?;
+    let username = normalize_administrator_username(&request.username)
+        .map_err(|error| AppError::Validation(error.to_string()))?;
     let now = Utc::now();
     let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, UserRecord>(
-        "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
-         VALUES (?, LOWER(?), ?, ?, 1, ?, ?) \
-         RETURNING id, email, password_hash, role, active, session_version, last_login_at, created_at, updated_at",
+        "INSERT INTO users (id, username, password_hash, active, created_at, updated_at) \
+         VALUES (?, ?, ?, 1, ?, ?) \
+         RETURNING id, username, password_hash, active, session_version, last_login_at, created_at, updated_at",
     )
     .bind(Uuid::new_v4())
-    .bind(request.email.trim())
-    .bind(hash_password(&request.password)?)
-    .bind(&request.role)
+    .bind(username)
+    .bind(hash_administrator_password(&request.password)?)
     .bind(now)
     .bind(now)
     .fetch_one(&mut *transaction)
     .await
-    .map_err(map_unique_email)?;
+    .map_err(map_unique_username)?;
     write_audit_in(
         &mut transaction,
         Some(user.id),
         "user.create",
         "user",
         Some(record.id),
-        json!({ "role": &record.role }),
+        json!({ "username": &record.username }),
     )
     .await?;
     transaction.commit().await?;
@@ -204,30 +240,25 @@ async fn update_user(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateUserRequest>,
 ) -> Result<Json<UserView>> {
-    user.require_admin()?;
     let existing = load_user(&state, id).await?;
-    let role = request.role.unwrap_or(existing.role.clone());
-    validate_role(&role)?;
     let active = request.active.unwrap_or(existing.active);
     if id == user.id && !active {
         return Err(AppError::Conflict("不能停用当前登录账号".into()));
     }
-    if existing.role == "admin" && (role != "admin" || !active) {
+    if !active {
         ensure_another_admin(&state, id).await?;
     }
     let (password_hash, password_changed) = match request.password {
-        Some(password) if !password.is_empty() => (hash_password(&password)?, true),
+        Some(password) if !password.is_empty() => (hash_administrator_password(&password)?, true),
         _ => (existing.password_hash, false),
     };
-    let invalidate_sessions =
-        password_changed || role != existing.role || active != existing.active;
+    let invalidate_sessions = password_changed || active != existing.active;
     let mut transaction = state.pool.begin().await?;
     let record = sqlx::query_as::<_, UserRecord>(
-        "UPDATE users SET role = ?, active = ?, password_hash = ?, \
+        "UPDATE users SET active = ?, password_hash = ?, \
          session_version = session_version + ?, updated_at = datetime('now') WHERE id = ? \
-         RETURNING id, email, password_hash, role, active, session_version, last_login_at, created_at, updated_at",
+         RETURNING id, username, password_hash, active, session_version, last_login_at, created_at, updated_at",
     )
-    .bind(&role)
     .bind(active)
     .bind(password_hash)
     .bind(i64::from(invalidate_sessions))
@@ -240,7 +271,7 @@ async fn update_user(
         "user.update",
         "user",
         Some(id),
-        json!({ "role": role, "active": active }),
+        json!({ "active": active, "password_changed": password_changed }),
     )
     .await?;
     transaction.commit().await?;
@@ -252,14 +283,11 @@ async fn delete_user(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
-    user.require_admin()?;
     if id == user.id {
         return Err(AppError::Conflict("不能删除当前登录账号".into()));
     }
     let existing = load_user(&state, id).await?;
-    if existing.role == "admin" {
-        ensure_another_admin(&state, id).await?;
-    }
+    ensure_another_admin(&state, id).await?;
     let mut transaction = state.pool.begin().await?;
     write_audit_in(
         &mut transaction,
@@ -267,7 +295,7 @@ async fn delete_user(
         "user.delete",
         "user",
         Some(id),
-        json!({ "email": existing.email }),
+        json!({ "username": existing.username }),
     )
     .await?;
     sqlx::query("DELETE FROM users WHERE id = ?")
@@ -302,7 +330,6 @@ async fn create_camera(
     State(state): State<AppState>,
     Json(request): Json<CreateCameraRequest>,
 ) -> Result<(StatusCode, Json<CameraMutationResponse>)> {
-    user.require_admin()?;
     validate_camera_values(
         &request.name,
         &request.main_stream_url,
@@ -398,7 +425,6 @@ async fn update_camera(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateCameraRequest>,
 ) -> Result<Json<CameraMutationResponse>> {
-    user.require_admin()?;
     let existing = load_camera(&state, id).await?;
     let name = request.name.unwrap_or(existing.name.clone());
     let location = request.location.unwrap_or(existing.location.clone());
@@ -514,7 +540,6 @@ async fn delete_camera(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<reconciliation::MediaOperationView>)> {
-    user.require_admin()?;
     let camera = load_camera(&state, id).await?;
     let mut transaction = state.pool.begin().await?;
     let now = Utc::now();
@@ -591,10 +616,9 @@ async fn stream_ticket(
 }
 
 async fn discover_onvif(
-    user: CurrentUser,
+    _user: CurrentUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<onvif::DiscoveredDevice>>> {
-    user.require_operator()?;
     Ok(Json(
         onvif::discover(state.config.onvif_discovery_timeout).await?,
     ))
@@ -606,7 +630,6 @@ async fn ptz(
     Path(id): Path<Uuid>,
     Json(request): Json<PtzRequest>,
 ) -> Result<StatusCode> {
-    user.require_operator()?;
     if request.action != "move" && request.action != "stop" {
         return Err(AppError::Validation("PTZ action只能是move或stop".into()));
     }
@@ -782,7 +805,6 @@ async fn ack_event(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
-    user.require_operator()?;
     let acknowledged_at = Utc::now();
     let result =
         sqlx::query("UPDATE events SET acknowledged_at = ?, acknowledged_by = ? WHERE id = ?")
@@ -837,11 +859,10 @@ struct AuditQuery {
 }
 
 async fn list_audit(
-    user: CurrentUser,
+    _user: CurrentUser,
     State(state): State<AppState>,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditRecord>>> {
-    user.require_admin()?;
     let rows = sqlx::query_as::<_, AuditRecord>(
         "SELECT id, user_id, action, entity_type, entity_id, details, created_at FROM audit_logs ORDER BY created_at DESC LIMIT ?",
     )
@@ -990,35 +1011,14 @@ async fn load_user(state: &AppState, id: Uuid) -> Result<UserRecord> {
 }
 
 async fn ensure_another_admin(state: &AppState, excluded: Uuid) -> Result<()> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND active AND id <> ?",
-    )
-    .bind(excluded)
-    .fetch_one(&state.pool)
-    .await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE active AND id <> ?")
+        .bind(excluded)
+        .fetch_one(&state.pool)
+        .await?;
     if count == 0 {
         return Err(AppError::Conflict("系统必须保留至少一个可用管理员".into()));
     }
     Ok(())
-}
-
-fn validate_role(role: &str) -> Result<()> {
-    if matches!(role, "admin" | "operator" | "viewer") {
-        Ok(())
-    } else {
-        Err(AppError::Validation(
-            "角色只能是admin、operator或viewer".into(),
-        ))
-    }
-}
-
-fn validate_email(email: &str) -> Result<()> {
-    let email = email.trim();
-    if email.len() >= 5 && email.contains('@') && !email.contains(char::is_whitespace) {
-        Ok(())
-    } else {
-        Err(AppError::Validation("邮箱格式无效".into()))
-    }
 }
 
 fn validate_camera_values(
@@ -1062,10 +1062,12 @@ fn clean_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn map_unique_email(error: sqlx::Error) -> AppError {
+fn map_unique_username(error: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(database) = &error {
-        if database.constraint() == Some("users_email_lower_idx") {
-            return AppError::Conflict("该邮箱已经存在".into());
+        // This INSERT's only caller-controlled unique key is `username`;
+        // SQLite does not expose an index name through sqlx's `constraint()`.
+        if database.is_unique_violation() {
+            return AppError::Conflict("该用户名已经存在".into());
         }
     }
     AppError::Database(error)

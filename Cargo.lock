@@ -1905,6 +1905,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "sarmg-admin-auth"
+version = "0.3.0"
+source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+dependencies = [
+ "argon2",
+ "base64",
+ "getrandom 0.4.3",
+ "sha2",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
+name = "sarmg-contracts"
+version = "0.3.0"
+source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+dependencies = [
+ "sarmg-admin-auth",
+ "sarmg-error",
+ "sarmg-schema-identity",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "sarmg-error"
+version = "0.3.0"
+source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "sarmg-schema-identity"
+version = "0.3.0"
+source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+dependencies = [
+ "serde",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "sarmg-server-target"
+version = "0.3.0"
+source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1916,7 +1967,6 @@ version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
- "argon2",
  "async-stream",
  "axum",
  "base64",
@@ -1931,12 +1981,15 @@ dependencies = [
  "reqwest",
  "roxmltree",
  "rusqlite",
+ "sarmg-admin-auth",
+ "sarmg-contracts",
+ "sarmg-error",
+ "sarmg-server-target",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
  "sqlx",
- "subtle",
  "tempfile",
  "thiserror",
  "tokio",

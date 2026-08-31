@@ -1,0 +1,4 @@
+{
+  "extends": "@sarmg/admin-web/tsconfig.json",
+  "include": ["src", "vite.config.ts"]
+}

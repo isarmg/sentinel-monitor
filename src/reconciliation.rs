@@ -1055,8 +1055,8 @@ mod tests {
         let camera = Uuid::new_v4();
         let operation = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO users (id, email, password_hash, role, created_at, updated_at) \
-             VALUES (?, 'lease@example.test', 'hash', 'admin', ?, ?)",
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+             VALUES (?, 'lease-admin', 'hash', ?, ?)",
         )
         .bind(user)
         .bind(now)

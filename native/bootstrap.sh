@@ -17,7 +17,7 @@ else
 fi
 
 ensure_directory "$(dirname "$SENTINEL_CONFIG_DIR")" 755 "configuration parent"
-ensure_directory "$SENTINEL_CONFIG_DIR" 700 "configuration directory"
+ensure_directory "$SENTINEL_CONFIG_DIR" 755 "Sarmg configuration directory"
 ensure_directory "$(dirname "$SENTINEL_STATE_DIR")" 755 "state parent"
 ensure_directory "$SENTINEL_STATE_DIR" 700 "state directory"
 ensure_directory "$SENTINEL_STATE_DIR/db" 700 "database directory"
@@ -78,7 +78,7 @@ trap cleanup_config_temp EXIT
     echo "DATABASE_URL=sqlite://$SENTINEL_STATE_DIR/db/app.db"
     echo "APP_JWT_SECRET=$JWT_SECRET"
     echo "CREDENTIALS_KEY=$CREDENTIAL_KEY"
-    echo "BOOTSTRAP_ADMIN_EMAIL=admin@sentinel.local"
+    echo "BOOTSTRAP_ADMIN_USERNAME=admin"
     echo "BOOTSTRAP_ADMIN_PASSWORD=$ADMIN_PASSWORD"
     echo "APP_ENV=production"
     echo "SESSION_IDLE_TTL_MINUTES=30"
@@ -123,5 +123,4 @@ unset JWT_SECRET CREDENTIAL_KEY ADMIN_PASSWORD
 
 echo "Created private configuration without printing its secrets: $SENTINEL_ENV_FILE"
 echo "Replace the generated administrator password and review every setting with a protected editor."
-echo "This script never imports .env.native or an older runtime layout."
 echo "Then run: $SENTINEL_RELEASE_ROOT/native/bootstrap.sh --confirm-config"

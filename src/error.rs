@@ -1,9 +1,12 @@
 use axum::{
-    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
+    http::{
+        header::{CACHE_CONTROL, RETRY_AFTER},
+        HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use sarmg_error::{ErrorCode, ErrorEnvelope};
 
 pub type Result<T> = std::result::Result<T, AppError>;
 
@@ -17,6 +20,8 @@ pub enum AppError {
     NotFound(String),
     #[error("{0}")]
     Validation(String),
+    #[error("request body is too large")]
+    PayloadTooLarge,
     #[error("{0}")]
     Conflict(String),
     #[error("rate limited; retry after {retry_after} seconds")]
@@ -33,18 +38,20 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, code, message, log_error, retry_after) = match &self {
+        let (status, code, message, retryable, log_error, retry_after) = match &self {
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "登录状态无效或已过期".to_string(),
+                false,
                 false,
                 None,
             ),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
                 "forbidden",
-                "当前账号没有执行此操作的权限".to_string(),
+                "请求未通过管理员安全校验".to_string(),
+                false,
                 false,
                 None,
             ),
@@ -53,12 +60,22 @@ impl IntoResponse for AppError {
                 "not_found",
                 message.clone(),
                 false,
+                false,
                 None,
             ),
             Self::Validation(message) => (
                 StatusCode::BAD_REQUEST,
                 "validation_error",
                 message.clone(),
+                false,
+                false,
+                None,
+            ),
+            Self::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "请求体超过当前大小限制".to_string(),
+                false,
                 false,
                 None,
             ),
@@ -67,12 +84,14 @@ impl IntoResponse for AppError {
                 "conflict",
                 message.clone(),
                 false,
+                false,
                 None,
             ),
             Self::RateLimited { retry_after } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
                 "登录尝试过多，请稍后重试".to_string(),
+                true,
                 false,
                 Some(*retry_after),
             ),
@@ -81,12 +100,14 @@ impl IntoResponse for AppError {
                 "media_service_error",
                 "媒体服务暂时不可用".to_string(),
                 true,
+                true,
                 None,
             ),
             Self::Database(_) | Self::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 "服务器内部错误".to_string(),
+                true,
                 true,
                 None,
             ),
@@ -96,16 +117,21 @@ impl IntoResponse for AppError {
             tracing::error!(error = %self, "request failed");
         }
 
-        let mut response = (
-            status,
-            Json(json!({ "error": { "code": code, "message": message } })),
-        )
-            .into_response();
+        let code = ErrorCode::new(code).expect("AppError codes are valid current identifiers");
+        let mut envelope = ErrorEnvelope::with_code(code, message).retryable(retryable);
+        if let Some(retry_after) = retry_after {
+            envelope = envelope.with_detail("retry_after_seconds", retry_after);
+        }
+        let mut response = (status, Json(envelope)).into_response();
         if let Some(retry_after) = retry_after {
             if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
                 response.headers_mut().insert(RETRY_AFTER, value);
             }
         }
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store, private, max-age=0"),
+        );
         response
     }
 }

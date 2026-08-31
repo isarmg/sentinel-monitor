@@ -255,7 +255,7 @@ resolve_release_context() {
 }
 
 deployment_paths() {
-  SENTINEL_CONFIG_DIR="${SENTINEL_NATIVE_CONFIG_DIR:-/etc/isarmg/sentinel-monitor}"
+  SENTINEL_CONFIG_DIR="${SENTINEL_NATIVE_CONFIG_DIR:-/etc/isarmg}"
   SENTINEL_STATE_DIR="${SENTINEL_NATIVE_STATE_DIR:-/var/lib/isarmg/sentinel-monitor}"
   SENTINEL_RUNTIME_PATH="${SENTINEL_NATIVE_RUNTIME_DIR:-/run/isarmg/sentinel-monitor}"
   validate_absolute_path "$SENTINEL_CONFIG_DIR" "SENTINEL_NATIVE_CONFIG_DIR"
@@ -264,14 +264,16 @@ deployment_paths() {
   SENTINEL_ENV_FILE="$SENTINEL_CONFIG_DIR/sentinel-monitor.env"
   # Consumed by the operational scripts that source this file.
   # shellcheck disable=SC2034
-  SENTINEL_REVIEW_MARKER="$SENTINEL_CONFIG_DIR/REVIEW-SECRETS-BEFORE-START"
+  SENTINEL_REVIEW_MARKER="$SENTINEL_CONFIG_DIR/sentinel-monitor.REVIEW-SECRETS-BEFORE-START"
   readonly SENTINEL_CONFIG_DIR SENTINEL_STATE_DIR SENTINEL_RUNTIME_PATH
   # shellcheck disable=SC2034
   readonly SENTINEL_ENV_FILE SENTINEL_REVIEW_MARKER
 }
 
 load_deployment_env() {
-  assert_private_directory "$SENTINEL_CONFIG_DIR" "Sentinel configuration directory"
+  assert_directory "$SENTINEL_CONFIG_DIR" "Sarmg configuration directory"
+  [[ "$(stat -c '%a' -- "$SENTINEL_CONFIG_DIR")" == "755" ]] ||
+    die "Sarmg configuration directory must have mode 0755: $SENTINEL_CONFIG_DIR"
   assert_private_file "$SENTINEL_ENV_FILE" "Sentinel environment file"
   set -a
   # shellcheck disable=SC1090

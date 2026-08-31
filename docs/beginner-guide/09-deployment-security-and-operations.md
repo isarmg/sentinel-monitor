@@ -19,7 +19,7 @@ release verify 与 offline doctor；启动 MediaMTX 后启动 Sentinel；检查�
 ## 9.4 监控指标
 
 关注 readiness、登录拒绝、Session、operation backlog/age/unknown、lease、reconcile latency/error、
-MediaMTX API、publisher、播放错误、录像磁盘/inode、SQLite/WAL 和 outbox。
+MediaMTX API、publisher、播放错误、录像磁盘/inode、SQLite/WAL、审计写入 warning 和 SSE resync。
 
 ## 9.5 日常 Doctor
 
@@ -28,8 +28,9 @@ offline doctor 验证 release/Schema/SQLite/key/MediaMTX 合同与录像目录�
 
 ## 9.6 备份恢复
 
-只使用 Sentinel 专用组合命令。定期验证 manifest、所有文件 Hash、recordings inventory 和 external key
-认证，并在隔离主机 restore + doctor + 播放。只验证备份目录存在毫无意义。
+只使用 Sentinel 专用组合命令。发行 manifest 验证发行树全部文件 Hash；升级/备份仓还必须自行生成并
+验证 recordings inventory 与 external key 认证，并在隔离主机 restore + doctor + 播放。当前 Sentinel
+doctor 只验证录像根安全属性和可清理写探针，不会逐个核对录像文件 Hash；只验证目录存在同样不充分。
 
 ## 9.7 事件处置
 
@@ -41,7 +42,7 @@ offline doctor 验证 release/Schema/SQLite/key/MediaMTX 合同与录像目录�
 | 故障 | 操作 |
 |---|---|
 | operation unknown | 冻结同资源写入，核对实际状态，禁止盲重试 |
-| key 解密失败 | 检查受保护 key 来源/ID，不启用旧 key fallback |
+| key 解密失败 | 检查受保护 key 来源/ID；产品只接受当前唯一 key |
 | Schema drift | 停止并保全 generation，交给升级工具 |
 | 录像盘满 | 停止新增写入，按策略扩容/归档，不手删控制文件 |
 | MediaMTX 合同不符 | 恢复精确制品/config，不临时放宽 SHA |

@@ -19,7 +19,7 @@
 ## 1. 先认识控制面和媒体面
 
 摄像头视频不经过 Rust 应用转发。MediaMTX 连接 RTSP 摄像头并向浏览器提供 WHEP/HLS；Rust 应用保存
-“应该有哪些 MediaMTX Path”的期望态，通过 MediaMTX 本地 API 协调实际态，并负责浏览器身份、角色、
+“应该有哪些 MediaMTX Path”的期望态，通过 MediaMTX 本地 API 协调实际态，并负责 Administrator 身份、
 临时媒体授权和 ONVIF 控制。
 
 ```text
@@ -64,12 +64,17 @@ cargo run -- serve
 
 ## 4. 浏览器登录
 
-管理员初始身份在全新数据库初始化时由环境提供，密码使用 Argon2。登录成功后浏览器取得
+管理员初始身份在全新数据库初始化时由 `BOOTSTRAP_ADMIN_USERNAME` 与密码提供。username candidate
+是 1–64 bytes printable ASCII，经 trim ASCII/lowercase 后必须是 3–64 bytes、首尾字母数字、字符仅
+`[a-z0-9._-]`；默认值为 `admin`，`@` 不合法。密码使用当前 Argon2id。登录成功后浏览器取得
 `__Host-sentinel_session` Secure/HttpOnly/SameSite Cookie；写请求同时需要 Session 绑定 CSRF。
 登录按真实连接来源和规范化账户分别限流，并受请求体、Argon2 并发与超时预算保护。
 
-角色：观察员可预览和回放；操作员额外拥有 PTZ、事件确认和发现；管理员再拥有摄像头、用户、审计
-及系统管理。
+控制面只有 Administrator：每个成功登录的账户都能访问摄像头、直播、录像、PTZ、事件、用户、审计
+和系统状态。请求精确为 `{username,password}`，Session 精确包含
+`authenticated/user_id/username/role/csrf_token` 五字段；`users` 表不保存 email 或 `role`，wire 中固定的
+`role:"admin"` 只是 Foundation 身份合同。摄像头
+RTSP/ONVIF 用户名、媒体 JWT `actions` 都是数据面凭据或资源范围，不能解释为第二套控制面角色。
 
 ## 5. 摄像头凭据为什么是 envelope
 
@@ -91,17 +96,20 @@ HTTP 请求不能同时原子提交 SQLite 和远端 MediaMTX。因此 API 先�
 
 ## 7. 播放和录像
 
-浏览器先向当前 API 申请短时媒体 JWT，再通过同源 Caddy 入口访问 WHEP/HLS。MediaMTX 调用唯一
+浏览器先向当前 API 申请短时媒体 JWT，再通过同源 Caddy 入口访问 WHEP/HLS。当前前端 guard 只证明
+ticket URL 是字符串，播放器也会接受绝对 URL/Location 并携带 Bearer；因此生产配置必须把
+`PUBLIC_WEBRTC_BASE_URL` 保持为受审同源相对路径，不能把该约束误写成代码已强制。MediaMTX 调用唯一
 `/internal/v2/media/auth` 校验。JWT 使用从 `APP_JWT_SECRET` 派生的当前签名 key，严格绑定 protocol、
 issuer、audience、kind、camera、jti 与时间窗；不验证旧 token。
 
-录像目录由 MediaMTX 写入、控制面索引和授权。Web 不应直连 9996/9997/9998 管理/媒体端口。
+录像目录由 MediaMTX 写入；控制面通过 MediaMTX playback API 查询和代理授权播放，并没有本地录像
+inventory 表或逐文件 Hash 索引。Web 不应直连 9996/9997/9998 管理/媒体端口。
 
 ## 8. 当前 Schema
 
 数据库只在主文件完全不存在时创建。启动从 main/WAL/journal 原始字节构造私有 generation，验证唯一
 `product_metadata`、实际 `sqlite_schema` 指纹和 reconciler singleton 状态，再打开生产写连接。已有空
-文件、旧版、额外列、非法租约或 Schema drift 都只读拒绝，不自动补表/补行。
+文件、非当前身份、额外列、非法租约或 Schema drift 都只读拒绝，不自动补表/补行。
 
 ## 9. 修改代码的方法
 

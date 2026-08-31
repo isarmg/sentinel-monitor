@@ -18,7 +18,9 @@ credential 在 Server 内解密，只在调用/生成受保护配置的最短范
 ## 6.4 播放
 
 浏览器先向 Sentinel 获取短期授权，再经 TLS 代理访问 WHEP/HLS。代理路由必须保持 Host、真实 peer 和
-升级协议语义，且不能公开 companion 管理 API。
+升级协议语义，且不能公开 companion 管理 API。当前 `isStreamTicket` 只校验 URL 字段类型，WHEP player
+对绝对 ticket/Location 也会携带 Bearer；生产必须把 WebRTC base URL 锁定为同源相对路径，直到客户端
+实现显式 same-origin 拒绝。
 
 ## 6.5 录像树
 
@@ -32,8 +34,9 @@ credential 在 Server 内解密，只在调用/生成受保护配置的最短范
 
 ## 6.7 组合备份
 
-使用 `sarmg-upgrade` 同时取得数据库、MediaMTX config/contract 和完整 recordings inventory。external
-key 仅以 ID/要求写 manifest，原始 key 独立保管。恢复后先验证 key 与所有密文，再启动 companion。
+使用 `sarmg-upgrade` 同时取得数据库、MediaMTX config/contract 和完整 recordings tree，并由升级仓生成
+recordings inventory。Sentinel doctor 本身不建立逐文件 inventory。external key 仅以 ID/要求写 manifest，
+原始 key 独立保管。恢复后先验证 key 与所有密文，再启动 companion。
 
 ## 6.8 无画面排查顺序
 

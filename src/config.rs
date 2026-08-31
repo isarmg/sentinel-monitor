@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ipnet::IpNet;
+use sarmg_admin_auth::normalize_administrator_username;
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone)]
@@ -9,7 +10,7 @@ pub struct Config {
     pub jwt_secret: Vec<u8>,
     pub credentials_key: [u8; 32],
     pub runtime_directory: PathBuf,
-    pub bootstrap_admin_email: String,
+    pub bootstrap_admin_username: String,
     pub bootstrap_admin_password: Option<String>,
     pub development_mode: bool,
     pub session_idle_ttl: Duration,
@@ -62,6 +63,11 @@ impl Config {
         if !runtime_directory.is_absolute() {
             return Err("SENTINEL_RUNTIME_DIR must be an absolute path".into());
         }
+        let bootstrap_admin_password = env::var("BOOTSTRAP_ADMIN_PASSWORD").ok();
+        if let Some(password) = &bootstrap_admin_password {
+            sarmg_admin_auth::validate_password(password)
+                .map_err(|error| format!("BOOTSTRAP_ADMIN_PASSWORD is invalid: {error}"))?;
+        }
 
         Ok(Self {
             bind_addr,
@@ -69,10 +75,12 @@ impl Config {
             jwt_secret,
             credentials_key,
             runtime_directory,
-            bootstrap_admin_email: value("BOOTSTRAP_ADMIN_EMAIL", "admin@example.com")
-                .trim()
-                .to_lowercase(),
-            bootstrap_admin_password: env::var("BOOTSTRAP_ADMIN_PASSWORD").ok(),
+            bootstrap_admin_username: normalize_administrator_username(&value(
+                "BOOTSTRAP_ADMIN_USERNAME",
+                "admin",
+            ))
+            .map_err(|error| format!("BOOTSTRAP_ADMIN_USERNAME is invalid: {error}"))?,
+            bootstrap_admin_password,
             development_mode,
             session_idle_ttl: duration_from_env("SESSION_IDLE_TTL_MINUTES", 30, 60)?,
             session_absolute_ttl: duration_from_env("SESSION_ABSOLUTE_TTL_HOURS", 12, 3_600)?,

@@ -37,6 +37,11 @@ require_command find
 require_command flock
 require_command sha256sum
 require_command sort
+[[ "$(uname -m)" == "x86_64" ]] ||
+  die "Sentinel formal release builds require an x86_64 Linux builder"
+[[ "$(uname -s)" == "Linux" ]] ||
+  die "Sentinel formal release builds require Linux"
+RUST_TARGET="x86_64-unknown-linux-gnu"
 
 is_source_revision() {
   [[ "$1" =~ ^[0-9a-f]{40}$ ]]
@@ -159,8 +164,8 @@ else
   CARGO_TARGET_DIR="$BUILD_TARGET/cargo" \
     SENTINEL_STATIC_MANIFEST_PATH="$STATIC_MANIFEST" \
     SENTINEL_SOURCE_REVISION="$SOURCE_REVISION" \
-    cargo build --locked --release --manifest-path "$SOURCE_ROOT/Cargo.toml"
-  install -m 0755 -- "$BUILD_TARGET/cargo/release/sentinel-monitor" "$APP_STAGE"
+    cargo build --locked --release --target "$RUST_TARGET" --manifest-path "$SOURCE_ROOT/Cargo.toml"
+  install -m 0755 -- "$BUILD_TARGET/cargo/$RUST_TARGET/release/sentinel-monitor" "$APP_STAGE"
 fi
 [[ "$($APP_STAGE --version | tr -d '\r\n')" == "$SENTINEL_PRODUCT $SENTINEL_VERSION" ]] ||
   die "Sentinel application binary version is not $SENTINEL_VERSION"

@@ -467,8 +467,8 @@ mod tests {
             )
             .unwrap();
         sqlx::query(
-            "INSERT INTO users (id, email, password_hash, role, created_at, updated_at)
-             VALUES (?, 'doctor@example.test', 'hash', 'admin', ?, ?)",
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at)
+             VALUES (?, 'doctor-admin', 'hash', ?, ?)",
         )
         .bind(&user)
         .bind(&now)

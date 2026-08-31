@@ -1,8 +1,8 @@
 use crate::{
-    auth::verify_password,
     config::Config,
     error::{AppError, Result},
 };
+use sarmg_admin_auth::verify_password;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -252,28 +252,28 @@ mod tests {
         let mut source_limited = LoginRateLimiter::new(8, policy, generous);
         let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         assert!(source_limited
-            .record(source, account_digest("one@example.com"), now)
+            .record(source, account_digest("admin-one"), now)
             .is_none());
         assert!(source_limited
-            .record(source, account_digest("two@example.com"), now)
+            .record(source, account_digest("admin-two"), now)
             .is_none());
         assert!(source_limited
-            .record(source, account_digest("three@example.com"), now)
+            .record(source, account_digest("admin-three"), now)
             .is_some());
         assert!(!source_limited
             .accounts
             .entries
-            .contains_key(&account_digest("three@example.com")));
+            .contains_key(&account_digest("admin-three")));
         assert!(source_limited
             .record(
                 source,
-                account_digest("four@example.com"),
+                account_digest("admin-four"),
                 now + Duration::from_secs(30),
             )
             .is_none());
 
         let mut account_limited = LoginRateLimiter::new(8, generous, policy);
-        let account = account_digest("target@example.com");
+        let account = account_digest("target-admin");
         assert!(account_limited
             .record(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), account, now)
             .is_none());
@@ -288,7 +288,7 @@ mod tests {
         for octet in 1..=10 {
             bounded.record(
                 IpAddr::V4(Ipv4Addr::new(198, 51, 100, octet)),
-                account_digest(&format!("user-{octet}@example.com")),
+                account_digest(&format!("admin-{octet}")),
                 now,
             );
         }

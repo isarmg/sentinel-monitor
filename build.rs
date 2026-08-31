@@ -7,6 +7,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SENTINEL_SOURCE_REVISION");
 
     let target = env::var("TARGET").expect("Cargo must provide TARGET");
+    assert_eq!(
+        target, "x86_64-unknown-linux-gnu",
+        "Sentinel server builds support only x86_64-unknown-linux-gnu"
+    );
     let source_revision =
         env::var("SENTINEL_SOURCE_REVISION").unwrap_or_else(|_| "unbound".to_owned());
     assert!(

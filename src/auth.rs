@@ -1,87 +1,42 @@
 use crate::{
     config::Config,
     error::{AppError, Result},
-    models::UserView,
     protocol::CONTRACT,
     AppState,
-};
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
 };
 use axum::{
     body::Body,
     extract::{FromRequestParts, State},
     http::{
-        header::{COOKIE, HOST, ORIGIN},
-        request::Parts,
-        uri::Authority,
-        HeaderMap, Method, Request,
+        header::COOKIE, request::Parts, HeaderMap, HeaderName, HeaderValue, Method, Request, Uri,
     },
     middleware::Next,
     response::Response,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hkdf::Hkdf;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use rand::RngCore;
+use sarmg_admin_auth::{
+    is_token_shape, parse_cookie_value, random_token, require_administrator_same_origin,
+    require_canonical_administrator_username, require_csrf_token_matches_hash,
+    require_current_password_hash, token_hash, validate_password, AdministratorOriginMode,
+    CSRF_HEADER, HOST_HEADER, ORIGIN_HEADER, SEC_FETCH_SITE_HEADER,
+};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::time::Duration;
-use subtle::ConstantTimeEq;
-use url::Url;
 use uuid::Uuid;
 
 const PRODUCTION_SESSION_COOKIE: &str = "__Host-sentinel_session";
 const DEVELOPMENT_SESSION_COOKIE: &str = "sentinel_session";
-const PRODUCTION_CSRF_COOKIE: &str = "__Host-sentinel_csrf";
-const DEVELOPMENT_CSRF_COOKIE: &str = "sentinel_csrf";
-const TOKEN_BYTES: usize = 32;
-const MAX_TOKEN_LENGTH: usize = 128;
 const MEDIA_JWT_KEY_SALT: &[u8] = b"sentinel-monitor/0.2.0/media-jwt/signing-key";
 const MEDIA_JWT_KEY_INFO: &[u8] = b"sentinel-media-jwt-v2/HS256";
 
 #[derive(Clone)]
 pub struct CurrentUser {
     pub id: Uuid,
-    pub email: String,
-    pub role: String,
-    pub active: bool,
-    pub last_login_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub username: String,
     pub(crate) session_id: Uuid,
-}
-
-impl CurrentUser {
-    pub fn require_admin(&self) -> Result<()> {
-        if self.role == "admin" {
-            Ok(())
-        } else {
-            Err(AppError::Forbidden)
-        }
-    }
-
-    pub fn require_operator(&self) -> Result<()> {
-        if self.role == "admin" || self.role == "operator" {
-            Ok(())
-        } else {
-            Err(AppError::Forbidden)
-        }
-    }
-
-    pub fn view(&self) -> UserView {
-        UserView {
-            id: self.id,
-            email: self.email.clone(),
-            role: self.role.clone(),
-            active: self.active,
-            last_login_at: self.last_login_at,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -114,12 +69,7 @@ struct SessionUserRow {
     csrf_digest: Vec<u8>,
     absolute_expires_at: DateTime<Utc>,
     user_id: Uuid,
-    email: String,
-    role: String,
-    active: bool,
-    last_login_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    username: String,
 }
 
 struct AuthenticatedBrowserSession {
@@ -149,8 +99,8 @@ pub async fn enforce_browser_security(
         return Ok(next.run(request).await);
     }
 
-    validate_same_origin(request.headers())?;
-    if request.uri().path() != "/auth/login" {
+    validate_same_origin(request.headers(), request.uri(), &state.config)?;
+    if request.uri().path() != admin_api_relative_path(sarmg_contracts::ADMIN_LOGIN_PATH) {
         let session = authenticate_browser_session(request.headers(), &state).await?;
         validate_csrf(request.headers(), &session.csrf_digest)?;
         request.extensions_mut().insert(session.user);
@@ -158,24 +108,15 @@ pub async fn enforce_browser_security(
     Ok(next.run(request).await)
 }
 
-pub fn hash_password(password: &str) -> Result<String> {
-    if password.len() < 12 {
-        return Err(AppError::Validation("密码至少需要12个字符".into()));
-    }
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|error| AppError::Internal(format!("password hash failed: {error}")))
+fn admin_api_relative_path(path: &'static str) -> &'static str {
+    path.strip_prefix("/api/v2")
+        .expect("Foundation administrator path must use /api/v2")
 }
 
-pub fn verify_password(password: &str, encoded: &str) -> bool {
-    let Ok(hash) = PasswordHash::new(encoded) else {
-        return false;
-    };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &hash)
-        .is_ok()
+pub fn hash_administrator_password(password: &str) -> Result<String> {
+    validate_password(password).map_err(|error| AppError::Validation(error.to_string()))?;
+    sarmg_admin_auth::hash_password(password)
+        .map_err(|error| AppError::Internal(format!("password hash failed: {error}")))
 }
 
 pub async fn issue_session(
@@ -189,8 +130,10 @@ pub async fn issue_session(
         now + chrono_duration(state.config.session_idle_ttl)?,
         absolute_expires_at,
     );
-    let token = random_token();
-    let csrf_token = random_token();
+    let token = random_token()
+        .map_err(|error| AppError::Internal(format!("session token failed: {error}")))?;
+    let csrf_token = random_token()
+        .map_err(|error| AppError::Internal(format!("CSRF token failed: {error}")))?;
     let session_id = Uuid::new_v4();
 
     let mut transaction = state.pool.begin().await?;
@@ -210,8 +153,8 @@ pub async fn issue_session(
     )
     .bind(session_id)
     .bind(user_id)
-    .bind(token_digest(&token).to_vec())
-    .bind(token_digest(&csrf_token).to_vec())
+    .bind(token_hash(&token).to_vec())
+    .bind(token_hash(&csrf_token).to_vec())
     .bind(session_version)
     .bind(now)
     .bind(now)
@@ -236,6 +179,23 @@ pub async fn revoke_session(state: &AppState, session_id: Uuid) -> Result<()> {
         .execute(&state.pool)
         .await?;
     Ok(())
+}
+
+/// 为安全的会话查询签发新的 CSRF token。只保存摘要，明文只返回一次。
+pub async fn rotate_csrf_token(state: &AppState, session_id: Uuid) -> Result<String> {
+    let token = random_token()
+        .map_err(|error| AppError::Internal(format!("CSRF token failed: {error}")))?;
+    let changed = sqlx::query(
+        "UPDATE browser_sessions SET csrf_digest = ? WHERE id = ? AND revoked_at IS NULL",
+    )
+    .bind(token_hash(&token).to_vec())
+    .bind(session_id)
+    .execute(&state.pool)
+    .await?;
+    if changed.rows_affected() != 1 {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(token)
 }
 
 pub fn issue_media_token(
@@ -338,22 +298,8 @@ pub fn session_cookie(token: &str, config: &Config) -> String {
     )
 }
 
-pub fn csrf_cookie(token: &str, config: &Config) -> String {
-    persistent_cookie(
-        csrf_cookie_name(config),
-        token,
-        config,
-        false,
-        state_cookie_max_age(config),
-    )
-}
-
 pub fn expired_session_cookie(config: &Config) -> String {
     persistent_cookie(session_cookie_name(config), "", config, true, 0)
-}
-
-pub fn expired_csrf_cookie(config: &Config) -> String {
-    persistent_cookie(csrf_cookie_name(config), "", config, false, 0)
 }
 
 pub fn session_cookie_name(config: &Config) -> &'static str {
@@ -364,15 +310,8 @@ pub fn session_cookie_name(config: &Config) -> &'static str {
     }
 }
 
-pub fn csrf_cookie_name(config: &Config) -> &'static str {
-    if config.development_mode {
-        DEVELOPMENT_CSRF_COOKIE
-    } else {
-        PRODUCTION_CSRF_COOKIE
-    }
-}
-
 pub async fn bootstrap_admin(state: &AppState) -> Result<()> {
+    validate_persisted_administrator_credentials(state).await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(&state.pool)
         .await?;
@@ -389,21 +328,45 @@ pub async fn bootstrap_admin(state: &AppState) -> Result<()> {
                 "BOOTSTRAP_ADMIN_PASSWORD is required while the users table is empty".into(),
             )
         })?;
-    let hash = hash_password(password)?;
+    let hash = hash_administrator_password(password)?;
     let id = Uuid::new_v4();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
-         VALUES (?, ?, ?, 'admin', 1, ?, ?)",
+        "INSERT INTO users (id, username, password_hash, active, created_at, updated_at) \
+         VALUES (?, ?, ?, 1, ?, ?)",
     )
     .bind(id)
-    .bind(&state.config.bootstrap_admin_email)
+    .bind(&state.config.bootstrap_admin_username)
     .bind(hash)
     .bind(now)
     .bind(now)
     .execute(&state.pool)
     .await?;
-    tracing::info!(email = %state.config.bootstrap_admin_email, "bootstrap administrator created");
+    tracing::info!(username = %state.config.bootstrap_admin_username, "bootstrap administrator created");
+    Ok(())
+}
+
+/// Validate every persisted control-plane identity before the listener starts.
+/// There is deliberately no alternate username or password-hash fallback.
+async fn validate_persisted_administrator_credentials(state: &AppState) -> Result<()> {
+    let credentials = sqlx::query_as::<_, (Uuid, String, String)>(
+        "SELECT id, username, password_hash FROM users ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    for (id, username, password_hash) in credentials {
+        require_canonical_administrator_username(&username).map_err(|error| {
+            AppError::Internal(format!(
+                "persisted administrator {id} has a non-canonical username: {error}"
+            ))
+        })?;
+        require_current_password_hash(&password_hash).map_err(|error| {
+            AppError::Internal(format!(
+                "persisted administrator {id} has a non-current password hash: {error}"
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -411,20 +374,19 @@ async fn authenticate_browser_session(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedBrowserSession> {
-    let token = cookie_token(headers, session_cookie_name(&state.config))
-        .filter(|token| !token.is_empty() && token.len() <= MAX_TOKEN_LENGTH)
-        .ok_or(AppError::Unauthorized)?;
+    let token =
+        cookie_token(headers, session_cookie_name(&state.config)).ok_or(AppError::Unauthorized)?;
     let now = Utc::now();
     let row = sqlx::query_as::<_, SessionUserRow>(
         "SELECT s.id AS session_id, s.csrf_digest, s.absolute_expires_at, \
-                u.id AS user_id, u.email, u.role, u.active, u.last_login_at, u.created_at, u.updated_at \
+                u.id AS user_id, u.username \
          FROM browser_sessions s \
          JOIN users u ON u.id = s.user_id \
          WHERE s.token_digest = ? AND s.revoked_at IS NULL \
            AND s.session_version = u.session_version AND u.active = 1 \
            AND s.idle_expires_at > ? AND s.absolute_expires_at > ?",
     )
-    .bind(token_digest(&token).to_vec())
+    .bind(token_hash(&token).to_vec())
     .bind(now)
     .bind(now)
     .fetch_optional(&state.pool)
@@ -457,67 +419,36 @@ async fn authenticate_browser_session(
         csrf_digest: row.csrf_digest,
         user: CurrentUser {
             id: row.user_id,
-            email: row.email,
-            role: row.role,
-            active: row.active,
-            last_login_at: row.last_login_at,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            username: row.username,
             session_id: row.session_id,
         },
     })
 }
 
 fn validate_csrf(headers: &HeaderMap, expected_digest: &[u8]) -> Result<()> {
-    let token = headers
-        .get("x-csrf-token")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty() && value.len() <= MAX_TOKEN_LENGTH)
-        .ok_or(AppError::Forbidden)?;
-    let digest = token_digest(token);
-    if expected_digest.len() != digest.len()
-        || expected_digest.ct_eq(digest.as_slice()).unwrap_u8() != 1
-    {
-        return Err(AppError::Forbidden);
-    }
-    Ok(())
+    let name = HeaderName::from_static(CSRF_HEADER);
+    let values = raw_header_values(headers, &name);
+    require_csrf_token_matches_hash(&values, expected_digest).map_err(|_| AppError::Forbidden)
 }
 
-fn validate_same_origin(headers: &HeaderMap) -> Result<()> {
-    let host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(AppError::Forbidden)?;
-    let authority = host.parse::<Authority>().map_err(|_| AppError::Forbidden)?;
-    let raw_origin = headers
-        .get(ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .ok_or(AppError::Forbidden)?;
-    let origin = Url::parse(raw_origin).map_err(|_| AppError::Forbidden)?;
-    if !matches!(origin.scheme(), "http" | "https")
-        || !origin.username().is_empty()
-        || origin.password().is_some()
-        || origin.path() != "/"
-        || origin.query().is_some()
-        || origin.fragment().is_some()
-    {
-        return Err(AppError::Forbidden);
+fn validate_same_origin(headers: &HeaderMap, uri: &Uri, config: &Config) -> Result<()> {
+    let mode = if config.development_mode {
+        AdministratorOriginMode::LoopbackDevelopmentHttp
+    } else {
+        AdministratorOriginMode::ProductionHttps
+    };
+    let origin_name = HeaderName::from_static(ORIGIN_HEADER);
+    let host_name = HeaderName::from_static(HOST_HEADER);
+    let site_name = HeaderName::from_static(SEC_FETCH_SITE_HEADER);
+    let origins = raw_header_values(headers, &origin_name);
+    let mut hosts = raw_header_values(headers, &host_name);
+    if let Some(authority) = uri.authority() {
+        hosts.push(authority.as_str().as_bytes());
     }
-    let origin_host = origin.host_str().ok_or(AppError::Forbidden)?;
-    if normalize_host(origin_host) != normalize_host(authority.host()) {
-        return Err(AppError::Forbidden);
-    }
-    match authority.port_u16() {
-        Some(port) if origin.port_or_known_default() != Some(port) => Err(AppError::Forbidden),
-        None if origin.port().is_some() => Err(AppError::Forbidden),
-        _ => Ok(()),
-    }
-}
-
-fn normalize_host(host: &str) -> String {
-    host.trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase()
+    let sites = raw_header_values(headers, &site_name);
+    require_administrator_same_origin(mode, &origins, &hosts, &sites)
+        .map(|_| ())
+        .map_err(|_| AppError::Forbidden)
 }
 
 fn is_state_changing(method: &Method) -> bool {
@@ -527,22 +458,31 @@ fn is_state_changing(method: &Method) -> bool {
     )
 }
 
-fn random_token() -> String {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn token_digest(token: &str) -> [u8; 32] {
-    Sha256::digest(token.as_bytes()).into()
-}
-
 fn cookie_token(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
-    let cookies = headers.get(COOKIE)?.to_str().ok()?;
-    cookies.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        (name == cookie_name).then(|| value.to_string())
-    })
+    let cookies = single_cookie_header(headers)?;
+    parse_cookie_value(cookies, cookie_name)
+        .filter(|value| is_token_shape(value))
+        .map(str::to_owned)
+}
+
+fn single_cookie_header(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(COOKIE).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+fn raw_header_values<'headers>(
+    headers: &'headers HeaderMap,
+    name: &HeaderName,
+) -> Vec<&'headers [u8]> {
+    headers
+        .get_all(name)
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .collect()
 }
 
 fn persistent_cookie(
@@ -573,7 +513,8 @@ fn chrono_duration(duration: Duration) -> Result<ChronoDuration> {
 
 #[cfg(test)]
 mod tests {
-    use super::MediaClaims;
+    use super::{cookie_token, random_token, MediaClaims};
+    use axum::http::{header::COOKIE, HeaderMap, HeaderValue};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -600,7 +541,7 @@ mod tests {
         unknown
             .as_object_mut()
             .expect("claims object")
-            .insert("legacy".into(), json!(true));
+            .insert("unknown_field".into(), json!(true));
         assert!(serde_json::from_value::<MediaClaims>(unknown).is_err());
 
         let mut missing = current_claims();
@@ -609,5 +550,44 @@ mod tests {
             .expect("claims object")
             .remove("jti");
         assert!(serde_json::from_value::<MediaClaims>(missing).is_err());
+    }
+
+    #[test]
+    fn browser_cookie_requires_one_header_one_name_and_current_token_shape() {
+        let token = random_token().expect("generate canonical session token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("other=x; sentinel_session={token}"))
+                .expect("valid test Cookie header"),
+        );
+        assert_eq!(
+            cookie_token(&headers, "sentinel_session"),
+            Some(token.clone())
+        );
+
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!(
+                "sentinel_session={token}; sentinel_session={token}"
+            ))
+            .expect("valid duplicate-cookie test header"),
+        );
+        assert_eq!(cookie_token(&headers, "sentinel_session"), None);
+
+        headers.insert(COOKIE, HeaderValue::from_static("sentinel_session=short"));
+        assert_eq!(cookie_token(&headers, "sentinel_session"), None);
+
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("sentinel_session={token}"))
+                .expect("valid first Cookie header"),
+        );
+        headers.append(
+            COOKIE,
+            HeaderValue::from_str(&format!("sentinel_session={token}"))
+                .expect("valid second Cookie header"),
+        );
+        assert_eq!(cookie_token(&headers, "sentinel_session"), None);
     }
 }

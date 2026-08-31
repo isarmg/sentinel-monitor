@@ -8,7 +8,7 @@ source "$REPOSITORY_ROOT/native/common.sh"
 TEST_ROOT="$(mktemp -d)"
 SOURCE_FIXTURE="$TEST_ROOT/source"
 INSTALL_ROOT="$TEST_ROOT/opt/isarmg/sentinel-monitor"
-CONFIG_ROOT="$TEST_ROOT/etc/isarmg/sentinel-monitor"
+CONFIG_ROOT="$TEST_ROOT/etc/isarmg"
 STATE_ROOT="$TEST_ROOT/var/lib/isarmg/sentinel-monitor"
 RUNTIME_ROOT="$TEST_ROOT/run/isarmg/sentinel-monitor"
 BUILD_ROOT="$TEST_ROOT/build"
@@ -57,7 +57,6 @@ printf '%s\n' '<!doctype html><script type="module" src="/assets/app.js"></scrip
   >"$SOURCE_FIXTURE/web-dist/index.html"
 printf '%s\n' 'console.log("sentinel lifecycle")' >"$SOURCE_FIXTURE/web-dist/assets/app.js"
 printf '%s\n' 'body { color: #123456; }' >"$SOURCE_FIXTURE/web-dist/assets/app.css"
-printf '%s\n' 'POISON_FROM_OLD_LAYOUT=must-not-be-imported' >"$SOURCE_FIXTURE/.env.native"
 
 FAKE_MEDIA="$TEST_ROOT/fake-mediamtx"
 cat >"$FAKE_MEDIA" <<'EOF'
@@ -106,7 +105,7 @@ target=x86_64-unknown-linux-gnu
 wire_protocol=sentinel-wire-v2
 api_prefix=/api/v2
 schema_revision=1
-schema_sha256=b089342e00e672d6e6c679e15f331c90e599129371042a37948a4b53e5f8e49e
+schema_sha256=f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0
 credential_envelope_revision=1
 credential_contract_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 static_contract_sha256=${FAKE_STATIC_CONTRACT:?}
@@ -248,7 +247,7 @@ ln -s -- "$TEST_ROOT/bad-config-real" "$TEST_ROOT/bad-config-link"
 if env \
   PATH="$FAKE_BIN:$PATH" \
   SENTINEL_NATIVE_INSTALL_ROOT="$INSTALL_ROOT" \
-  SENTINEL_NATIVE_CONFIG_DIR="$TEST_ROOT/bad-config-link/sentinel" \
+  SENTINEL_NATIVE_CONFIG_DIR="$TEST_ROOT/bad-config-link" \
   SENTINEL_NATIVE_STATE_DIR="$STATE_ROOT" \
   SENTINEL_NATIVE_RUNTIME_DIR="$RUNTIME_ROOT" \
   "$INSTALL_ROOT/releases/0.2.0/native/bootstrap.sh" >"$TEST_ROOT/symlink-config.out" 2>&1; then
@@ -258,7 +257,7 @@ fi
 # A final configuration file symlink is never treated as an existing config.
 BAD_FINAL_CONFIG="$TEST_ROOT/bad-final-config"
 mkdir -p -- "$BAD_FINAL_CONFIG"
-chmod 0700 -- "$BAD_FINAL_CONFIG"
+chmod 0755 -- "$BAD_FINAL_CONFIG"
 printf '%s\n' 'must-not-be-read' >"$TEST_ROOT/symlink-env-target"
 ln -s -- "$TEST_ROOT/symlink-env-target" "$BAD_FINAL_CONFIG/sentinel-monitor.env"
 if env \
@@ -276,9 +275,6 @@ run_operation "$INSTALL_ROOT/releases/0.2.0/native/bootstrap.sh" >"$BOOTSTRAP_OU
 ENV_FILE="$CONFIG_ROOT/sentinel-monitor.env"
 [[ "$(stat -c '%a' "$ENV_FILE")" == "600" ]] || fail "environment file is not mode 0600"
 grep -q '^STATIC_DIR=.*/releases/0.2.0/web$' "$ENV_FILE" || fail "STATIC_DIR is not release-pinned"
-if grep -q 'POISON_FROM_OLD_LAYOUT' "$ENV_FILE"; then
-  fail "bootstrap imported .env.native"
-fi
 JWT_VALUE="$(sed -n 's/^APP_JWT_SECRET=//p' "$ENV_FILE")"
 KEY_VALUE="$(sed -n 's/^CREDENTIALS_KEY=//p' "$ENV_FILE")"
 PASSWORD_VALUE="$(sed -n 's/^BOOTSTRAP_ADMIN_PASSWORD=//p' "$ENV_FILE")"
@@ -299,7 +295,7 @@ fi
 sed -i 's/^BOOTSTRAP_ADMIN_PASSWORD=.*/BOOTSTRAP_ADMIN_PASSWORD=operator-reviewed-password-0.2.0/' "$ENV_FILE"
 chmod 0600 -- "$ENV_FILE"
 run_operation "$INSTALL_ROOT/releases/0.2.0/native/bootstrap.sh" --confirm-config >/dev/null
-[[ ! -e "$CONFIG_ROOT/REVIEW-SECRETS-BEFORE-START" ]] || fail "review marker was not cleared"
+[[ ! -e "$CONFIG_ROOT/sentinel-monitor.REVIEW-SECRETS-BEFORE-START" ]] || fail "review marker was not cleared"
 
 # Failure after spawning the companion rolls back only this invocation and
 # leaves no stale PID file or surviving process.

@@ -2,13 +2,13 @@
 name = "sentinel-monitor"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.98"
 description = "Maintainable Rust control plane for browser-based camera monitoring"
 build = "build.rs"
 
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1"
-argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
@@ -23,12 +23,15 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 roxmltree = "0.20"
 rusqlite = { version = "0.32", features = ["bundled"] }
+sarmg-admin-auth = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
+sarmg-contracts = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
+sarmg-error = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
+sarmg-server-target = { version = "=0.3.0", git = "https://github.com/isarmg/sarmg-foundation.git", rev = "1fe326081cfd896f05ff502e80f99504797c14c6" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "derive"] }
-subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

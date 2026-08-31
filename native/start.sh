@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+[[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] || {
+  printf '%s\n' 'Sentinel release runtime requires x86_64 Linux' >&2
+  exit 1
+}
+
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 # shellcheck source=/dev/null
 source "$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)/common.sh"

@@ -40,10 +40,10 @@ mod tests {
             format!("sentinel-monitor/{}", env!("CARGO_PKG_VERSION"))
         );
 
-        let web = include_str!("../clients/web/src/main.js");
-        assert!(web.contains("import { apiPath } from \"./protocol.js\";"));
+        let web = include_str!("../clients/web/src/api.ts");
+        assert!(web.contains("export function apiPath"));
         assert!(!web.contains("\"/api/"));
-        let vite = include_str!("../clients/web/vite.config.js");
+        let vite = include_str!("../clients/web/vite.config.ts");
         assert!(vite.contains("\"/api/v2\": \"http://127.0.0.1:8080\""));
         assert!(!vite.contains("\"/api\":"));
 

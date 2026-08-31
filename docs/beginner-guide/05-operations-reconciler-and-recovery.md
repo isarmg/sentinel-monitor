@@ -24,21 +24,23 @@ reconciler 在事务内 claim 可执行 operation，并更新全局/资源租约
 ## 5.4 执行顺序
 
 ```text
-claim -> decrypt current request/credential -> validate again
- -> call MediaMTX -> classify result -> terminal transaction + audit outbox
+claim -> decrypt current credential -> validate again
+ -> call MediaMTX -> classify result -> fenced terminal transaction
 ```
 
 外部调用不持有长 SQLite 写事务。完成事务必须检查 lease/operation 仍由当前 worker 拥有。
 
 ## 5.5 重启恢复
 
-启动时 pending 可继续；上一进程遗留的 running 转为 unknown，因为无法知道 MediaMTX 是否已经执行。
-系统不通过“再发一次”猜测。操作者核对 actual state 后采取新的明确意图或外部恢复流程。
+启动时 pending 可继续；只有 operation lease 已过期的 running 转为 unknown，因为其外部效果无法证明。
+租约仍有效的 owner 保持不变，启动过程不会清空健康所有权。系统不把 unknown 当普通失败盲目重发；
+操作者核对 actual state 后采取新的明确意图。
 
-## 5.6 审计 Outbox
+## 5.6 审计的当前边界
 
-requested 和 completion 审计与业务状态同事务写入 outbox，再由有界 worker 投递/整理。这样崩溃不会让
-业务成功而审计消失。稳定事件 ID 使重投可幂等。
+摄像头 create/update/delete 的审计行与业务意图在同一事务写入 `audit_logs`。登录和 PTZ 成功后的审计
+使用 best-effort 单独写入，失败会记录 warning。当前 Schema 没有 outbox、外部 sink、投递 worker 或
+重投合同；若未来要求外部必达审计，必须新增完整的持久投递状态机，不能把当前表描述成 outbox。
 
 ## 5.7 Reconcile 的边界
 
@@ -47,8 +49,8 @@ requested 和 completion 审计与业务状态同事务写入 outbox，再由有
 
 ## 5.8 故障注入
 
-测试调用前失败、远端明确拒绝、响应前断线、响应解析失败、完成事务失败、lease 过期、进程 kill、重启
-和 outbox 重投。断言状态与审计，而非只断言 HTTP mock 次数。
+测试调用前失败、远端明确拒绝、响应前断线、响应解析失败、完成事务失败、lease 过期、健康 lease、
+进程 kill 和重启。分别断言 operation、desired/applied path 与审计行，不只断言 HTTP mock 次数。
 
 ## 5.9 处置 unknown
 

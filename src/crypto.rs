@@ -189,7 +189,6 @@ fn malformed_envelope() -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::Aead;
     use base64::engine::general_purpose::STANDARD;
 
     fn box_under_test() -> SecretBox {
@@ -209,7 +208,14 @@ mod tests {
             assert!(schema.contains(field.database_name()));
         }
         assert!(schema.contains("username_enc BLOB"));
-        assert!(!schema.contains("username TEXT"));
+        let camera_table = schema
+            .split_once("CREATE TABLE cameras (")
+            .and_then(|(_, remainder)| remainder.split_once("\n);"))
+            .map(|(table, _)| table)
+            .expect("current schema must contain the cameras table");
+        assert!(!camera_table
+            .lines()
+            .any(|line| line.trim_start().starts_with("username ")));
     }
 
     #[test]
@@ -254,15 +260,9 @@ mod tests {
     }
 
     #[test]
-    fn old_raw_and_bare_base64_ciphertexts_are_not_accepted() {
+    fn malformed_non_envelope_ciphertexts_are_not_accepted() {
         let master_key = [0x42; 32];
-        let legacy = Aes256Gcm::new_from_slice(&master_key).unwrap();
-        let nonce = [0x11; 12];
-        let ciphertext = legacy
-            .encrypt(Nonce::from_slice(&nonce), b"legacy-password".as_slice())
-            .unwrap();
-        let mut raw = nonce.to_vec();
-        raw.extend(ciphertext);
+        let raw = b"not-a-current-credential-envelope".to_vec();
         let secrets = SecretBox::new(&master_key);
         let camera_id = Uuid::new_v4();
         assert!(secrets
@@ -292,10 +292,10 @@ mod tests {
         wrong_product.product = "another-product".into();
         cases.push(serde_json::to_vec(&wrong_product).unwrap());
         let mut wrong_version = envelope.clone();
-        wrong_version.application_version = "0.1.0".into();
+        wrong_version.application_version = "noncurrent-version".into();
         cases.push(serde_json::to_vec(&wrong_version).unwrap());
         let mut wrong_key = envelope.clone();
-        wrong_key.key_id = "previous-key".into();
+        wrong_key.key_id = "unknown-key".into();
         cases.push(serde_json::to_vec(&wrong_key).unwrap());
         let mut wrong_revision = envelope.clone();
         wrong_revision.envelope_revision = 2;

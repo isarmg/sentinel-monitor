@@ -15,7 +15,9 @@ npm run build
 ## 2.2 临时实验环境
 
 为数据库、runtime、recordings、MediaMTX config 与 binary 分别创建受保护临时路径；生成仅用于实验的
-32 字节 credential key 和管理员密码。所有路径使用绝对路径，避免工作目录变化改变身份。
+32 字节 credential key 和管理员密码，并设置 `BOOTSTRAP_ADMIN_USERNAME=admin`（或其他 Foundation
+canonical username）。这个值只初始化 Server 管理账户；摄像头的 RTSP/ONVIF username 仍在摄像头表中
+独立加密。所有路径使用绝对路径，避免工作目录变化改变身份。
 
 ## 2.3 第一次开发启动
 
@@ -42,7 +44,7 @@ cargo +1.98.0 run -- serve
 - 两个进程各自只存在一个实例；
 - 创建操作持久化并到达可解释终态；
 - 浏览器只拿短期播放授权；
-- 重启后 pending 可继续、残留 running 变为 unknown；
+- 重启后 pending 可继续；只有 operation lease 已过期的 running 才转为 unknown，健康 owner 不被改写；
 - offline/online doctor 都通过。
 
 ## 2.7 常见失败
@@ -52,6 +54,7 @@ cargo +1.98.0 run -- serve
 | MediaMTX 拒绝启动 | binary SHA、版本、config exact contract |
 | Sentinel 拒绝库 | metadata、DDL SHA、lease、密文或锁 |
 | 登录循环 | HTTPS、Secure Cookie、Origin/Host、系统时钟 |
+| 登录 400 | 请求是否精确为 `username/password`，username 是否符合 3–64 bytes canonical 规则 |
 | operation 不结束 | reconciler lease、MediaMTX API、网络 |
 | 无画面 | RTSP source、publisher、JWT、代理 WHEP/HLS 路由 |
 

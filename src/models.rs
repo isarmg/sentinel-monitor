@@ -10,9 +10,8 @@ use uuid::Uuid;
 #[derive(Clone, sqlx::FromRow)]
 pub struct UserRecord {
     pub id: Uuid,
-    pub email: String,
+    pub username: String,
     pub password_hash: String,
-    pub role: String,
     pub active: bool,
     pub session_version: i64,
     pub last_login_at: Option<DateTime<Utc>>,
@@ -23,8 +22,7 @@ pub struct UserRecord {
 #[derive(Clone, Serialize)]
 pub struct UserView {
     pub id: Uuid,
-    pub email: String,
-    pub role: String,
+    pub username: String,
     pub active: bool,
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -35,8 +33,7 @@ impl From<UserRecord> for UserView {
     fn from(value: UserRecord) -> Self {
         Self {
             id: value.id,
-            email: value.email,
-            role: value.role,
+            username: value.username,
             active: value.active,
             last_login_at: value.last_login_at,
             created_at: value.created_at,
@@ -47,23 +44,14 @@ impl From<UserRecord> for UserView {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
-    pub email: String,
+    pub username: String,
     pub password: String,
-    pub role: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateUserRequest {
-    pub role: Option<String>,
     pub password: Option<String>,
     pub active: Option<bool>,
 }
@@ -264,6 +252,7 @@ pub struct AuditRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sarmg_contracts::AdministratorLoginRequest;
     use serde::de::DeserializeOwned;
     use serde_json::json;
 
@@ -273,15 +262,14 @@ mod tests {
 
     #[test]
     fn every_public_request_dto_rejects_unknown_fields() {
-        rejects_unknown::<LoginRequest>(json!({
-            "email": "user@example.test",
+        rejects_unknown::<AdministratorLoginRequest>(json!({
+            "username": "test-user",
             "password": "a-password",
             "unknown": true
         }));
         rejects_unknown::<CreateUserRequest>(json!({
-            "email": "user@example.test",
+            "username": "test-user",
             "password": "a-password",
-            "role": "viewer",
             "unknown": true
         }));
         rejects_unknown::<UpdateUserRequest>(json!({ "unknown": true }));
@@ -298,13 +286,22 @@ mod tests {
 
     #[test]
     fn required_public_request_fields_cannot_be_omitted() {
-        assert!(serde_json::from_value::<LoginRequest>(json!({
-            "email": "user@example.test"
+        assert!(serde_json::from_value::<AdministratorLoginRequest>(json!({
+            "email": "admin@example.test",
+            "password": "a-password"
         }))
         .is_err());
         assert!(serde_json::from_value::<CreateUserRequest>(json!({
-            "email": "user@example.test",
+            "email": "admin@example.test",
             "password": "a-password"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<AdministratorLoginRequest>(json!({
+            "username": "test-user"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<CreateUserRequest>(json!({
+            "username": "test-user"
         }))
         .is_err());
         assert!(serde_json::from_value::<CreateCameraRequest>(json!({

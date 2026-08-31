@@ -8,9 +8,15 @@ CREATE TABLE product_metadata (
 
 CREATE TABLE users (
     id TEXT PRIMARY KEY,
-    email TEXT NOT NULL,
+    username TEXT NOT NULL CHECK (
+        length(username) BETWEEN 3 AND 64
+        AND username = lower(username)
+        AND username NOT GLOB '*[^a-z0-9._-]*'
+        AND substr(username, 1, 1) GLOB '[a-z0-9]'
+        AND substr(username, -1, 1) GLOB '[a-z0-9]'
+        AND instr(username, '@') = 0
+    ),
     password_hash TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
     active INTEGER NOT NULL DEFAULT 1,
     last_login_at TEXT,
     created_at TEXT NOT NULL,
@@ -18,7 +24,7 @@ CREATE TABLE users (
     session_version INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE UNIQUE INDEX users_email_lower_idx ON users (LOWER(email));
+CREATE UNIQUE INDEX users_username_idx ON users (username);
 
 CREATE TABLE cameras (
     id TEXT PRIMARY KEY,

@@ -1,8 +1,7 @@
 use crate::{
     auth::{
-        bootstrap_admin, csrf_cookie, csrf_cookie_name, decode_media_token,
-        encode_media_claims_for_test, issue_media_token, issue_session, session_cookie,
-        session_cookie_name, IssuedBrowserSession,
+        bootstrap_admin, decode_media_token, encode_media_claims_for_test, issue_media_token,
+        issue_session, session_cookie, session_cookie_name, IssuedBrowserSession,
     },
     background::{camera_path, emit_event},
     config::Config,
@@ -220,10 +219,7 @@ impl From<IssuedBrowserSession> for BrowserCredentials {
 
 impl BrowserCredentials {
     fn cookie_header(&self) -> String {
-        format!(
-            "sentinel_session={}; sentinel_csrf={}",
-            self.token, self.csrf_token
-        )
+        format!("sentinel_session={}", self.token)
     }
 }
 
@@ -303,7 +299,7 @@ impl TestContext {
             jwt_secret: b"sentinel-test-jwt-secret-32-bytes".to_vec(),
             credentials_key: [7; 32],
             runtime_directory: std::env::temp_dir(),
-            bootstrap_admin_email: "admin@example.com".into(),
+            bootstrap_admin_username: "admin".into(),
             bootstrap_admin_password: Some("bootstrap-password".into()),
             development_mode: true,
             session_idle_ttl: Duration::from_secs(1_800),
@@ -361,17 +357,63 @@ impl TestContext {
         bootstrap_admin(&self.state)
             .await
             .expect("bootstrap administrator");
-        let (id, session_version) = sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT id, session_version FROM users WHERE role = 'admin'",
-        )
-        .fetch_one(&self.state.pool)
-        .await
-        .expect("load administrator id");
+        let (id, session_version) =
+            sqlx::query_as::<_, (Uuid, i64)>("SELECT id, session_version FROM users")
+                .fetch_one(&self.state.pool)
+                .await
+                .expect("load administrator id");
         let session = issue_session(&self.state, id, session_version)
             .await
             .expect("issue administrator session");
         (id, session.into())
     }
+}
+
+#[tokio::test]
+async fn startup_rejects_noncanonical_admin_identity_and_noncurrent_password_hash() {
+    let context = TestContext::current().await;
+    bootstrap_admin(&context.state)
+        .await
+        .expect("bootstrap current administrator");
+    let current_hash: String = sqlx::query_scalar("SELECT password_hash FROM users")
+        .fetch_one(&context.state.pool)
+        .await
+        .expect("load current administrator hash");
+
+    sqlx::query("UPDATE users SET password_hash = 'malformed-password-hash'")
+        .execute(&context.state.pool)
+        .await
+        .expect("install invalid test hash");
+    let error = bootstrap_admin(&context.state)
+        .await
+        .expect_err("non-current administrator hash must fail startup");
+    assert!(error.to_string().contains("non-current password hash"));
+
+    let mut connection = context
+        .state
+        .pool
+        .acquire()
+        .await
+        .expect("acquire connection for corruption fixture");
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *connection)
+        .await
+        .expect("disable CHECK constraints for corruption fixture");
+    sqlx::query("UPDATE users SET password_hash = ?, username = 'admin@example.com'")
+        .bind(current_hash)
+        .execute(&mut *connection)
+        .await
+        .expect("install non-canonical test username");
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(&mut *connection)
+        .await
+        .expect("restore CHECK constraints after corruption fixture");
+    drop(connection);
+    let error = bootstrap_admin(&context.state)
+        .await
+        .expect_err("non-canonical administrator username must fail startup");
+    assert!(error.to_string().contains("non-canonical username"));
+    context.state.pool.close().await;
 }
 
 async fn send_json(
@@ -400,8 +442,8 @@ async fn send_request(
         BrowserRequestContext {
             credentials: Some(credentials),
             csrf_token: Some(&credentials.csrf_token),
-            host: Some("sentinel.test"),
-            origin: Some("https://sentinel.test"),
+            host: Some("127.0.0.1"),
+            origin: Some("http://127.0.0.1"),
             source: None,
         },
         value,
@@ -424,7 +466,9 @@ async fn send_custom_request(
         builder = builder.header(HOST, host);
     }
     if let Some(origin) = context.origin {
-        builder = builder.header(ORIGIN, origin);
+        builder = builder
+            .header(ORIGIN, origin)
+            .header("sec-fetch-site", "same-origin");
     }
     if let Some(credentials) = context.credentials {
         builder = builder.header(COOKIE, credentials.cookie_header());
@@ -445,11 +489,24 @@ async fn send_custom_request(
         .expect("serve test request")
 }
 
-fn login_credentials(headers: &HeaderMap, config: &Config) -> BrowserCredentials {
+async fn login_credentials(response: Response, config: &Config) -> BrowserCredentials {
+    assert_eq!(
+        response.headers()[axum::http::header::CACHE_CONTROL],
+        "no-store, private, max-age=0"
+    );
+    let token = set_cookie_value(response.headers(), session_cookie_name(config));
+    let body = response_json(response).await;
+    assert_eq!(body["authenticated"], json!(true));
+    assert_eq!(body["role"], json!("admin"));
+    assert!(body["user_id"].is_string());
+    assert!(body["username"].is_string());
     BrowserCredentials {
         session_id: None,
-        token: set_cookie_value(headers, session_cookie_name(config)),
-        csrf_token: set_cookie_value(headers, csrf_cookie_name(config)),
+        token,
+        csrf_token: body["csrf_token"]
+            .as_str()
+            .expect("login response csrf_token")
+            .to_string(),
     }
 }
 
@@ -465,18 +522,18 @@ fn set_cookie_value(headers: &HeaderMap, name: &str) -> String {
         .unwrap_or_else(|| panic!("missing {name} Set-Cookie header"))
 }
 
-async fn send_login(app: &Router, email: &str, password: &str, source: SocketAddr) -> Response {
+async fn send_login(app: &Router, username: &str, password: &str, source: SocketAddr) -> Response {
     send_custom_request(
         app,
         Method::POST,
         "/api/v2/auth/login",
         BrowserRequestContext {
-            host: Some("sentinel.test"),
-            origin: Some("https://sentinel.test"),
+            host: Some("127.0.0.1"),
+            origin: Some("http://127.0.0.1"),
             source: Some(source),
             ..Default::default()
         },
-        Some(json!({ "email": email, "password": password })),
+        Some(json!({ "username": username, "password": password })),
     )
     .await
 }
@@ -658,16 +715,30 @@ async fn current_database_accepts_all_required_creation_timestamps() {
             "/api/v2/users",
             &token,
             json!({
-                "email": "operator@example.com",
-                "password": "operator-password",
-                "role": "operator"
+                "username": "managed-admin",
+                "password": "managed-admin-password"
             }),
         )
         .await,
         StatusCode::CREATED
     );
-    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = ?")
-        .bind("operator@example.com")
+    assert_eq!(
+        send_json(
+            &app,
+            Method::POST,
+            "/api/v2/users",
+            &token,
+            json!({
+                "username": " MANAGED-ADMIN ",
+                "password": "another-managed-admin-password"
+            }),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "normalized administrator usernames must remain unique"
+    );
+    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = ?")
+        .bind("managed-admin")
         .fetch_one(&context.state.pool)
         .await
         .expect("load created user");
@@ -730,7 +801,7 @@ async fn current_database_accepts_all_required_creation_timestamps() {
 #[tokio::test]
 async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     let context = TestContext::current().await;
-    let (admin_id, token) = context.bootstrap().await;
+    let (admin_id, mut token) = context.bootstrap().await;
     sqlx::query(
         "UPDATE users SET active = 1, last_login_at = ?, created_at = ?, updated_at = ? WHERE id = ?",
     )
@@ -743,14 +814,18 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
     .expect("set recognizable persisted user values");
     let app = routes::router(context.state.clone());
 
-    let response = send_request(&app, Method::GET, "/api/v2/me", &token, None).await;
+    let response = send_request(&app, Method::GET, "/api/v2/auth/session", &token, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let current_user = response_json(response).await;
-    assert_eq!(current_user["id"], json!(admin_id));
-    assert_eq!(current_user["active"], json!(true));
-    assert_eq!(current_user["last_login_at"], json!("2024-03-04T05:06:07Z"));
-    assert_eq!(current_user["created_at"], json!("2024-01-02T03:04:05Z"));
-    assert_eq!(current_user["updated_at"], json!("2024-05-06T07:08:09Z"));
+    assert_eq!(current_user["authenticated"], json!(true));
+    assert_eq!(current_user["user_id"], json!(admin_id));
+    assert_eq!(current_user["username"], json!("admin"));
+    assert_eq!(current_user["role"], json!("admin"));
+    assert_eq!(current_user.as_object().expect("session object").len(), 5);
+    token.csrf_token = current_user["csrf_token"]
+        .as_str()
+        .expect("rotated csrf token")
+        .to_string();
 
     for (name, stream) in [
         ("Target Camera", "rtsp://camera.example/target"),
@@ -789,7 +864,7 @@ async fn current_database_updates_cameras_filters_and_acknowledges_events() {
         .bind(target_id)
         .execute(&context.state.pool)
         .await
-        .expect("set recognizable old camera update time");
+        .expect("set recognizable camera update time sentinel");
 
     let response = send_request(
         &app,
@@ -1036,9 +1111,9 @@ async fn invalid_camera_envelopes_fail_before_database_or_media_side_effects() {
     let mut invalid_envelopes = vec![vec![0x11; 48]];
     for (field, value) in [
         ("product", json!("another-product")),
-        ("application_version", json!("0.1.0")),
+        ("application_version", json!("noncurrent-version")),
         ("envelope_revision", json!(2)),
-        ("key_id", json!("previous-key")),
+        ("key_id", json!("unknown-key")),
         ("unknown", json!(true)),
     ] {
         let mut invalid = envelope.clone();
@@ -1384,13 +1459,13 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
     bootstrap_admin(&context.state)
         .await
         .expect("bootstrap administrator");
-    let admin_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE role = 'admin'")
+    let admin_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users")
         .fetch_one(&context.state.pool)
         .await
         .expect("load administrator id");
     let app = routes::router(context.state.clone());
     let login_body = json!({
-        "email": "admin@example.com",
+        "username": "admin",
         "password": "bootstrap-password"
     });
 
@@ -1399,7 +1474,7 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
         Method::POST,
         "/api/v2/auth/login",
         BrowserRequestContext {
-            host: Some("sentinel.test"),
+            host: Some("127.0.0.1"),
             ..Default::default()
         },
         Some(login_body.clone()),
@@ -1411,8 +1486,8 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
         Method::POST,
         "/api/v2/auth/login",
         BrowserRequestContext {
-            host: Some("sentinel.test"),
-            origin: Some("https://attacker.test"),
+            host: Some("127.0.0.1"),
+            origin: Some("http://attacker.test"),
             ..Default::default()
         },
         Some(login_body.clone()),
@@ -1425,15 +1500,15 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
         Method::POST,
         "/api/v2/auth/login",
         BrowserRequestContext {
-            host: Some("sentinel.test"),
-            origin: Some("https://sentinel.test"),
+            host: Some("127.0.0.1"),
+            origin: Some("http://127.0.0.1"),
             ..Default::default()
         },
         Some(login_body),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let credentials = login_credentials(response.headers(), &context.state.config);
+    let credentials = login_credentials(response, &context.state.config).await;
     assert!(!credentials.token.is_empty());
     assert!(!credentials.csrf_token.is_empty());
 
@@ -1463,14 +1538,9 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
     assert!(production_session_cookie.contains("; Secure"));
     assert!(production_session_cookie.contains("; HttpOnly"));
     assert!(production_session_cookie.contains("; SameSite=Strict"));
-    let production_csrf_cookie = csrf_cookie("csrf-token", &production);
-    assert!(production_csrf_cookie.starts_with("__Host-sentinel_csrf=csrf-token;"));
-    assert!(production_csrf_cookie.contains("; Secure"));
-    assert!(!production_csrf_cookie.contains("HttpOnly"));
-
     let bearer_only = Request::builder()
         .method(Method::GET)
-        .uri("/api/v2/me")
+        .uri("/api/v2/auth/session")
         .header(AUTHORIZATION, format!("Bearer {}", credentials.token))
         .body(Body::empty())
         .expect("build bearer-only browser request");
@@ -1501,9 +1571,15 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
     assert_eq!(response.status(), StatusCode::OK);
 
     assert_eq!(
-        send_request(&app, Method::GET, "/api/v2/me", &credentials, None)
-            .await
-            .status(),
+        send_request(
+            &app,
+            Method::GET,
+            "/api/v2/auth/session",
+            &credentials,
+            None
+        )
+        .await
+        .status(),
         StatusCode::OK
     );
     drop(app);
@@ -1516,7 +1592,7 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
         send_request(
             &restarted_app,
             Method::GET,
-            "/api/v2/me",
+            "/api/v2/auth/session",
             &credentials,
             None,
         )
@@ -1528,12 +1604,12 @@ async fn browser_session_persists_across_reopen_and_machine_tokens_remain_separa
 }
 
 #[tokio::test]
-async fn protocol_v1_routes_json_and_tokens_are_rejected_without_side_effects() {
+async fn unknown_routes_and_malformed_current_inputs_are_rejected_without_side_effects() {
     let context = TestContext::current().await;
     bootstrap_admin(&context.state)
         .await
         .expect("bootstrap administrator");
-    let admin_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE role = 'admin'")
+    let admin_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users")
         .fetch_one(&context.state.pool)
         .await
         .expect("load administrator id");
@@ -1548,39 +1624,39 @@ async fn protocol_v1_routes_json_and_tokens_are_rejected_without_side_effects() 
     .await
     .expect("capture protocol side effects");
 
-    let old_login = send_custom_request(
+    let unknown_post = send_custom_request(
         &app,
         Method::POST,
-        "/api/auth/login",
+        "/not-an-api-route",
         BrowserRequestContext {
             host: Some("sentinel.test"),
             origin: Some("https://sentinel.test"),
             ..Default::default()
         },
         Some(json!({
-            "email": "admin@example.com",
+            "username": "admin",
             "password": "bootstrap-password"
         })),
     )
     .await;
-    assert!(!old_login.status().is_success());
-    let old_me = send_custom_request(
+    assert!(!unknown_post.status().is_success());
+    let unknown_get = send_custom_request(
         &app,
         Method::GET,
-        "/api/me",
+        "/another-unknown-route",
         BrowserRequestContext::default(),
         None,
     )
     .await;
-    assert!(!old_me.status().is_success());
+    assert!(!unknown_get.status().is_success());
 
     for malformed_login in [
         json!({
-            "email": "admin@example.com",
+            "username": "admin",
             "password": "bootstrap-password",
             "remember": true
         }),
-        json!({ "email": "admin@example.com" }),
+        json!({ "username": "admin" }),
     ] {
         let response = send_custom_request(
             &app,
@@ -1637,27 +1713,22 @@ async fn protocol_v1_routes_json_and_tokens_are_rejected_without_side_effects() 
     .await;
     assert!(!response.status().is_success());
 
-    let now = Utc::now().timestamp() as u64;
-    let legacy_token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &json!({
-            "sub": admin_id.to_string(),
-            "camera_id": camera_id,
-            "path": "camera/main",
-            "actions": ["read"],
-            "kind": "media",
-            "iat": now,
-            "exp": now + 300
-        }),
-        &jsonwebtoken::EncodingKey::from_secret(&context.state.config.jwt_secret),
-    )
-    .expect("encode pre-0.2 media token");
+    let mut wrong_protocol_claims = current_claims.clone();
+    wrong_protocol_claims.protocol = "unsupported-media-protocol".into();
+    let wrong_protocol_token = encode_media_claims_for_test(
+        &serde_json::to_value(wrong_protocol_claims).expect("serialize wrong protocol claims"),
+        &context.state.config,
+    );
     let response = send_custom_request(
         &app,
         Method::POST,
         "/internal/v2/media/auth",
         BrowserRequestContext::default(),
-        Some(media_auth_payload(legacy_token, "read", "camera/main")),
+        Some(media_auth_payload(
+            wrong_protocol_token,
+            "read",
+            "camera/main",
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1670,7 +1741,7 @@ async fn protocol_v1_routes_json_and_tokens_are_rejected_without_side_effects() 
     unknown_claims
         .as_object_mut()
         .expect("claims object")
-        .insert("legacy".into(), json!(true));
+        .insert("unknown_field".into(), json!(true));
     let mut missing_claims = serde_json::to_value(&current_claims).expect("serialize claims");
     missing_claims
         .as_object_mut()
@@ -1698,7 +1769,7 @@ async fn protocol_v1_routes_json_and_tokens_are_rejected_without_side_effects() 
     unknown_media_json
         .as_object_mut()
         .expect("media payload object")
-        .insert("legacy".into(), json!(true));
+        .insert("unknown_field".into(), json!(true));
     let mut missing_media_json = current_payload;
     missing_media_json
         .as_object_mut()
@@ -1809,7 +1880,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
             .expect("load revoked session state");
     assert!(revoked);
     assert_eq!(
-        send_request(&app, Method::GET, "/api/v2/me", &first, None)
+        send_request(&app, Method::GET, "/api/v2/auth/session", &first, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1823,7 +1894,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
         .await
         .expect("expire idle session deadline");
     assert_eq!(
-        send_request(&app, Method::GET, "/api/v2/me", &second, None)
+        send_request(&app, Method::GET, "/api/v2/auth/session", &second, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1843,7 +1914,7 @@ async fn browser_session_enforces_bound_csrf_origin_revocation_and_both_expiries
     .await
     .expect("expire absolute session deadline");
     assert_eq!(
-        send_request(&app, Method::GET, "/api/v2/me", &absolute, None)
+        send_request(&app, Method::GET, "/api/v2/auth/session", &absolute, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1863,26 +1934,25 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
             "/api/v2/users",
             &admin,
             json!({
-                "email": "session-operator@example.com",
-                "password": "operator-password",
-                "role": "operator"
+                "username": "session-admin",
+                "password": "managed-admin-password"
             }),
         )
         .await,
         StatusCode::CREATED
     );
-    let (operator_id, version) = sqlx::query_as::<_, (Uuid, i64)>(
-        "SELECT id, session_version FROM users WHERE email = 'session-operator@example.com'",
+    let (managed_id, version) = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT id, session_version FROM users WHERE username = 'session-admin'",
     )
     .fetch_one(&context.state.pool)
     .await
-    .expect("load operator session version");
-    let operator: BrowserCredentials = issue_session(&context.state, operator_id, version)
+    .expect("load managed administrator session version");
+    let managed: BrowserCredentials = issue_session(&context.state, managed_id, version)
         .await
-        .expect("issue operator session")
+        .expect("issue managed administrator session")
         .into();
     assert_eq!(
-        send_request(&app, Method::GET, "/api/v2/me", &operator, None)
+        send_request(&app, Method::GET, "/api/v2/auth/session", &managed, None)
             .await
             .status(),
         StatusCode::OK
@@ -1892,7 +1962,7 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
         send_json(
             &app,
             Method::PUT,
-            &format!("/api/v2/users/{operator_id}"),
+            &format!("/api/v2/users/{managed_id}"),
             &admin,
             json!({ "password": "replacement-password" }),
         )
@@ -1901,13 +1971,13 @@ async fn password_reset_advances_version_and_invalidates_existing_sessions() {
     );
     let updated_version =
         sqlx::query_scalar::<_, i64>("SELECT session_version FROM users WHERE id = ?")
-            .bind(operator_id)
+            .bind(managed_id)
             .fetch_one(&context.state.pool)
             .await
-            .expect("load updated operator session version");
+            .expect("load updated managed administrator session version");
     assert_eq!(updated_version, version + 1);
     assert_eq!(
-        send_request(&app, Method::GET, "/api/v2/me", &operator, None)
+        send_request(&app, Method::GET, "/api/v2/auth/session", &managed, None)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -1931,12 +2001,18 @@ async fn login_budget_limits_body_and_both_bounded_rate_dimensions() {
         "192.0.2.1:41000".parse().unwrap(),
     )
     .await;
-    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let oversized_status = oversized.status();
+    let oversized_body = response_json(oversized).await;
+    assert_eq!(
+        oversized_status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "unexpected oversized response: {oversized_body}"
+    );
 
     for source in ["192.0.2.11:41000", "192.0.2.12:41000"] {
         let response = send_login(
             &app,
-            "unknown@example.com",
+            "unknown-admin",
             "wrong-password",
             source.parse().unwrap(),
         )
@@ -1945,7 +2021,7 @@ async fn login_budget_limits_body_and_both_bounded_rate_dimensions() {
     }
     let response = send_login(
         &app,
-        "UNKNOWN@example.com",
+        "UNKNOWN-ADMIN",
         "wrong-password",
         "192.0.2.13:41000".parse().unwrap(),
     )
@@ -1957,11 +2033,11 @@ async fn login_budget_limits_body_and_both_bounded_rate_dimensions() {
     context.state.login = LoginProtection::for_test(2, 2, 10, 2, Duration::from_secs(5));
     let app = routes::router(context.state.clone());
     let source = "198.51.100.20:42000".parse().unwrap();
-    for account in ["one@example.com", "two@example.com"] {
+    for account in ["admin-one", "admin-two"] {
         let response = send_login(&app, account, "wrong-password", source).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
-    let response = send_login(&app, "three@example.com", "wrong-password", source).await;
+    let response = send_login(&app, "admin-three", "wrong-password", source).await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     let retry_after = response
         .headers()
@@ -1976,6 +2052,26 @@ async fn login_budget_limits_body_and_both_bounded_rate_dimensions() {
 }
 
 #[tokio::test]
+async fn login_rejects_policy_invalid_credentials_before_account_lookup() {
+    let context = TestContext::current().await;
+    bootstrap_admin(&context.state)
+        .await
+        .expect("bootstrap administrator");
+    let app = routes::router(context.state.clone());
+    let source = "192.0.2.70:41000".parse().unwrap();
+
+    let malformed_username = send_login(&app, "admin@example.com", "valid-password", source).await;
+    assert_eq!(malformed_username.status(), StatusCode::BAD_REQUEST);
+    let malformed_password = send_login(&app, "admin", "short", source).await;
+    assert_eq!(malformed_password.status(), StatusCode::BAD_REQUEST);
+    let empty_password = send_login(&app, "admin", "", source).await;
+    assert_eq!(empty_password.status(), StatusCode::BAD_REQUEST);
+    let wrong_but_valid = send_login(&app, "unknown-admin", "wrong-password", source).await;
+    assert_eq!(wrong_but_valid.status(), StatusCode::UNAUTHORIZED);
+    context.state.pool.close().await;
+}
+
+#[tokio::test]
 async fn login_argon2_global_gate_times_out_with_retry_after() {
     let mut context = TestContext::current().await;
     bootstrap_admin(&context.state)
@@ -1986,7 +2082,7 @@ async fn login_argon2_global_gate_times_out_with_retry_after() {
 
     let response = send_login(
         &app,
-        "admin@example.com",
+        "admin",
         "bootstrap-password",
         "203.0.113.10:43000".parse().unwrap(),
     )
@@ -2030,8 +2126,8 @@ async fn production_pool_configures_every_connection_and_persists_after_reopen()
     let persisted_user = Uuid::new_v4();
     let now = Utc::now();
     sqlx::query(
-        "INSERT INTO users (id, email, password_hash, role, active, created_at, updated_at) \
-         VALUES (?, 'persisted@example.com', 'test-hash', 'viewer', 1, ?, ?)",
+        "INSERT INTO users (id, username, password_hash, active, created_at, updated_at) \
+         VALUES (?, 'persisted-admin', 'test-hash', 1, ?, ?)",
     )
     .bind(persisted_user)
     .bind(now)
@@ -2046,7 +2142,7 @@ async fn production_pool_configures_every_connection_and_persists_after_reopen()
         .await
         .expect("reopen production-configured SQLite pool");
     let loaded_user =
-        sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = 'persisted@example.com'")
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = 'persisted-admin'")
             .fetch_one(&reopened)
             .await
             .expect("load data after reopening");

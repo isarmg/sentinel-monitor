@@ -38,11 +38,11 @@ credential key 身份。只复制 `app.db` 不能形成可恢复备份；原始 
 ## 1.6 仓库地图
 
 ```text
-src/        Rust API、认证、状态、reconciler、release
-clients/web/        React/Vite 控制台
-native/     MediaMTX 生命周期和真实发行 smoke
-deploy/     环境与系统服务资产
-docs/       教程、流程、取舍和运维
+src/          Rust API、认证、状态、reconciler、release
+clients/web/  React/Vite 控制台
+config/       环境样例、MediaMTX 配置和 companion lock
+native/       MediaMTX 生命周期和真实发行 smoke
+docs/         教程、流程、取舍和运维
 ```
 
 ## 1.7 明确不做
