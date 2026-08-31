@@ -21,8 +21,8 @@ jobs:
         run: |
           node --version
           npm --version
-          npm ci --prefix web
-          npm run build --prefix web
+          npm ci --prefix clients/web
+          npm run build --prefix clients/web
 
   rust:
     runs-on: ubuntu-24.04

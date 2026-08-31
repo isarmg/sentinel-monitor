@@ -26,8 +26,9 @@ const MAX_RELEASE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
 pub(crate) const PRODUCTION_RELEASE_ROOT: &str = "/opt/isarmg/sentinel-monitor/releases/0.2.0";
 const RELOCATABLE_RELEASE_SUFFIX: &str = "opt/isarmg/sentinel-monitor/releases/0.2.0";
-const MEDIAMTX_LOCK: &[u8] = include_bytes!("../native/mediamtx.lock");
-const MEDIAMTX_CONFIG: &[u8] = include_bytes!("../native/mediamtx.yml");
+// config/ 是仓库内受审配置的唯一位置；发布包仍按运行时契约写入 config/。
+const MEDIAMTX_LOCK: &[u8] = include_bytes!("../config/mediamtx.lock");
+const MEDIAMTX_CONFIG: &[u8] = include_bytes!("../config/mediamtx.yml");
 
 const FIXED_DIRECTORIES: &[&str] = &["bin", "config", "native", "web", "web/assets"];
 const FIXED_FILES: &[(&str, u32)] = &[

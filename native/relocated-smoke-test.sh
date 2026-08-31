@@ -23,8 +23,8 @@ STATE_ROOT="$TEST_ROOT/state"
 RUNTIME_ROOT="$TEST_ROOT/runtime"
 mkdir -p -- "$WEB_ROOT" "$APP_ROOT" "$STATE_ROOT/db" "$RUNTIME_ROOT"
 
-npm ci --prefix "$REPOSITORY_ROOT/web" >/dev/null
-npm run build --prefix "$REPOSITORY_ROOT/web" -- \
+npm ci --prefix "$REPOSITORY_ROOT/clients/web" >/dev/null
+npm run build --prefix "$REPOSITORY_ROOT/clients/web" -- \
   --outDir "$WEB_ROOT" --emptyOutDir >/dev/null
 find -P "$WEB_ROOT" -type d -exec chmod 0555 -- {} +
 find -P "$WEB_ROOT" -type f -exec chmod 0444 -- {} +

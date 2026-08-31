@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use std::sync::LazyLock;
 
-const CONTRACT_SOURCE: &str = include_str!("../web/src/protocol-contract.json");
+// 浏览器客户端与 Rust 服务端读取同一份协议常量，避免各自手写 API 路径。
+const CONTRACT_SOURCE: &str = include_str!("../clients/web/src/protocol-contract.json");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,10 +40,10 @@ mod tests {
             format!("sentinel-monitor/{}", env!("CARGO_PKG_VERSION"))
         );
 
-        let web = include_str!("../web/src/main.js");
+        let web = include_str!("../clients/web/src/main.js");
         assert!(web.contains("import { apiPath } from \"./protocol.js\";"));
         assert!(!web.contains("\"/api/"));
-        let vite = include_str!("../web/vite.config.js");
+        let vite = include_str!("../clients/web/vite.config.js");
         assert!(vite.contains("\"/api/v2\": \"http://127.0.0.1:8080\""));
         assert!(!vite.contains("\"/api\":"));
 
@@ -50,16 +51,12 @@ mod tests {
         assert!(routes.contains(".nest(&CONTRACT.api_prefix, api)"));
         assert!(routes.contains(".route(&CONTRACT.media_auth_path, post(media_auth))"));
 
-        for config in [
-            include_str!("../native/mediamtx.yml"),
-            include_str!("../mediamtx.yml"),
-        ] {
-            assert!(
-                config.lines().any(|line| line
-                    .strip_prefix("authHTTPAddress: ")
-                    .is_some_and(|url| url.ends_with(&CONTRACT.media_auth_path))),
-                "MediaMTX config must use the embedded current callback path"
-            );
-        }
+        let config = include_str!("../config/mediamtx.yml");
+        assert!(
+            config.lines().any(|line| line
+                .strip_prefix("authHTTPAddress: ")
+                .is_some_and(|url| url.ends_with(&CONTRACT.media_auth_path))),
+            "MediaMTX config must use the embedded current callback path"
+        );
     }
 }

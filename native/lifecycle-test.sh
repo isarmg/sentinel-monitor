@@ -38,7 +38,7 @@ fail() {
   exit 1
 }
 
-mkdir -p -- "$SOURCE_FIXTURE/native" "$SOURCE_FIXTURE/web-dist/assets" "$FAKE_BIN"
+mkdir -p -- "$SOURCE_FIXTURE/native" "$SOURCE_FIXTURE/config" "$SOURCE_FIXTURE/web-dist/assets" "$FAKE_BIN"
 install -m 0755 -- \
   "$REPOSITORY_ROOT/native/common.sh" \
   "$REPOSITORY_ROOT/native/build.sh" \
@@ -47,7 +47,7 @@ install -m 0755 -- \
   "$REPOSITORY_ROOT/native/status.sh" \
   "$REPOSITORY_ROOT/native/stop.sh" \
   "$SOURCE_FIXTURE/native/"
-install -m 0644 -- "$REPOSITORY_ROOT/native/mediamtx.yml" "$SOURCE_FIXTURE/native/mediamtx.yml"
+install -m 0644 -- "$REPOSITORY_ROOT/config/mediamtx.yml" "$SOURCE_FIXTURE/config/mediamtx.yml"
 printf '%s\n' \
   '[package]' \
   'name = "sentinel-monitor"' \
@@ -76,14 +76,14 @@ EOF
 chmod 0755 -- "$FAKE_MEDIA"
 FAKE_MEDIA_SHA="$(sha256sum -- "$FAKE_MEDIA" | awk '{print $1}')"
 FAKE_SOURCE_REVISION="0123456789abcdef0123456789abcdef01234567"
-FAKE_CONFIG_SHA="$(sha256sum -- "$SOURCE_FIXTURE/native/mediamtx.yml" | awk '{print $1}')"
+FAKE_CONFIG_SHA="$(sha256sum -- "$SOURCE_FIXTURE/config/mediamtx.yml" | awk '{print $1}')"
 FAKE_RELEASE_CONTRACT="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 printf '%s\n' \
   '# Sentinel lifecycle fixture companion contract.' \
   'version=v1.20.0' \
   'platform=linux_amd64' \
   "sha256=$FAKE_MEDIA_SHA" \
-  >"$SOURCE_FIXTURE/native/mediamtx.lock"
+  >"$SOURCE_FIXTURE/config/mediamtx.lock"
 
 FAKE_APP="$TEST_ROOT/fake-sentinel-monitor"
 cat >"$FAKE_APP" <<'EOF'
@@ -373,6 +373,6 @@ if run_operation "$INSTALL_ROOT/releases/0.2.0/native/status.sh" >"$TEST_ROOT/ha
 fi
 
 grep -q '^sha256=25947caac403f37ec881c9be213af2cad67e344a6c7098905b0d31c17f40e336$' \
-  "$REPOSITORY_ROOT/native/mediamtx.lock" || fail "the reviewed production MediaMTX digest changed"
+  "$REPOSITORY_ROOT/config/mediamtx.lock" || fail "the reviewed production MediaMTX digest changed"
 
 echo "Sentinel native temporary-root lifecycle tests passed"

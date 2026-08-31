@@ -101,7 +101,7 @@ SOURCE_VERSION="$(awk '
 
 manifest_value() {
   local key="$1"
-  awk -F= -v key="$key" '$1 == key { print $2 }' "$SOURCE_ROOT/native/mediamtx.lock"
+  awk -F= -v key="$key" '$1 == key { print $2 }' "$SOURCE_ROOT/config/mediamtx.lock"
 }
 
 EXPECTED_MEDIA_VERSION="$(manifest_value version)"
@@ -110,9 +110,9 @@ EXPECTED_MEDIA_SHA256="$(manifest_value sha256)"
 [[ "$EXPECTED_MEDIA_PLATFORM" == "linux_amd64" ]] ||
   die "Unsupported MediaMTX companion platform: $EXPECTED_MEDIA_PLATFORM"
 [[ "$($MEDIA_SOURCE --version | tr -d '\r\n')" == "$EXPECTED_MEDIA_VERSION" ]] ||
-  die "MediaMTX source version does not match native/mediamtx.lock"
+  die "MediaMTX source version does not match config/mediamtx.lock"
 [[ "$(sha256sum -- "$MEDIA_SOURCE" | awk '{print $1}')" == "$EXPECTED_MEDIA_SHA256" ]] ||
-  die "MediaMTX source SHA-256 does not match native/mediamtx.lock"
+  die "MediaMTX source SHA-256 does not match config/mediamtx.lock"
 
 ensure_directory "$BUILD_TARGET" 755 "build target"
 TEMPORARY="$(mktemp -d "$BUILD_TARGET/release-build.XXXXXX")"
@@ -140,8 +140,8 @@ if [[ -n "$WEB_SOURCE" ]]; then
   cp -a -- "$WEB_SOURCE/." "$WEB_STAGE/"
 else
   require_command npm
-  npm ci --prefix "$SOURCE_ROOT/web"
-  npm run build --prefix "$SOURCE_ROOT/web" -- --outDir "$WEB_STAGE" --emptyOutDir
+  npm ci --prefix "$SOURCE_ROOT/clients/web"
+  npm run build --prefix "$SOURCE_ROOT/clients/web" -- --outDir "$WEB_STAGE" --emptyOutDir
 fi
 find -P "$WEB_STAGE" -type d -exec chmod 0555 -- {} +
 find -P "$WEB_STAGE" -type f -exec chmod 0444 -- {} +
@@ -178,8 +178,8 @@ STAGE="$STAGE_CONTAINER/opt/isarmg/sentinel-monitor/releases/$SENTINEL_VERSION"
 mkdir -p -- "$STAGE/bin" "$STAGE/config" "$STAGE/native" "$STAGE/web"
 install -m 0555 -- "$APP_STAGE" "$STAGE/bin/sentinel-monitor"
 install -m 0555 -- "$MEDIA_SOURCE" "$STAGE/bin/mediamtx"
-install -m 0444 -- "$SOURCE_ROOT/native/mediamtx.yml" "$STAGE/config/mediamtx.yml"
-install -m 0444 -- "$SOURCE_ROOT/native/mediamtx.lock" "$STAGE/config/mediamtx.lock"
+install -m 0444 -- "$SOURCE_ROOT/config/mediamtx.yml" "$STAGE/config/mediamtx.yml"
+install -m 0444 -- "$SOURCE_ROOT/config/mediamtx.lock" "$STAGE/config/mediamtx.lock"
 for script in common.sh bootstrap.sh start.sh status.sh stop.sh; do
   install -m 0555 -- "$SOURCE_ROOT/native/$script" "$STAGE/native/$script"
 done
