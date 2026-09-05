@@ -22,9 +22,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          coupling_pattern='UNION_|X-Union-|UnionGateway|ModuleManifest|PluginManifest|ProcessContext|sarmg[-_]platform|/modules/'
+          # The current Foundation metadata table is not a retired runtime component.
+          coupling_pattern='UNION_|X-Union-|UnionGateway|ModuleManifest|PluginManifest|ProcessContext|sarmg-platform|sarmg_platform(?!_metadata\b)|/modules/'
           coupling_matches="$(
-            git grep -nE "$coupling_pattern" -- \
+            git grep -nP "$coupling_pattern" -- \
               ':!.github/workflows/independence.yml' \
               ':!CHANGELOG.md' \
               || true
