@@ -142,6 +142,9 @@ cat >"$FAKE_BIN/curl" <<'EOF'
 if [[ "${SENTINEL_TEST_CURL_FAILURE:-}" == "1" ]]; then
   exit 22
 fi
+if [[ "${*: -1}" == */readyz ]]; then
+  printf '%s' '{"ready":true}:200'
+fi
 exit 0
 EOF
 chmod 0755 -- "$FAKE_BIN/curl"
