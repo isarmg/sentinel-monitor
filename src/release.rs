@@ -426,6 +426,9 @@ fn validate_exact_layout(entries: &BTreeMap<String, ManifestEntry>) -> Result<()
                 match Path::new(path).extension().and_then(|value| value.to_str()) {
                     Some("js") => javascript += 1,
                     Some("css") => stylesheets += 1,
+                    // Foundation fonts are compiled, hash-bound Web assets;
+                    // the embedded static manifest still validates their bytes.
+                    Some("woff2") => {}
                     _ => bail!("release contains an unexpected compiled Web asset type: {path}"),
                 }
             }
@@ -801,5 +804,51 @@ mod tests {
         assert!(!is_source_revision("v0.2.0"));
         assert!(validate_sha256(&"a".repeat(64)).is_ok());
         assert!(validate_sha256(&"A".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn exact_layout_accepts_compiled_fonts_but_rejects_other_payloads() {
+        let mut entries = BTreeMap::new();
+        for directory in FIXED_DIRECTORIES {
+            entries.insert(
+                (*directory).to_owned(),
+                ManifestEntry::Directory { mode: 0o555 },
+            );
+        }
+        for (file, mode) in FIXED_FILES {
+            entries.insert(
+                (*file).to_owned(),
+                ManifestEntry::File {
+                    mode: *mode,
+                    size: 1,
+                    sha256: "a".repeat(64),
+                },
+            );
+        }
+        for asset in [
+            "app.js",
+            "app.css",
+            "MapleMono-hash.woff2",
+            "MapleMono-Italic-hash.woff2",
+        ] {
+            entries.insert(
+                format!("web/assets/{asset}"),
+                ManifestEntry::File {
+                    mode: 0o444,
+                    size: 1,
+                    sha256: "b".repeat(64),
+                },
+            );
+        }
+        assert!(validate_exact_layout(&entries).is_ok());
+        entries.insert(
+            "web/assets/payload.exe".into(),
+            ManifestEntry::File {
+                mode: 0o444,
+                size: 1,
+                sha256: "c".repeat(64),
+            },
+        );
+        assert!(validate_exact_layout(&entries).is_err());
     }
 }
