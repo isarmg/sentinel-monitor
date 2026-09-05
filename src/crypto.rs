@@ -8,7 +8,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const PRODUCT: &str = "sentinel-monitor";
-const APPLICATION_VERSION: &str = "0.2.0";
+const APPLICATION_VERSION: &str = "0.2.1";
 pub(crate) const CREDENTIAL_ENVELOPE_REVISION: u32 = 1;
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_PLAINTEXT_BYTES: usize = 16 * 1024;

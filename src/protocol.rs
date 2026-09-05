@@ -23,7 +23,7 @@ pub static CONTRACT: LazyLock<ProtocolContract> = LazyLock::new(|| {
     assert_eq!(contract.api_prefix, "/api/v2");
     assert_eq!(contract.media_auth_path, "/internal/v2/media/auth");
     assert_eq!(contract.media_jwt_protocol, "sentinel-media-jwt-v2");
-    assert_eq!(contract.media_jwt_issuer, "sentinel-monitor/0.2.0");
+    assert_eq!(contract.media_jwt_issuer, "sentinel-monitor/0.2.1");
     assert_eq!(contract.media_jwt_audience, "sentinel-mediamtx/1.20.0");
     assert_eq!(contract.media_jwt_kind, "media");
     contract

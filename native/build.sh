@@ -66,7 +66,7 @@ require_empty_release_destination() {
       die "Releases destination must be a real directory"
     entries=("$INSTALL_ROOT/releases"/*)
     (( ${#entries[@]} == 0 )) ||
-      die "Releases destination is not empty; Sentinel 0.2.0 publication is one-shot"
+      die "Releases destination is not empty; Sentinel 0.2.1 publication is one-shot"
   fi
 }
 

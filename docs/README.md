@@ -1,6 +1,6 @@
 # Sentinel Monitor 文档总览
 
-本文档集只描述 `0.2.0` 当前实现。协议 JSON、当前 Schema、MediaMTX lock、发行 manifest 和自动化测试
+本文档集只描述 `0.2.1` 当前实现。协议 JSON、当前 Schema、MediaMTX lock、发行 manifest 和自动化测试
 是约束事实源。
 
 | 分类 | 文档 | 重点 |

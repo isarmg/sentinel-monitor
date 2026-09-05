@@ -35,7 +35,7 @@ try {
         if (path.endsWith("/events")) return route.fulfill({ json: [{ id: "event-1", camera_id: camera.id, kind: "camera.status", severity: "info", message: "验收事件", acknowledged_at: acknowledged ? time : null, created_at: time }] });
         if (path.endsWith("/system/status")) {
           if (failStatus) { failStatus = false; return route.fulfill({ status: 500, json: { code: "platform.internal", message: "SECRET database path", retryable: false, request_id: "system-failure-123" } }); }
-          return route.fulfill({ json: { service: "sentinel-monitor", version: "0.2.0", database: "ok", media_service: "ok", cameras: { total: 1, online: 0, recording: 0 }, server_time: time } });
+          return route.fulfill({ json: { service: "sentinel-monitor", version: "0.2.1", database: "ok", media_service: "ok", cameras: { total: 1, online: 0, recording: 0 }, server_time: time } });
         }
         if (path.endsWith("/audit")) return route.fulfill({ json: [{ id: "audit-1", action: "camera.updated", entity_type: "camera", entity_id: camera.id, created_at: time }] });
         if (path.endsWith("/platform/administrators")) {

@@ -1,6 +1,6 @@
 # Sentinel Monitor 完整功能与取舍清单
 
-本文按当前 `0.2.0` 工作树逐项盘点 Sentinel Monitor 的真实能力、保证、交付工具和明确边界。代码、
+本文按当前 `0.2.1` 工作树逐项盘点 Sentinel Monitor 的真实能力、保证、交付工具和明确边界。代码、
 `schema/generated/current_schema.sql`、`clients/web/src/protocol-contract.json`、`config/mediamtx.lock` 与发行 manifest 是
 最终事实源；本文不是未来愿望清单，也不把测试中不存在的行为写成已实现功能。
 
@@ -203,14 +203,14 @@ viewer。摄像头的 RTSP/ONVIF `username`、加密 `password` 和媒体 JWT `a
 | SEN-R-010 | release identity 绑定产品、版本、source revision、target、API、Schema、Web、credential 与 MediaMTX | `src/release.rs::ReleaseIdentity` | 保障 | 高 | 可把不同提交/协议/companion 拼成同名发行物 | identity JSON 与 manifest header 一致 |
 | SEN-R-011 | 全树 manifest 精确验证 path/type/mode/size/SHA，拒绝额外条目 | `verify_release`、`static_assets.rs` | 保障 | 高 | 攻击者或误部署可插入/替换资产而仍启动 | missing/extra/tamper/mode/symlink/hardlink |
 | SEN-R-012 | release root 必须是规范物理版本路径，正式父目录 root-owned | `validate_release_root`、`PRODUCTION_RELEASE_ROOT` | 保障 | 高 | 可通过 alias 或可写父目录替换已验证内容 | symlink parent、相对路径、错误 suffix、ownership |
-| SEN-R-013 | `native/build.sh` 要求 clean checkout、annotated `v0.2.0` 指向 HEAD 和 Linux AMD64 | `native/build.sh` | 开发运维 | 中 | 无法把制品稳定追溯到源码与版本 | dirty tree、lightweight/wrong tag、wrong host |
+| SEN-R-013 | `native/build.sh` 要求 clean checkout、annotated `v0.2.1` 指向 HEAD 和 Linux AMD64 | `native/build.sh` | 开发运维 | 中 | 无法把制品稳定追溯到源码与版本 | dirty tree、lightweight/wrong tag、wrong host |
 | SEN-R-014 | build 在同一文件系统 stage，验证后 no-clobber 安装固定发行目录 | `native/build.sh` | 保障 | 高 | 半写 release 或同版本覆盖会让重启内容不可预测 | 中途失败、并发 build、第二次 build |
 | SEN-R-015 | lifecycle test 使用临时根覆盖 no-clobber、Secret、锁、失败回滚和链接防御 | `native/lifecycle-test.sh` | 开发运维 | 高 | 脚本安全语义容易在普通单元测试外回归 | 临时根运行；不得访问真实 `/var/lib` |
 | SEN-R-016 | relocated smoke 使用真实 Rust/Vite/SQLite/MediaMTX 制品验证重定位和篡改拒绝 | `native/relocated-smoke-test.sh` | 开发运维 | 高 | 静态脚本检查无法证明真实发行闭包 | 真实启动、hashed assets、字节篡改、source-bound binary |
 | SEN-R-017 | CI 同时门禁 Rust fmt/check/clippy/test、Web、native 生命周期与 Caddy 当前代理合同 | `.github/workflows/ci.yml` | 开发运维 | 高 | 任一语言或交付层可独立漂移进入 main；代理可能重新指向不存在的容器 | clean checkout 全 job；锁文件模式；根级 Caddyfile/容器上游负例；三个 loopback 上游精确一次 |
 | SEN-R-018 | Rust 固定 1.98.0，Cargo.lock 与 npm package-lock 都纳入提交 | `rust-toolchain.toml`、lockfiles | 开发运维 | 中 | 依赖解析随时间变化，构建结果不可复现 | `--locked`、`npm ci`、工具链版本 |
 | SEN-R-019 | 源配置统一为 `config/`，主机部署资产为 `deploy/`，客户端为 `clients/web/`，生命周期为 `native/`；根目录不放散落部署文件 | 仓库目录结构、CI proxy gate | 开发运维 | 低 | 配置、客户端和部署资产散落，开发者难以判断事实源；双份代理模板会漂移 | 目录清单；根级 `Caddyfile` 不存在；脚本/文档不引用已移除位置 |
-| SEN-R-020 | 当前 Schema identity 为 application `sentinel-monitor`、version 0.2.0、revision 1、SHA `f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0`；`users` 只有 username，没有 email/role | `src/current_schema.sql`、`src/sqlite.rs`、`native/lifecycle-test.sh` | 保障 | 高 | 发行物、运行库和运维文档可能各自接受不同管理身份 DDL | code-owned fingerprint 重算、metadata/现场 schema、列清单、lifecycle identity 一致 |
+| SEN-R-020 | 当前 Schema identity 为 application `sentinel-monitor`、version 0.2.1、revision 1、SHA `f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0`；`users` 只有 username，没有 email/role | `src/current_schema.sql`、`src/sqlite.rs`、`native/lifecycle-test.sh` | 保障 | 高 | 发行物、运行库和运维文档可能各自接受不同管理身份 DDL | code-owned fingerprint 重算、metadata/现场 schema、列清单、lifecycle identity 一致 |
 
 ## 11. 可观测性、容量和故障边界
 

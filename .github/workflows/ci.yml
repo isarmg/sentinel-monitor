@@ -83,6 +83,15 @@ jobs:
           shellcheck "${scripts[@]}"
       - name: Exercise immutable native release lifecycle
         run: ./native/lifecycle-test.sh
+      - name: Exercise the real pinned companion configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          companion_dir="$(mktemp -d)"
+          curl --fail --location --retry 3 --output "$companion_dir/mediamtx.tar.gz" \
+            https://github.com/bluenviron/mediamtx/releases/download/v1.20.0/mediamtx_v1.20.0_linux_amd64.tar.gz
+          tar -xzf "$companion_dir/mediamtx.tar.gz" -C "$companion_dir" mediamtx
+          python3 native/companion-smoke-test.py "$companion_dir/mediamtx"
       - name: Validate the current native proxy contract
         shell: bash
         run: |

@@ -16,7 +16,7 @@ use crate::crypto::{credential_contract_sha256, CREDENTIAL_ENVELOPE_REVISION};
 
 const MANIFEST_FORMAT: &str = "sentinel-release-v2";
 const PRODUCT: &str = "sentinel-monitor";
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.2.1";
 const TARGET: &str = sarmg_server_target::SERVER_TARGET_TRIPLE;
 const SERVER_BINARY: &str = "bin/sentinel-monitor";
 const MANIFEST_NAME: &str = "RELEASE-MANIFEST";
@@ -24,8 +24,8 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RELEASE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
-pub(crate) const PRODUCTION_RELEASE_ROOT: &str = "/opt/isarmg/sentinel-monitor/releases/0.2.0";
-const RELOCATABLE_RELEASE_SUFFIX: &str = "opt/isarmg/sentinel-monitor/releases/0.2.0";
+pub(crate) const PRODUCTION_RELEASE_ROOT: &str = "/opt/isarmg/sentinel-monitor/releases/0.2.1";
+const RELOCATABLE_RELEASE_SUFFIX: &str = "opt/isarmg/sentinel-monitor/releases/0.2.1";
 // config/ 是仓库内受审配置的唯一位置；发布包仍按运行时契约写入 config/。
 const MEDIAMTX_LOCK: &[u8] = include_bytes!("../config/mediamtx.lock");
 const MEDIAMTX_CONFIG: &[u8] = include_bytes!("../config/mediamtx.yml");
@@ -305,7 +305,7 @@ fn validate_release_root(root: &Path) -> Result<PathBuf> {
     );
     ensure!(
         canonical.ends_with(RELOCATABLE_RELEASE_SUFFIX),
-        "RELEASE_ROOT must end in the fixed Sentinel 0.2.0 physical release path"
+        "RELEASE_ROOT must end in the fixed Sentinel 0.2.1 physical release path"
     );
     Ok(canonical)
 }
@@ -797,11 +797,24 @@ mod tests {
     }
 
     #[test]
+    fn companion_contract_explicitly_disables_unmanaged_protocols() {
+        let config = std::str::from_utf8(MEDIAMTX_CONFIG).unwrap();
+        for protocol in ["rtmp", "srt", "moq"] {
+            let prefix = format!("{protocol}:");
+            let declarations: Vec<_> = config
+                .lines()
+                .filter(|line| line.starts_with(&prefix))
+                .collect();
+            assert_eq!(declarations, [format!("{protocol}: no")]);
+        }
+    }
+
+    #[test]
     fn source_revision_and_hashes_have_exact_encodings() {
         assert!(is_source_revision(
             "0123456789abcdef0123456789abcdef01234567"
         ));
-        assert!(!is_source_revision("v0.2.0"));
+        assert!(!is_source_revision("v0.2.1"));
         assert!(validate_sha256(&"a".repeat(64)).is_ok());
         assert!(validate_sha256(&"A".repeat(64)).is_err());
     }

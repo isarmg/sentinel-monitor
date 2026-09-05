@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 
-const MEDIA_JWT_KEY_SALT: &[u8] = b"sentinel-monitor/0.2.0/media-jwt/signing-key";
+const MEDIA_JWT_KEY_SALT: &[u8] = b"sentinel-monitor/0.2.1/media-jwt/signing-key";
 const MEDIA_JWT_KEY_INFO: &[u8] = b"sentinel-media-jwt-v2/HS256";
 
 #[derive(Clone)]
@@ -146,7 +146,7 @@ mod tests {
 
     fn current_claims() -> Value {
         json!({
-            "protocol":"sentinel-media-jwt-v2","iss":"sentinel-monitor/0.2.0",
+            "protocol":"sentinel-media-jwt-v2","iss":"sentinel-monitor/0.2.1",
             "aud":"sentinel-mediamtx/1.20.0","kind":"media","sub":Uuid::new_v4(),
             "camera_id":Uuid::new_v4(),"path":"camera/main","actions":["read"],
             "jti":Uuid::new_v4(),"iat":1,"nbf":1,"exp":121

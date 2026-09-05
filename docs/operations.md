@@ -18,7 +18,7 @@ Node `26.7.0`。
 ## 1. 唯一生产布局
 
 ```text
-/opt/isarmg/sentinel-monitor/releases/0.2.0/
+/opt/isarmg/sentinel-monitor/releases/0.2.1/
 ├─ RELEASE-MANIFEST
 ├─ bin/{sentinel-monitor,mediamtx}
 ├─ web/{index.html,assets/...}
@@ -43,11 +43,11 @@ Node `26.7.0`。
 export SENTINEL_MEDIAMTX_SOURCE=/absolute/path/to/mediamtx
 ./native/build.sh
 
-/opt/isarmg/sentinel-monitor/releases/0.2.0/native/bootstrap.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.1/native/bootstrap.sh
 sudoedit /etc/isarmg/sentinel-monitor.env
-/opt/isarmg/sentinel-monitor/releases/0.2.0/native/bootstrap.sh --confirm-config
-/opt/isarmg/sentinel-monitor/releases/0.2.0/native/start.sh
-/opt/isarmg/sentinel-monitor/releases/0.2.0/native/status.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.1/native/bootstrap.sh --confirm-config
+/opt/isarmg/sentinel-monitor/releases/0.2.1/native/start.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.1/native/status.sh
 ```
 
 构建机必须是 Linux x86_64，并安装 Rust `1.98.0` 的 `rustfmt`、`clippy` 组件及
@@ -57,7 +57,7 @@ sudoedit /etc/isarmg/sentinel-monitor.env
 停止：
 
 ```bash
-/opt/isarmg/sentinel-monitor/releases/0.2.0/native/stop.sh
+/opt/isarmg/sentinel-monitor/releases/0.2.1/native/stop.sh
 ```
 
 同版本第二次 build/bootstrap 不覆盖既有 release 或环境文件。bootstrap 不启动服务，只读取固定的平面
@@ -107,7 +107,7 @@ sudo systemctl reload caddy
 
 ```text
 application=sentinel-monitor
-application_version=0.2.0
+application_version=0.2.1
 schema_revision=3
 schema_sha256=18d53d385fda41458b3e614d0f1179409a52137b52c6b69ce5c3c19c5f84506e
 ```
@@ -131,9 +131,9 @@ set -a
 source /etc/isarmg/sentinel-monitor.env
 set +a
 
-"/opt/isarmg/sentinel-monitor/releases/0.2.0/bin/sentinel-monitor" doctor --offline
-/opt/isarmg/sentinel-monitor/releases/0.2.0/native/start.sh
-"/opt/isarmg/sentinel-monitor/releases/0.2.0/bin/sentinel-monitor" doctor
+"/opt/isarmg/sentinel-monitor/releases/0.2.1/bin/sentinel-monitor" doctor --offline
+/opt/isarmg/sentinel-monitor/releases/0.2.1/native/start.sh
+"/opt/isarmg/sentinel-monitor/releases/0.2.1/bin/sentinel-monitor" doctor
 ```
 
 offline 检查 Schema、SQLite integrity/foreign keys、回滚写探针、录像目录、全量凭据解密、MediaMTX

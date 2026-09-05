@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 readonly SENTINEL_PRODUCT="sentinel-monitor"
-readonly SENTINEL_VERSION="0.2.0"
+readonly SENTINEL_VERSION="0.2.1"
 readonly SENTINEL_STATIC_FORMAT="sentinel-static-layout-v1"
 
 die() {
@@ -243,8 +243,8 @@ resolve_release_context() {
   [[ "$(basename "$releases_root")" == "releases" ]] ||
     die "Operational scripts must run from an immutable releases directory"
   SENTINEL_INSTALL_ROOT="$(dirname "$releases_root")"
-  [[ "$SENTINEL_RELEASE_ROOT" == */opt/isarmg/sentinel-monitor/releases/0.2.0 ]] ||
-    die "Operational scripts must use the fixed Sentinel 0.2.0 physical release suffix"
+  [[ "$SENTINEL_RELEASE_ROOT" == */opt/isarmg/sentinel-monitor/releases/0.2.1 ]] ||
+    die "Operational scripts must use the fixed Sentinel 0.2.1 physical release suffix"
   validate_absolute_path "$SENTINEL_INSTALL_ROOT" "install root"
   if [[ -n "${SENTINEL_NATIVE_INSTALL_ROOT:-}" ]]; then
     validate_absolute_path "$SENTINEL_NATIVE_INSTALL_ROOT" "SENTINEL_NATIVE_INSTALL_ROOT"
@@ -294,7 +294,7 @@ acquire_native_operation_lock() {
 
 require_runtime_contract() {
   [[ "${DATABASE_URL:-}" == "sqlite://$SENTINEL_STATE_DIR/db/app.db" ]] ||
-    die "DATABASE_URL must target the new 0.2.0 state directory"
+    die "DATABASE_URL must target the new 0.2.1 state directory"
   [[ "${STATIC_DIR:-}" == "$SENTINEL_RELEASE_ROOT/web" ]] ||
     die "STATIC_DIR must target the executing immutable release"
   [[ "${MEDIAMTX_CONFIG:-}" == "$SENTINEL_RELEASE_ROOT/config/mediamtx.yml" ]] ||
@@ -304,7 +304,7 @@ require_runtime_contract() {
   [[ "${MEDIAMTX_BINARY:-}" == "$SENTINEL_RELEASE_ROOT/bin/mediamtx" ]] ||
     die "MEDIAMTX_BINARY must target the executing immutable release"
   [[ "${RECORDINGS_DIR:-}" == "$SENTINEL_STATE_DIR/recordings" ]] ||
-    die "RECORDINGS_DIR must target the new 0.2.0 state directory"
+    die "RECORDINGS_DIR must target the new 0.2.1 state directory"
   [[ "${SENTINEL_RUNTIME_DIR:-}" == "$SENTINEL_RUNTIME_PATH" ]] ||
     die "SENTINEL_RUNTIME_DIR must target the configured runtime directory"
   [[ -n "${APP_JWT_SECRET:-}" && ${#APP_JWT_SECRET} -ge 32 ]] ||

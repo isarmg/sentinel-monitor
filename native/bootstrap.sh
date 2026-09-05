@@ -33,7 +33,7 @@ if [[ "$MODE" == "confirm" ]]; then
     assert_private_file "$SENTINEL_REVIEW_MARKER" "configuration review marker"
     rm -- "$SENTINEL_REVIEW_MARKER"
   fi
-  echo "Sentinel 0.2.0 configuration accepted. Start it with: $SENTINEL_RELEASE_ROOT/native/start.sh"
+  echo "Sentinel 0.2.1 configuration accepted. Start it with: $SENTINEL_RELEASE_ROOT/native/start.sh"
   exit 0
 fi
 

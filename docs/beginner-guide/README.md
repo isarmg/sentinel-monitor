@@ -82,7 +82,7 @@ RTSP/ONVIF 用户名、媒体 JWT `actions` 都是数据面凭据或资源范围
 `CREDENTIALS_KEY` 经 HKDF-SHA256 派生；AAD 绑定产品、版本、revision、key ID、camera UUID 和精确
 数据库字段，因此密文不能复制到另一摄像头或另一字段。
 
-当前 key ID 固定为 `sentinel-credentials-0.2.0-key-1`。产品没有 previous key/keyring，不接受旧
+当前 key ID 固定为 `sentinel-credentials-0.2.1-key-1`。产品没有 previous key/keyring，不接受旧
 `nonce || ciphertext` 或宽松 Base64。`CREDENTIALS_KEY` 丢失意味着密文不可恢复。
 
 ## 6. 一次摄像头变更

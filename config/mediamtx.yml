@@ -1,6 +1,13 @@
 logLevel: info
 logDestinations: [stdout]
 
+# Only RTSP, HLS and WebRTC belong to this companion contract. MediaMTX 1.20
+# otherwise enables additional listeners, and MoQ can create auto.key/auto.crt
+# in the process working directory. Never inherit those upstream defaults.
+rtmp: no
+srt: no
+moq: no
+
 authMethod: http
 authHTTPAddress: http://127.0.0.1:8080/internal/v2/media/auth
 authHTTPExclude:

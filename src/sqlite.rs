@@ -946,7 +946,7 @@ mod tests {
                  INSERT INTO product_metadata (
                      singleton, application, application_version, schema_revision, schema_sha256
                  ) VALUES (
-                     2, 'sentinel-monitor', '0.2.0', 1,
+                     2, 'sentinel-monitor', '0.2.1', 1,
                      'f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0'
                  )",
             ),

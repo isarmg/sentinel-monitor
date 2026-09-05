@@ -3,7 +3,7 @@
   "api_prefix": "/api/v2",
   "media_auth_path": "/internal/v2/media/auth",
   "media_jwt_protocol": "sentinel-media-jwt-v2",
-  "media_jwt_issuer": "sentinel-monitor/0.2.0",
+  "media_jwt_issuer": "sentinel-monitor/0.2.1",
   "media_jwt_audience": "sentinel-mediamtx/1.20.0",
   "media_jwt_kind": "media"
 }

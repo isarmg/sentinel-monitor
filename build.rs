@@ -1,6 +1,6 @@
 use std::{env, fs, path::PathBuf};
 
-const UNBOUND_MANIFEST: &str = "format=sentinel-static-layout-v1\napplication=sentinel-monitor\napplication_version=0.2.0\nunbound=true\n";
+const UNBOUND_MANIFEST: &str = "format=sentinel-static-layout-v1\napplication=sentinel-monitor\napplication_version=0.2.1\nunbound=true\n";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SENTINEL_STATIC_MANIFEST_PATH");

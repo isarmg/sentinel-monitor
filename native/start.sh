@@ -177,4 +177,4 @@ trap - EXIT
 STARTED_APP=""
 STARTED_MEDIA=""
 
-echo "Sentinel Monitor 0.2.0 is ready at ${SENTINEL_READY_URL:-http://127.0.0.1:8080/readyz}"
+echo "Sentinel Monitor 0.2.1 is ready at ${SENTINEL_READY_URL:-http://127.0.0.1:8080/readyz}"
