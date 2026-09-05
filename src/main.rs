@@ -4,7 +4,6 @@ mod config;
 mod crypto;
 mod doctor;
 mod error;
-mod login_security;
 mod mediamtx;
 mod models;
 mod onvif;
@@ -17,21 +16,17 @@ mod sqlite;
 mod static_assets;
 
 #[cfg(test)]
-mod sqlite_tests;
-
-#[cfg(test)]
 static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use config::Config;
 use crypto::SecretBox;
-use login_security::LoginProtection;
 use mediamtx::MediaMtxClient;
 use models::EventRecord;
 use sqlx::SqlitePool;
 use std::{path::PathBuf, sync::Arc};
-use tokio::{net::TcpListener, signal, sync::broadcast};
+use tokio::{net::TcpListener, sync::broadcast};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -42,7 +37,9 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub media: MediaMtxClient,
     pub events: broadcast::Sender<EventRecord>,
-    pub login: LoginProtection,
+    pub administrator:
+        Arc<sarmg_admin_core::AdministratorService<sarmg_admin_sqlite::SqliteAdministratorStore>>,
+    pub administrator_origin: sarmg_admin_auth::AdministratorOriginMode,
 }
 
 #[derive(Parser)]
@@ -88,7 +85,7 @@ struct DoctorArgs {
     #[arg(
         long,
         env = "SENTINEL_READY_URL",
-        default_value = "http://127.0.0.1:8080/health/ready"
+        default_value = "http://127.0.0.1:8080/readyz"
     )]
     app_ready_url: String,
     #[arg(
@@ -212,6 +209,30 @@ async fn serve(release_root: Option<&std::path::Path>) -> anyhow::Result<()> {
         config.mediamtx_playback_url.clone(),
     );
     let (events, _) = broadcast::channel(256);
+    let administrator = Arc::new(sarmg_admin_core::AdministratorService::new(
+        sarmg_admin_sqlite::SqliteAdministratorStore::new(pool.clone()),
+    ));
+    use sarmg_admin_core::AdministratorStore as _;
+    administrator.store().validate_all_administrators().await?;
+    if administrator.store().administrator_count().await? == 0 {
+        administrator
+            .bootstrap_administrator(
+                &config.bootstrap_admin_username,
+                config.bootstrap_admin_password.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "BOOTSTRAP_ADMIN_PASSWORD is required while no administrators exist"
+                    )
+                })?,
+                current_time_micros()?,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
+    let administrator_origin = if config.development_mode {
+        sarmg_admin_auth::AdministratorOriginMode::LoopbackDevelopmentHttp
+    } else {
+        sarmg_admin_auth::AdministratorOriginMode::ProductionHttps
+    };
     let state = AppState {
         secrets: SecretBox::new(&config.credentials_key),
         config: config.clone(),
@@ -219,11 +240,11 @@ async fn serve(release_root: Option<&std::path::Path>) -> anyhow::Result<()> {
         http,
         media,
         events,
-        login: LoginProtection::new(&config),
+        administrator,
+        administrator_origin,
     };
 
     reconciliation::validate_stored_camera_credentials(&state).await?;
-    auth::bootstrap_admin(&state).await?;
     let recovered = reconciliation::recover_interrupted_operations(&state.pool).await?;
     if recovered > 0 {
         tracing::warn!(
@@ -231,38 +252,86 @@ async fn serve(release_root: Option<&std::path::Path>) -> anyhow::Result<()> {
             "expired media operation leases were marked unknown for safe reconciliation"
         );
     }
-    background::spawn(state.clone());
-
     let listener = TcpListener::bind(config.bind_addr).await?;
+    let health_pool = state.pool.clone();
+    let reconcile_state = state.clone();
+    let status_state = state.clone();
+    let audit_pool = state.pool.clone();
+    let audit_delivery_pool = state.pool.clone();
+    let operations_pool = state.pool.clone();
+    let runtime =
+        sarmg_server_runtime::ServerRuntime::builder(sarmg_server_runtime::ProductDescriptor {
+            id: "sentinel-monitor".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            foundation_revision: "394c0201d85c5a331cded87db4af8fa01f6b6258".into(),
+            profile: "server-control-plane".into(),
+            capabilities: vec![
+                "admin-persistent".into(),
+                "server-runtime".into(),
+                "server-health".into(),
+                "durable-operations".into(),
+                "secure-http".into(),
+                "secure-xml".into(),
+                "secret-envelope".into(),
+            ],
+        })
+        .with_schema_identity(sqlite::current_schema_identity()?)
+        .register_metric(
+            sarmg_server_runtime::DiagnosticMetric::AuditBacklog,
+            move || {
+                let store = sarmg_operations::SqliteOperationStore::new(audit_pool.clone());
+                async move { store.pending_audit_count().await.ok() }
+            },
+        )
+        .register_metric(
+            sarmg_server_runtime::DiagnosticMetric::OperationBacklog,
+            move || {
+                let store = sarmg_operations::SqliteOperationStore::new(operations_pool.clone());
+                async move { store.active_operation_count().await.ok() }
+            },
+        )
+        .register_health_check(
+            "database",
+            sarmg_server_runtime::health_check(move || {
+                let pool = health_pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, i64>("SELECT 1")
+                        .fetch_one(&pool)
+                        .await
+                        .is_ok_and(|value| value == 1)
+                }
+            }),
+        )
+        .register_background_task(
+            "media-reconciliation",
+            sarmg_server_runtime::TaskCriticality::Critical,
+            move |shutdown| background::reconcile_loop(reconcile_state, shutdown),
+        )
+        .register_background_task(
+            "operation-audit",
+            sarmg_server_runtime::TaskCriticality::Degrading,
+            move |shutdown| background::operation_audit_loop(audit_delivery_pool, shutdown),
+        )
+        .register_background_task(
+            "camera-status",
+            sarmg_server_runtime::TaskCriticality::Degrading,
+            move |shutdown| background::status_loop(status_state, shutdown),
+        )
+        .build()
+        .await?;
+    let runtime_handle = runtime.handle();
     tracing::info!(address = %config.bind_addr, "sentinel monitor started");
-    axum::serve(
-        listener,
-        routes::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    runtime
+        .serve(listener, routes::router(state, runtime_handle)?)
+        .await?;
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c().await.expect("install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-    tracing::info!("shutdown requested");
+fn current_time_micros() -> anyhow::Result<u64> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_micros(),
+    )
+    .map_err(|_| anyhow::anyhow!("current time exceeds administrator timestamp range"))
 }

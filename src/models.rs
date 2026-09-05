@@ -8,55 +8,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Clone, sqlx::FromRow)]
-pub struct UserRecord {
-    pub id: Uuid,
-    pub username: String,
-    pub password_hash: String,
-    pub active: bool,
-    pub session_version: i64,
-    pub last_login_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Serialize)]
-pub struct UserView {
-    pub id: Uuid,
-    pub username: String,
-    pub active: bool,
-    pub last_login_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl From<UserRecord> for UserView {
-    fn from(value: UserRecord) -> Self {
-        Self {
-            id: value.id,
-            username: value.username,
-            active: value.active,
-            last_login_at: value.last_login_at,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateUserRequest {
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateUserRequest {
-    pub password: Option<String>,
-    pub active: Option<bool>,
-}
-
-#[derive(Clone, sqlx::FromRow)]
 pub struct CameraRecord {
     pub id: Uuid,
     pub name: String,
@@ -226,7 +177,7 @@ pub struct EventRecord {
     pub message: String,
     pub details: Value,
     pub acknowledged_at: Option<DateTime<Utc>>,
-    pub acknowledged_by: Option<Uuid>,
+    pub acknowledged_by: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -241,7 +192,7 @@ pub struct EventQuery {
 #[derive(Serialize, sqlx::FromRow)]
 pub struct AuditRecord {
     pub id: Uuid,
-    pub user_id: Option<Uuid>,
+    pub user_id: Option<String>,
     pub action: String,
     pub entity_type: String,
     pub entity_id: Option<Uuid>,
@@ -252,7 +203,6 @@ pub struct AuditRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sarmg_contracts::AdministratorLoginRequest;
     use serde::de::DeserializeOwned;
     use serde_json::json;
 
@@ -262,17 +212,6 @@ mod tests {
 
     #[test]
     fn every_public_request_dto_rejects_unknown_fields() {
-        rejects_unknown::<AdministratorLoginRequest>(json!({
-            "username": "test-user",
-            "password": "a-password",
-            "unknown": true
-        }));
-        rejects_unknown::<CreateUserRequest>(json!({
-            "username": "test-user",
-            "password": "a-password",
-            "unknown": true
-        }));
-        rejects_unknown::<UpdateUserRequest>(json!({ "unknown": true }));
         rejects_unknown::<CreateCameraRequest>(json!({
             "name": "Camera",
             "main_stream_url": "rtsp://camera.invalid/main",
@@ -286,24 +225,6 @@ mod tests {
 
     #[test]
     fn required_public_request_fields_cannot_be_omitted() {
-        assert!(serde_json::from_value::<AdministratorLoginRequest>(json!({
-            "email": "admin@example.test",
-            "password": "a-password"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<CreateUserRequest>(json!({
-            "email": "admin@example.test",
-            "password": "a-password"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<AdministratorLoginRequest>(json!({
-            "username": "test-user"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<CreateUserRequest>(json!({
-            "username": "test-user"
-        }))
-        .is_err());
         assert!(serde_json::from_value::<CreateCameraRequest>(json!({
             "main_stream_url": "rtsp://camera.invalid/main"
         }))

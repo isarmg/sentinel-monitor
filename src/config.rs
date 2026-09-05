@@ -3,6 +3,8 @@ use ipnet::IpNet;
 use sarmg_admin_auth::normalize_administrator_username;
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+
 #[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -13,16 +15,6 @@ pub struct Config {
     pub bootstrap_admin_username: String,
     pub bootstrap_admin_password: Option<String>,
     pub development_mode: bool,
-    pub session_idle_ttl: Duration,
-    pub session_absolute_ttl: Duration,
-    pub login_body_limit: usize,
-    pub login_rate_capacity: usize,
-    pub login_source_attempts: u32,
-    pub login_source_window: Duration,
-    pub login_account_attempts: u32,
-    pub login_account_window: Duration,
-    pub login_argon2_parallelism: usize,
-    pub login_argon2_timeout: Duration,
     pub media_token_ttl: Duration,
     pub mediamtx_api_url: String,
     pub mediamtx_playback_url: String,
@@ -38,7 +30,9 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        let bind_addr = value("BIND_ADDR", "0.0.0.0:8080")
+        // The public TLS/media gateway is the only network-facing entry. A
+        // missing BIND_ADDR therefore stays on loopback in every environment.
+        let bind_addr = value("BIND_ADDR", DEFAULT_BIND_ADDR)
             .parse::<SocketAddr>()
             .map_err(|_| "BIND_ADDR is invalid".to_string())?;
         let development_mode = match value("APP_ENV", "production").as_str() {
@@ -82,31 +76,6 @@ impl Config {
             .map_err(|error| format!("BOOTSTRAP_ADMIN_USERNAME is invalid: {error}"))?,
             bootstrap_admin_password,
             development_mode,
-            session_idle_ttl: duration_from_env("SESSION_IDLE_TTL_MINUTES", 30, 60)?,
-            session_absolute_ttl: duration_from_env("SESSION_ABSOLUTE_TTL_HOURS", 12, 3_600)?,
-            login_body_limit: bounded_usize("LOGIN_BODY_LIMIT_BYTES", 16_384, 1_024, 65_536)?,
-            login_rate_capacity: bounded_usize("LOGIN_RATE_CAPACITY", 4_096, 128, 65_536)?,
-            login_source_attempts: bounded_u64("LOGIN_SOURCE_ATTEMPTS", 30, 1, 1_000)? as u32,
-            login_source_window: Duration::from_secs(bounded_u64(
-                "LOGIN_SOURCE_WINDOW_SECS",
-                60,
-                1,
-                3_600,
-            )?),
-            login_account_attempts: bounded_u64("LOGIN_ACCOUNT_ATTEMPTS", 10, 1, 1_000)? as u32,
-            login_account_window: Duration::from_secs(bounded_u64(
-                "LOGIN_ACCOUNT_WINDOW_SECS",
-                300,
-                1,
-                86_400,
-            )?),
-            login_argon2_parallelism: bounded_usize("LOGIN_ARGON2_PARALLELISM", 2, 1, 64)?,
-            login_argon2_timeout: Duration::from_millis(bounded_u64(
-                "LOGIN_ARGON2_TIMEOUT_MS",
-                5_000,
-                100,
-                30_000,
-            )?),
             media_token_ttl: Duration::from_secs(parse_u64("MEDIA_TOKEN_TTL_SECS", 120)?),
             mediamtx_api_url: trim_slash(value("MEDIAMTX_API_URL", "http://127.0.0.1:9997")),
             mediamtx_playback_url: trim_slash(value(
@@ -151,34 +120,8 @@ fn parse_u64(name: &str, default: u64) -> Result<u64, String> {
         .map_err(|_| format!("{name} must be an unsigned integer"))
 }
 
-fn duration_from_env(name: &str, default: u64, unit_seconds: u64) -> Result<Duration, String> {
-    let value = parse_u64(name, default)?;
-    let seconds = value
-        .checked_mul(unit_seconds)
-        .ok_or_else(|| format!("{name} is too large"))?;
-    if seconds == 0 {
-        return Err(format!("{name} must be greater than zero"));
-    }
-    Ok(Duration::from_secs(seconds))
-}
-
 fn bounded_u64(name: &str, default: u64, minimum: u64, maximum: u64) -> Result<u64, String> {
     let value = parse_u64(name, default)?;
-    if (minimum..=maximum).contains(&value) {
-        Ok(value)
-    } else {
-        Err(format!("{name} must be between {minimum} and {maximum}"))
-    }
-}
-
-fn bounded_usize(
-    name: &str,
-    default: u64,
-    minimum: usize,
-    maximum: usize,
-) -> Result<usize, String> {
-    let value = parse_u64(name, default)?;
-    let value = usize::try_from(value).map_err(|_| format!("{name} is too large"))?;
     if (minimum..=maximum).contains(&value) {
         Ok(value)
     } else {
@@ -226,6 +169,13 @@ mod tests {
         assert!(validate_development_bind("0.0.0.0:8080".parse().unwrap(), true).is_err());
         assert!(validate_development_bind("192.168.1.10:8080".parse().unwrap(), true).is_err());
         assert!(validate_development_bind("0.0.0.0:8080".parse().unwrap(), false).is_ok());
+    }
+
+    #[test]
+    fn default_server_binding_is_loopback() {
+        let address = DEFAULT_BIND_ADDR.parse::<SocketAddr>().unwrap();
+        assert!(address.ip().is_loopback());
+        assert_eq!(address.port(), 8080);
     }
 
     #[test]

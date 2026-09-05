@@ -41,6 +41,7 @@ credential key 身份。只复制 `app.db` 不能形成可恢复备份；原始 
 src/          Rust API、认证、状态、reconciler、release
 clients/web/  React/Vite 控制台
 config/       环境样例、MediaMTX 配置和 companion lock
+deploy/       主机侧 Caddy 同源 TLS/媒体代理模板
 native/       MediaMTX 生命周期和真实发行 smoke
 docs/         教程、流程、取舍和运维
 ```

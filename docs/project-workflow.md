@@ -13,7 +13,8 @@ Sentinel Monitor 0.2.0
 │  ├─ 解析当前配置与 Secret
 │  ├─ 取得 database/runtime/MediaMTX 锁
 │  ├─ 验证当前 SQLite、Schema 与全部摄像头凭据
-│  └─ 启动 MediaMTX、Rust API 和 reconciler
+│  ├─ 启动只监听 loopback 的 MediaMTX、Rust API 和 reconciler
+│  └─ Caddy 将 TLS 同源入口转发到三个明确的 127.0.0.1 上游
 ├─ Administrator 控制面
 │  ├─ login/session/logout -> Session + CSRF
 │  ├─ 摄像头期望态 -> durable operation
@@ -43,6 +44,10 @@ Rust binary，生成完整 manifest，在同一文件系统暂存并验证后，
 数据库时才创建。它不启动服务、不覆盖配置、不回显随机 Secret。操作者
 编辑密码并运行 `--confirm-config` 后，`start.sh` 才按锁顺序启动 companion 和应用；运行机同样必须是
 Linux x86_64。
+
+主机代理源资产固定为 `deploy/Caddyfile`，不进入应用生命周期脚本。它只允许
+`127.0.0.1:8080/8888/8889` 三个原生进程上游；根目录不存在第二份 Caddyfile，仓库也没有容器 DNS
+兼容。CI 会拒绝根级副本、缺失模板、端口漂移和 `app:`/`mediamtx:` 上游重新出现。
 
 ## 3. 正式进程启动顺序
 
@@ -170,7 +175,7 @@ npm run build
 `build` 已把 `check:foundation` 设为硬前置，因此不能通过直接执行 Vite 跳过共享边界。构建产物完全自包含；
 浏览器运行时不解析 npm 包，也不访问 npm registry、Foundation 仓库或远程 CSS。
 构建期四个 Web 包来自 Foundation `v0.3.0` GitHub Release 归档，并由 lockfile integrity 锁定字节；
-Rust crate 由版本 `=0.3.0` 和 revision `1fe326081cfd896f05ff502e80f99504797c14c6` 双重锁定。两者都不读取
+Rust crate 由版本 `=0.3.1` 和 revision `7c6a210cd5fc8bf987e0f50fccee69b7c58cbdf0` 双重锁定。两者都不读取
 共同父目录或 sibling checkout，也不提供旧来源 fallback。
 
 ## 10. Foundation 共享层与产品层调用树
@@ -194,10 +199,11 @@ clients/web/src/main.tsx
    └─ 纸张/墨色/警示色、布局、组件和响应式品牌样式
 
 Rust/Axum
-├─ sarmg-contracts 0.3.0 -> Administrator 认证 DTO/路径和跨语言合同
-├─ sarmg-error 0.3.0 -> 严格 ErrorEnvelope/ErrorCode
-├─ sarmg-server-target 0.3.0 -> 编译期 x86_64-unknown-linux-gnu 门禁
-└─ Sentinel 产品代码 -> Schema、Cookie、Session 存储、摄像头、媒体、审计与运维
+├─ sarmg-contracts 0.3.1 -> Administrator 认证 DTO/路径和跨语言合同
+├─ sarmg-error 0.3.1 -> 严格 ErrorEnvelope/ErrorCode
+├─ sarmg-schema-identity 0.3.1 -> metadata DDL/列、指纹 framing 与 exact identity
+├─ sarmg-server-target 0.3.1 -> 编译期 x86_64-unknown-linux-gnu 门禁
+└─ Sentinel 产品代码 -> 私有 SQLite generation、Schema DDL、Cookie、Session、媒体、审计与运维
 ```
 
 共享层只统一真正跨产品的合同；它不拥有 Sentinel 的业务 DTO、数据库、媒体状态机、密码策略、Cookie

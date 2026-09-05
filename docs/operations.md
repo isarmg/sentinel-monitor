@@ -1,5 +1,16 @@
 # Sentinel Monitor 运维文档
 
+## 媒体操作人工处理与审计
+
+当前 `POST /api/v2/media/operations/{id}/resolve` 要求管理员 Session 和 CSRF，严格请求体为
+`{"resolution":"confirmed_succeeded"}`、`confirmed_failed` 或 `unable_to_confirm` 三种决定之一。
+确认成功/失败将 Unknown、Failed 或 DeadLetter 标为 Resolved；无法确认仅将 Unknown 标为 DeadLetter。
+这些决定不重放原请求。处理前必须核对 MediaMTX 的实际状态；操作者审计与平台状态同事务提交。
+
+调和结果、摄像头状态、当前 owner 的完成转换与 outbox 同事务。租约过期或本地结果提交失败进入 Unknown，
+不作为可重试失败。`operation-audit` 监督任务按事件 ID 幂等物化审计；插入和 outbox 确认同事务。
+投递失败会将该 Degrading 任务标为失败并保留积压，诊断可见；排除存储故障后重启恢复投递。
+
 本产品的正式服务端构建和运行平台只有 `x86_64-unknown-linux-gnu`。Linux aarch64、musl、Windows、macOS
 以及其他 target 都不属于可部署范围，也没有兼容分支。Rust 工具链固定为 `1.98.0`；Web 构建机固定为
 Node `26.7.0`。
@@ -17,6 +28,8 @@ Node `26.7.0`。
 /etc/isarmg/sentinel-monitor.env
 /var/lib/isarmg/sentinel-monitor/{db,recordings,logs}
 /run/isarmg/sentinel-monitor/{operations.lock,app.lock,app.pid,mediamtx.lock,mediamtx.pid}
+
+源码 `deploy/Caddyfile` -> 主机受管的 Caddy 配置
 ```
 
 版本树 root-owned、只读且无 symlink alias。本仓库不发布 systemd unit；唯一生命周期入口是 release
@@ -65,11 +78,28 @@ sudoedit /etc/isarmg/sentinel-monitor.env
 | 登录 | body/rate/Argon2 concurrency/timeout | 按 CPU/内存容量调整，不取消边界 |
 | MediaMTX | API、playback、config、contract、binary | 必须指向同一固定 release |
 | Web | `STATIC_DIR` | 必须是 release 的 `web/` 真实路径 |
-| 公网 | `PUBLIC_HLS_BASE_URL`、`PUBLIC_WEBRTC_BASE_URL` | 由同源 Caddy 路由 |
+| 监听 | `BIND_ADDR=127.0.0.1:8080` | 代码默认值和正式样例一致；仅可信本机网关访问 |
+| 公网 | `PUBLIC_HLS_BASE_URL`、`PUBLIC_WEBRTC_BASE_URL` | 保持同源相对路径，由 Caddy 路由 |
 
 MediaMTX 的 9996/9997/9998 只应在本机/受控网络可达；摄像头放入隔离 VLAN。
-仓库 `Caddyfile` 的默认站点占位为 `:80`，不是生产 TLS 证明；生产必须设置真实 `SITE_ADDRESS` 并取得
-有效证书，同时用防火墙阻止浏览器直连 Axum/MediaMTX。应用本身不终止 TLS，也不拒绝所有明文直连。
+唯一代理源模板是 `deploy/Caddyfile`。它把 WHEP、HLS 和 Sentinel 分别转发到本机
+`127.0.0.1:8889`、`127.0.0.1:8888`、`127.0.0.1:8080`，不会解析容器名，也不公开 9996/9997/9998。
+模板默认站点占位为 `:80`，不是生产 TLS 证明；生产必须在 Caddy 服务环境设置真实 `SITE_ADDRESS`（或由
+配置管理渲染为真实站点），取得有效证书，并用防火墙阻止浏览器直连 Axum/MediaMTX。应用本身不终止
+TLS，也不拒绝所有明文直连。
+
+安装或更新后至少执行：
+
+```bash
+# 由配置管理把 deploy/Caddyfile 的唯一站点块纳入主机受管配置；不要盲目覆盖其他站点。
+sudoedit /etc/caddy/Caddyfile
+sudo env SITE_ADDRESS=sentinel.example.org \
+  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+```
+
+若主机 Caddy 使用拆分 include 目录，应由配置管理安装到该目录，不要再保留根级 `Caddyfile` 副本。
+仓库没有 Docker/Compose 部署合同，`app:8080` 与 `mediamtx:8888/8889` 都是已删除的未定义目标。
 
 ## 4. 当前数据库与凭据合同
 
@@ -78,11 +108,11 @@ MediaMTX 的 9996/9997/9998 只应在本机/受控网络可达；摄像头放入
 ```text
 application=sentinel-monitor
 application_version=0.2.0
-schema_revision=1
-schema_sha256=f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0
+schema_revision=3
+schema_sha256=18d53d385fda41458b3e614d0f1179409a52137b52c6b69ce5c3c19c5f84506e
 ```
 
-`users` 表只保存管理员账户的 `id`、canonical `username`、密码摘要、启停状态、Session version 和时间
+Foundation `_sarmg_administrators` 表保存不透明 TEXT `administrator_id`、canonical `username`、密码摘要、启停状态、Session version 和微秒整数时间
 字段，不保存 email 或 `role`。username 的 Schema CHECK 精确要求 3–64 bytes、ASCII 小写、首尾
 `[a-z0-9]`、其余字符仅 `[a-z0-9._-]`；唯一索引直接作用于 canonical 值。登录 candidate 可包含首尾
 ASCII whitespace/大写，但 Foundation 规范化后才查询；`@`、Unicode、内部空白、控制字符和首尾分隔符
@@ -177,27 +207,28 @@ auth body、媒体 JWT、WHEP/HLS 播放与录像状态不使用 Administrator u
 
 ## 11. Web 设计依赖与发布证明
 
-四个 Foundation `0.3.0` Web 包都是构建期依赖，不是生产运行服务。发布机使用 `.node-version` 固定的
-Node `26.7.0`，从 lockfile 对应的精确来源安装，然后执行共享边界检查、TypeScript strict 检查和 Vite
-构建：
+当前 Web 使用 Foundation 的 admin-web、admin-shell、admin-ui、contracts、design-tokens、http-client、
+web-fonts、web-toolchain 八个构建期包，不是生产运行服务。Node 固定为 `.node-version` 的 `26.7.0`。
 
-- Web 包固定到 Foundation GitHub Release `v0.3.0` 下四个 `sarmg-<name>-0.3.0.tgz` URL；lockfile 必须
-  对 `admin-web`、`contracts`、`design-tokens`、`http-client` 分别保存相同 URL、版本和 `sha512`
-  integrity。
-- Rust crate 固定 `https://github.com/isarmg/sarmg-foundation.git`、版本 `=0.3.0` 和完整 revision
-  `1fe326081cfd896f05ff502e80f99504797c14c6`。
-- 独立 checkout/CI 不读取共同父目录中的 Foundation 源码，不允许把依赖改回 `file:` 或 `path`。
+- 当前是迁移工作区联调：Web 使用精确 `file:../../../sarmg-foundation-server/packages/<name>`，Rust 使用当前工作区 crate。
+  这不是可独立发行的消费者依赖证明，不能声称仅检出 Sentinel 就能构建。
+- P13 必须创建新的不可变 Foundation 发行版，统一 manifest、lockfile、发布身份后执行独立 checkout 验收。
+  不改写已发布 tag，不保留旧发行包或双路径。
 
 ```bash
 cd clients/web
 npm ci
 npm run check:foundation
 npm run build
+npm run test:browser
 ```
 
 `build` 自身以 `check:foundation` 为前置，不能绕开。精确工具链为 React/ReactDOM `19.2.8`、TypeScript
 `5.8.3`、Vite `7.3.6`、`@vitejs/plugin-react` `4.7.0`、`@types/react` `19.2.18` 和
-`@types/react-dom` `19.2.5`。成功后 Foundation token/reset/accessibility 和 Sentinel `styles.css` 已合并进 `dist/assets/*.css`。后续
+`@types/react-dom` `19.2.5`。Shell、登录/恢复/退出、通知、主题、诊断、Maple 字体和 UI 原语全部来自 Foundation。
+Sentinel CSS 仅保留业务布局，不覆盖平台 token 或定义私有字体。HLS 按需单独加载，完整功能保留；各资产遵循
+Foundation 512 KiB 硬限制且不发布 source map。浏览器验收使用真实 dist，覆盖两种浏览器的系统/管理员、
+摄像头、录像、事件、云台键盘停止、对话框焦点和移动明暗主题无障碍。后续
 `native/build.sh` 把该 Hash 文件写入发行 manifest，`relocated-smoke-test.sh` 证明实际归档引用它并在篡改
 后拒绝启动。生产目录中不应出现 `node_modules`、源包、`vendor/sarmg-design` 或远程 CSS URL。
 
@@ -205,22 +236,30 @@ npm run build
 当前 Foundation 来源/lockfile，重新生成整个 Web dist 和不可变 release。Foundation 版本切换属于直接
 替换当前合同，不保留并行 CSS 或媒体查询式版本 fallback。
 
+系统页的管理员管理只请求 Foundation `/api/v2/platform/administrators`，支持列表、创建、改密和停用；
+不再有 `/users` 请求或产品用户编辑器。停用不物理删除账户，不会破坏业务外键；最后一个活动管理员不能停用。
+改密/停用撤销全部会话，安全审计与写入同事务。系统页展示的“业务审计”仍来自产品 `/audit`，与平台安全审计分工明确。
+
 ### 11.1 Foundation 包的运维边界
 
 | 包 | Sentinel 使用内容 | 运维必须证明 | 不由该包负责 |
 |---|---|---|---|
 | `@sarmg/contracts` | auth 路径、Administrator DTO、ErrorEnvelope 类型与严格守卫 | 版本/来源锁定；不可信 JSON 通过守卫；未知字段拒绝 | 摄像头、录像、事件、审计等产品 DTO |
 | `@sarmg/http-client` | same-origin、Cookie、CSRF、超时、响应上限、Content-Type、错误解析 | unsafe 请求携带当前 CSRF；401 使本地 Session 失效；无跨 origin | 自动重试写操作、大文件下载、业务响应判定 |
-| `@sarmg/design-tokens` | token、scoped reset、键盘焦点、reduced motion、forced colors | `data-sarmg-scope`、CSS 摘要、无 CDN/仓库运行依赖 | Sentinel 品牌、组件、布局和全部可访问性责任 |
-| `@sarmg/admin-web` | API client、React Session hook、Vite 配置、strict tsconfig、精确工具链台账 | `check:foundation` 与 build 前置；固定三个 auth 端点 | 用户表、Cookie 属性、密码策略、Session 数据库和页面 |
+| `@sarmg/design-tokens` / `web-fonts` | token、scoped reset、Maple 字体 | `data-sarmg-scope`、无私有字体覆盖、无 CDN | 业务布局 |
+| `@sarmg/admin-web` | API client、Session 状态机、管理 API client | 当前 auth/administrators 合同、401 generation、CSRF | 业务请求 DTO |
+| `@sarmg/admin-shell` / `admin-ui` | 登录、导航、诊断、主题、通知、管理员面板及交互原语 | 共享浏览器与消费者无障碍验收 | 摄像头、录像、事件业务 |
+| `@sarmg/web-toolchain` | Vite、strict tsconfig、精确工具链、资源预算和 source map 政策 | `check:foundation`、构建与独立发行验收 | 生产服务 |
 
 ### 11.2 Foundation Rust crate 的运维边界
 
 | crate | 共享能力 | Sentinel 保留的产品责任 | 删除后果 |
 |---|---|---|---|
-| `sarmg-contracts = 0.3.0` | Administrator 路径/DTO、跨语言合同类型 | 路由挂载、密码校验、Session 持久化与业务 DTO | Rust/Web 认证合同可能静默漂移 |
-| `sarmg-error = 0.3.0` | `ErrorCode`、严格 `ErrorEnvelope` | 状态码映射、脱敏文案、Retry-After 与日志诊断 | Web 无法可靠解析错误，可能泄漏产品内部结构 |
-| `sarmg-server-target = 0.3.0` | 编译期唯一 server target 与 target 常量 | release 脚本、运行平台检查、MediaMTX 平台合同 | 非正式平台可能误编译或 manifest target 漂移 |
+| `sarmg-contracts` | Administrator 路径/DTO、跨语言合同类型 | 业务 DTO | Rust/Web 认证合同可能静默漂移 |
+| `sarmg-admin-core` / `admin-sqlite` / `admin-axum` | 管理员、固定密码策略、Session、Cookie、CSRF、限流、事务审计与管理路由 | 启动时选择 Profile 并挂载平台 Router | 产品再次拥有第二套认证策略 |
+| `sarmg-error` | `ErrorCode`、严格 `ErrorEnvelope` | 业务状态映射和脱敏诊断 | 错误可能泄漏内部结构 |
+| `sarmg-schema-identity` / `platform-db` | metadata、当前平台表、fingerprint 和数据库初始化边界 | Sentinel 业务 Schema、快照与全局调和租约不变量 | 平台 Schema 发生分叉 |
+| `sarmg-server-runtime` / `server-target` | 生命周期、任务监督、健康/诊断与正式 target | 注册业务任务、业务 Router、MediaMTX 伴随进程合同 | 生命周期与运行目标漂移 |
 
 这些共享包不提供旧合同兼容。升级包版本时同时替换依赖、lockfile、代码消费者、检查和整套发行物，
 不在 Sentinel 内加入双读、别名或 fallback。

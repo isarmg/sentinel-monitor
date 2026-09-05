@@ -21,8 +21,9 @@ canonical username）。这个值只初始化 Server 管理账户；摄像头的
 
 ## 2.3 第一次开发启动
 
-开发模式只绑定回环，使用已构建 Web `dist` 和临时 SQLite。按 `config/sentinel-monitor.env.example`/当前配置解析器设置必要
-变量后运行开发 `serve`。正式 source-bound binary 只能从验证过的 release root 启动。
+开发模式只绑定回环，未提供 `BIND_ADDR` 时生产解析器也安全默认到 `127.0.0.1:8080`。使用已构建 Web
+`dist` 和临时 SQLite，按 `config/sentinel-monitor.env.example`/当前配置解析器设置必要变量后运行开发
+`serve`。正式 source-bound binary 只能从验证过的 release root 启动；对外访问由可信 TLS 网关转发。
 
 ```bash
 cargo +1.98.0 run -- serve

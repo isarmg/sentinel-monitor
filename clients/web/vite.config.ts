@@ -1,4 +1,4 @@
-import { createSarmgReactViteConfig } from "@sarmg/admin-web/vite";
+import { createSarmgReactViteConfig } from "@sarmg/web-toolchain/vite";
 import { mergeConfig } from "vite";
 
 export default mergeConfig(createSarmgReactViteConfig(), {
@@ -6,7 +6,8 @@ export default mergeConfig(createSarmgReactViteConfig(), {
     port: 5173,
     proxy: {
       "/api/v2": "http://127.0.0.1:8080",
-      "/health": "http://127.0.0.1:8080",
+      "/healthz": "http://127.0.0.1:8080",
+      "/readyz": "http://127.0.0.1:8080",
       "/media-webrtc": {
         target: "http://127.0.0.1:8889",
         rewrite: (path: string) => path.replace(/^\/media-webrtc/, ""),

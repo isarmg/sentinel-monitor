@@ -71,8 +71,8 @@ pub async fn run(options: &DoctorOptions) -> anyhow::Result<DoctorReport> {
     let (application_ready, mediamtx_ready) = if options.offline {
         (None, None)
     } else {
-        let application = live_probe(&options.app_ready_url).await?;
-        let mediamtx = live_probe(&options.mediamtx_ready_url).await?;
+        let application = live_probe(&options.app_ready_url, ReadinessKind::Application).await?;
+        let mediamtx = live_probe(&options.mediamtx_ready_url, ReadinessKind::MediaMtx).await?;
         ensure!(application, "application readiness endpoint is unavailable");
         ensure!(mediamtx, "MediaMTX readiness endpoint is unavailable");
         (Some(true), Some(true))
@@ -90,7 +90,19 @@ pub async fn run(options: &DoctorOptions) -> anyhow::Result<DoctorReport> {
     })
 }
 
-async fn live_probe(url: &str) -> anyhow::Result<bool> {
+#[derive(Clone, Copy)]
+enum ReadinessKind {
+    Application,
+    MediaMtx,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationReadiness {
+    ready: bool,
+}
+
+async fn live_probe(url: &str, kind: ReadinessKind) -> anyhow::Result<bool> {
     let parsed = url::Url::parse(url).context("parse readiness URL")?;
     ensure!(
         matches!(parsed.scheme(), "http" | "https"),
@@ -116,7 +128,33 @@ async fn live_probe(url: &str) -> anyhow::Result<bool> {
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()?;
-    Ok(client.get(parsed).send().await?.status().is_success())
+    let response = client.get(parsed).send().await?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Ok(false);
+    }
+    if matches!(kind, ReadinessKind::MediaMtx) {
+        return Ok(true);
+    }
+    let content_types = response.headers().get_all(reqwest::header::CONTENT_TYPE);
+    if content_types.iter().count() != 1
+        || !content_types
+            .iter()
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return Ok(false);
+    }
+    let bytes = sarmg_secure_http::bounded_response(
+        response,
+        sarmg_secure_http::ResponseBudget {
+            max_header_bytes: 4096,
+            max_body_bytes: 128,
+        },
+    )
+    .await?;
+    Ok(serde_json::from_slice::<ApplicationReadiness>(&bytes).is_ok_and(|value| value.ready))
 }
 
 fn verify_credentials(path: &Path, key: &[u8; 32]) -> anyhow::Result<()> {
@@ -446,6 +484,7 @@ mod tests {
         let pool = sqlite::open_pool(&database_url).await.unwrap();
         let key = [0x42; 32];
         let now = Utc::now().to_rfc3339();
+        let now_micros = Utc::now().timestamp_micros();
         let user = Uuid::new_v4().to_string();
         let camera_id = Uuid::new_v4();
         let secret_box = SecretBox::new(&key);
@@ -467,12 +506,14 @@ mod tests {
             )
             .unwrap();
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at)
-             VALUES (?, 'doctor-admin', 'hash', ?, ?)",
+            "INSERT INTO _sarmg_administrators(
+             administrator_id,username,password_hash,created_at_micros,updated_at_micros)
+             VALUES (?, 'doctor-admin', ?, ?, ?)",
         )
-        .bind(&user)
-        .bind(&now)
-        .bind(&now)
+        .bind(user.to_string())
+        .bind(sarmg_admin_auth::hash_password("doctor-admin-password").unwrap())
+        .bind(now_micros)
+        .bind(now_micros)
         .execute(&pool)
         .await
         .unwrap();
@@ -537,7 +578,7 @@ mod tests {
             mediamtx_binary: binary.clone(),
             recordings_directory: recordings.clone(),
             credentials_key: key,
-            app_ready_url: "http://127.0.0.1:1/health/ready".to_string(),
+            app_ready_url: "http://127.0.0.1:1/readyz".to_string(),
             mediamtx_ready_url: "http://127.0.0.1:1/v3/info".to_string(),
             offline: true,
         };
@@ -581,6 +622,64 @@ mod tests {
         assert!(!tampered_error.contains("doctor-camera-password"));
         assert!(!tampered_error.contains("rtsp://"));
         assert!(!companion_marker.exists());
-        assert!(live_probe("http://example.com/health/ready").await.is_err());
+        assert!(
+            live_probe("http://example.com/readyz", ReadinessKind::Application)
+                .await
+                .is_err()
+        );
+    }
+}
+#[tokio::test]
+async fn application_probe_requires_the_exact_bounded_current_readiness_contract() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (status, content_type, body, expected) in [
+        ("200 OK", "application/json", "{\"ready\":true}", true),
+        ("200 OK", "application/json", "{\"ready\":false}", false),
+        ("200 OK", "application/json", "{\"status\":\"ok\"}", false),
+        (
+            "200 OK",
+            "application/json",
+            "{\"ready\":true,\"extra\":1}",
+            false,
+        ),
+        (
+            "200 OK",
+            "application/json",
+            "{\"ready\":false,\"ready\":true}",
+            false,
+        ),
+        ("200 OK", "text/html", "{\"ready\":true}", false),
+        (
+            "503 Service Unavailable",
+            "application/json",
+            "{\"ready\":true}",
+            false,
+        ),
+        (
+            "301 Moved Permanently",
+            "application/json",
+            "{\"ready\":true}",
+            false,
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let response = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        assert_eq!(
+            live_probe(
+                &format!("http://{address}/readyz"),
+                ReadinessKind::Application
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        server.await.unwrap();
     }
 }

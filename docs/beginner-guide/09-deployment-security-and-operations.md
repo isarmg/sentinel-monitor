@@ -3,13 +3,14 @@
 ## 9.1 生产布局
 
 不可变 release tree、0600 环境、SQLite、runtime locks、MediaMTX config/contract 和 recordings 分区管理。
-服务账户只能写业务状态，不得修改 binary、Web 或 manifest。公网只暴露可信代理需要的路由。
+服务账户只能写业务状态，不得修改 binary、Web 或 manifest。Axum 默认/正式样例均监听
+`127.0.0.1:8080`；公网只暴露按 `deploy/Caddyfile` 安装的可信代理路由。
 
 ## 9.2 上线流程
 
 验证 tag/归档/checksum；安装新精确版本目录；设置 ownership/mode；准备当前组合状态和 external key；运行
-release verify 与 offline doctor；启动 MediaMTX 后启动 Sentinel；检查两个 readiness、登录、摄像头读取
-和实验播放。任一步失败停止，不覆盖原目录。
+release verify 与 offline doctor；把 `deploy/Caddyfile` 安装到受管 Caddy 配置并设置真实 TLS 站点；启动
+MediaMTX 后启动 Sentinel；检查两个 readiness、登录、摄像头读取和实验播放。任一步失败停止，不覆盖原目录。
 
 ## 9.3 配置和 Secret
 

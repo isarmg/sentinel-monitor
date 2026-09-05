@@ -3,8 +3,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use ipnet::IpNet;
 use rand::{rngs::OsRng, RngCore};
-use reqwest::{redirect::Policy, Client};
-use roxmltree::{Document, ParsingOptions};
+use reqwest::{Method, Request};
+use sarmg_secure_http::{NetworkPolicy, ResponseBudget, SecureHttpClient};
+use sarmg_secure_xml::Document;
 use serde::Serialize;
 use sha1::{Digest, Sha1};
 use std::{
@@ -429,68 +430,66 @@ async fn soap_request(
     let envelope = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Header>{security}</s:Header><s:Body>{body}</s:Body></s:Envelope>"#
     );
-    let client = client_for_target(target)?;
-    let mut response = client
-        .post(target.url.clone())
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            format!("application/soap+xml; charset=utf-8; action=\"{action}\""),
-        )
-        .body(envelope)
-        .send()
+    let client = secure_client_for_target(target)?;
+    let port = target
+        .url
+        .port_or_known_default()
+        .ok_or_else(|| AppError::Upstream("ONVIF服务地址缺少端口".into()))?;
+    let mut request = Request::new(Method::POST, target.url.clone());
+    request.headers_mut().insert(
+        reqwest::header::CONTENT_TYPE,
+        format!("application/soap+xml; charset=utf-8; action=\"{action}\"")
+            .parse()
+            .map_err(|_| AppError::Internal("ONVIF SOAP action无效".into()))?,
+    );
+    *request.body_mut() = Some(envelope.into());
+    let response = client
+        .execute_bounded(request, &[SocketAddr::new(target.ip, port)])
         .await
         .map_err(safe_http_error)?;
-    let status = response.status();
+    let status = response.status;
     if !status.is_success() {
         return Err(AppError::Upstream(format!("ONVIF返回了HTTP {status}")));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-    {
-        return Err(AppError::Upstream("ONVIF响应超过大小限制".into()));
-    }
-    let mut response_body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(safe_http_error)? {
-        if response_body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err(AppError::Upstream("ONVIF响应超过大小限制".into()));
-        }
-        response_body.extend_from_slice(&chunk);
-    }
-    let response_body = String::from_utf8(response_body)
+    let response_body = String::from_utf8(response.body)
         .map_err(|_| AppError::Upstream("ONVIF响应不是有效的UTF-8".into()))?;
     parse_bounded_xml(&response_body, "SOAP响应")?;
     Ok(response_body)
 }
 
-fn client_for_target(target: &ResolvedTarget) -> Result<Client> {
-    let host = target
-        .url
-        .host_str()
-        .ok_or_else(|| AppError::Upstream("ONVIF服务地址缺少主机".into()))?;
-    let port = target
-        .url
-        .port_or_known_default()
-        .ok_or_else(|| AppError::Upstream("ONVIF服务地址缺少端口".into()))?;
-    Client::builder()
-        .no_proxy()
-        .redirect(Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .resolve(host, SocketAddr::new(target.ip, port))
-        .build()
-        .map_err(|_| AppError::Internal("ONVIF HTTP客户端初始化失败".into()))
+fn secure_client_for_target(target: &ResolvedTarget) -> Result<SecureHttpClient> {
+    SecureHttpClient::new(
+        NetworkPolicy::PrivateDevice {
+            allow_loopback: target.ip.is_loopback(),
+            allow_link_local: match target.ip {
+                IpAddr::V4(address) => address.is_link_local(),
+                IpAddr::V6(address) => address.is_unicast_link_local(),
+            },
+        },
+        REQUEST_TIMEOUT,
+        CONNECT_TIMEOUT,
+        ResponseBudget {
+            max_header_bytes: 64 * 1024,
+            max_body_bytes: MAX_RESPONSE_BYTES,
+        },
+    )
+    .map_err(|_| AppError::Internal("ONVIF HTTP客户端初始化失败".into()))
 }
 
-fn safe_http_error(error: reqwest::Error) -> AppError {
-    let message = if error.is_timeout() {
-        "ONVIF请求超时"
-    } else if error.is_connect() {
-        "ONVIF连接失败"
-    } else {
-        "ONVIF请求失败"
-    };
-    AppError::Upstream(message.into())
+fn safe_http_error(error: sarmg_secure_http::Error) -> AppError {
+    tracing::debug!(error = %error, "ONVIF secure HTTP request failed");
+    match error {
+        sarmg_secure_http::Error::ResponseTooLarge => {
+            AppError::Upstream("ONVIF响应超过大小限制".into())
+        }
+        sarmg_secure_http::Error::Http(error) if error.is_timeout() => {
+            AppError::Upstream("ONVIF请求超时".into())
+        }
+        sarmg_secure_http::Error::Http(error) if error.is_connect() => {
+            AppError::Upstream("ONVIF连接失败".into())
+        }
+        _ => AppError::Upstream("ONVIF请求失败".into()),
+    }
 }
 
 fn ws_security_header(username: &str, password: &str) -> String {
@@ -587,50 +586,26 @@ fn parse_profile_token(xml: &str) -> Result<String> {
 }
 
 fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>> {
-    if xml.len() > MAX_RESPONSE_BYTES {
-        return Err(AppError::Upstream("ONVIF XML超过大小限制".into()));
-    }
-    if contains_ascii_case(xml.as_bytes(), b"<!DOCTYPE")
-        || contains_ascii_case(xml.as_bytes(), b"<!ENTITY")
-    {
-        return Err(AppError::Upstream("ONVIF XML禁止DTD和实体声明".into()));
-    }
-    let document = Document::parse_with_options(
+    sarmg_secure_xml::parse_bounded(
         xml,
-        ParsingOptions {
-            allow_dtd: false,
-            nodes_limit: MAX_XML_NODES,
+        sarmg_secure_xml::XmlBudget {
+            max_bytes: MAX_RESPONSE_BYTES,
+            max_depth: MAX_XML_DEPTH,
+            max_nodes: MAX_XML_NODES as usize,
+            max_text_bytes: MAX_XML_TOTAL_TEXT_BYTES,
+            max_text_node_bytes: MAX_XML_TEXT_BYTES,
+            max_parse_time: REQUEST_TIMEOUT,
         },
     )
-    .map_err(|_| AppError::Upstream(format!("ONVIF{context}XML无效")))?;
-
-    let mut total_text_bytes = 0usize;
-    for node in document.descendants() {
-        let depth = node
-            .ancestors()
-            .filter(|ancestor| ancestor.is_element())
-            .count();
-        if depth > MAX_XML_DEPTH {
-            return Err(AppError::Upstream("ONVIF XML嵌套过深".into()));
+    .map_err(|error| match error {
+        sarmg_secure_xml::Error::ForbiddenDeclaration => {
+            AppError::Upstream("ONVIF XML禁止DTD和实体声明".into())
         }
-        if node.is_text() {
-            let length = node.text().unwrap_or_default().len();
-            if length > MAX_XML_TEXT_BYTES {
-                return Err(AppError::Upstream("ONVIF XML文本节点过大".into()));
-            }
-            total_text_bytes = total_text_bytes.saturating_add(length);
-            if total_text_bytes > MAX_XML_TOTAL_TEXT_BYTES {
-                return Err(AppError::Upstream("ONVIF XML文本总量过大".into()));
-            }
+        sarmg_secure_xml::Error::Budget(_) => {
+            AppError::Upstream(format!("ONVIF{context}XML超过解析预算"))
         }
-    }
-    Ok(document)
-}
-
-fn contains_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+        sarmg_secure_xml::Error::Parse(_) => AppError::Upstream(format!("ONVIF{context}XML无效")),
+    })
 }
 
 fn xml_escape(value: &str) -> String {

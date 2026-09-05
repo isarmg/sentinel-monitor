@@ -182,6 +182,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.92"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1906,8 +1917,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sarmg-admin-auth"
-version = "0.3.0"
-source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
 dependencies = [
  "argon2",
  "base64",
@@ -1918,9 +1929,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "sarmg-admin-axum"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "axum",
+ "bytes",
+ "http-body-util",
+ "mime",
+ "sarmg-admin-auth",
+ "sarmg-admin-core",
+ "sarmg-contracts",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "sarmg-admin-core"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "async-trait",
+ "sarmg-admin-auth",
+ "sarmg-contracts",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "sarmg-admin-sqlite"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "async-trait",
+ "sarmg-admin-auth",
+ "sarmg-admin-core",
+ "sqlx",
+ "thiserror",
+]
+
+[[package]]
 name = "sarmg-contracts"
-version = "0.3.0"
-source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
 dependencies = [
  "sarmg-admin-auth",
  "sarmg-error",
@@ -1932,8 +1985,8 @@ dependencies = [
 
 [[package]]
 name = "sarmg-error"
-version = "0.3.0"
-source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1941,9 +1994,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sarmg-operations"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "sarmg-schema-identity"
-version = "0.3.0"
-source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
 dependencies = [
  "serde",
  "sha2",
@@ -1951,9 +2017,83 @@ dependencies = [
 ]
 
 [[package]]
+name = "sarmg-secret"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
+name = "sarmg-secret-envelope"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "aes-gcm",
+ "getrandom 0.4.3",
+ "hkdf",
+ "sarmg-secret",
+ "sha2",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "sarmg-secure-http"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "ipnet",
+ "reqwest",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "sarmg-secure-xml"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "roxmltree",
+ "thiserror",
+]
+
+[[package]]
+name = "sarmg-server-runtime"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "getrandom 0.4.3",
+ "sarmg-admin-auth",
+ "sarmg-admin-axum",
+ "sarmg-admin-core",
+ "sarmg-contracts",
+ "sarmg-schema-identity",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "sarmg-server-target"
-version = "0.3.0"
-source = "git+https://github.com/isarmg/sarmg-foundation.git?rev=1fe326081cfd896f05ff502e80f99504797c14c6#1fe326081cfd896f05ff502e80f99504797c14c6"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+
+[[package]]
+name = "sarmg-sqlite"
+version = "0.6.0"
+source = "git+https://github.com/isarmg/sarmg-foundation-server.git?rev=1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1#1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+dependencies = [
+ "sarmg-schema-identity",
+ "sqlx",
+ "thiserror",
+]
 
 [[package]]
 name = "scopeguard"
@@ -1965,7 +2105,6 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "sentinel-monitor"
 version = "0.2.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "async-stream",
  "axum",
@@ -1979,12 +2118,22 @@ dependencies = [
  "libc",
  "rand 0.8.7",
  "reqwest",
- "roxmltree",
  "rusqlite",
  "sarmg-admin-auth",
+ "sarmg-admin-axum",
+ "sarmg-admin-core",
+ "sarmg-admin-sqlite",
  "sarmg-contracts",
  "sarmg-error",
+ "sarmg-operations",
+ "sarmg-schema-identity",
+ "sarmg-secret",
+ "sarmg-secret-envelope",
+ "sarmg-secure-http",
+ "sarmg-secure-xml",
+ "sarmg-server-runtime",
  "sarmg-server-target",
+ "sarmg-sqlite",
  "serde",
  "serde_json",
  "sha1",

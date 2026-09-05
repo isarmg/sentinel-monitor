@@ -7,8 +7,12 @@ use crate::{
     AppState,
 };
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use sarmg_operations::{
+    EnqueueOutcome, NewOperation, OperationState, SqliteOperationStore, StoredOperation, Transition,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::{Executor, Sqlite, SqlitePool, Transaction};
 use std::time::Duration as StdDuration;
 use url::Url;
@@ -17,15 +21,12 @@ use uuid::Uuid;
 const GLOBAL_LEASE_REQUEST_BUDGET: u64 = 6;
 const OPERATION_LEASE_REQUEST_BUDGET: u64 = 4;
 const LEASE_SAFETY_MARGIN_SECONDS: u64 = 30;
+const OPERATION_NAMESPACE: &str = "sentinel.media-reconciliation";
 
 const CAMERA_SELECT_INTERNAL: &str = "SELECT id, name, location, main_stream_url_enc, \
     sub_stream_url_enc, onvif_url, username_enc, password_enc, enabled, record_enabled, status, \
     last_seen_at, created_at, updated_at FROM cameras";
-const OPERATION_SELECT: &str = "SELECT id, camera_id, generation, kind, state, reason, \
-    requested_by, attempt, max_attempts, created_at, started_at, finished_at, retry_at, error_code, \
-    error_message, lease_owner, lease_expires_at FROM media_operations";
-
-#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+#[derive(Clone, Debug, Serialize)]
 pub struct MediaOperationView {
     pub id: String,
     pub camera_id: Uuid,
@@ -33,7 +34,7 @@ pub struct MediaOperationView {
     pub kind: String,
     pub state: String,
     pub reason: String,
-    pub requested_by: Option<Uuid>,
+    pub requested_by: Option<String>,
     pub attempt: i64,
     pub max_attempts: i64,
     pub created_at: DateTime<Utc>,
@@ -46,6 +47,15 @@ pub struct MediaOperationView {
     pub lease_owner: Option<String>,
     #[serde(skip_serializing)]
     pub lease_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MediaOperationRequest {
+    camera_id: Uuid,
+    generation: i64,
+    reason: String,
+    requested_by: Option<String>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -75,7 +85,7 @@ pub async fn queue_camera_change(
     transaction: &mut Transaction<'_, Sqlite>,
     camera: &CameraRecord,
     desired_present: bool,
-    requested_by: Uuid,
+    requested_by: &str,
     reason: &'static str,
 ) -> Result<MediaOperationView> {
     let current_generation = sqlx::query_scalar::<_, i64>(
@@ -111,71 +121,38 @@ pub async fn queue_camera_change(
     .execute(&mut **transaction)
     .await?;
 
-    sqlx::query(
-        "UPDATE media_operations SET state = 'failed', finished_at = ?, retry_at = NULL, \
-         error_code = 'superseded', error_message = 'A newer desired generation replaced this operation', \
-         lease_owner = NULL, lease_expires_at = NULL \
-         WHERE camera_id = ? AND generation < ? AND state = 'pending'",
+    enqueue_operation_in(
+        transaction,
+        MediaOperationRequest {
+            camera_id: camera.id,
+            generation,
+            reason: reason.to_owned(),
+            requested_by: Some(requested_by.to_owned()),
+        },
+        now,
     )
-    .bind(now)
-    .bind(camera.id)
-    .bind(generation)
-    .execute(&mut **transaction)
-    .await?;
-
-    let id = Uuid::new_v4().to_string();
-    sqlx::query_as::<_, MediaOperationView>(&format!(
-        "INSERT INTO media_operations (id, camera_id, generation, kind, state, reason, \
-         requested_by, attempt, created_at, retry_at) \
-         VALUES (?, ?, ?, 'reconcile_camera', 'pending', ?, ?, 0, ?, ?) \
-         RETURNING {OPERATION_SELECT_FIELDS}",
-        OPERATION_SELECT_FIELDS = operation_select_fields()
-    ))
-    .bind(&id)
-    .bind(camera.id)
-    .bind(generation)
-    .bind(reason)
-    .bind(requested_by)
-    .bind(now)
-    .bind(now)
-    .fetch_one(&mut **transaction)
     .await
-    .map_err(AppError::from)
 }
 
 pub async fn get_operation(pool: &SqlitePool, id: &str) -> Result<MediaOperationView> {
-    sqlx::query_as::<_, MediaOperationView>(&format!("{OPERATION_SELECT} WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?
+    SqliteOperationStore::new(pool.clone())
+        .get(id)
+        .await
+        .map_err(operation_error)?
+        .map(operation_view)
+        .transpose()?
         .ok_or_else(|| AppError::NotFound("媒体操作不存在".into()))
 }
 
 pub async fn recover_interrupted_operations(pool: &SqlitePool) -> Result<u64> {
-    recover_expired_operation_leases(pool).await
-}
-
-async fn recover_expired_operation_leases(pool: &SqlitePool) -> Result<u64> {
-    recover_expired_operation_leases_at(pool, Utc::now()).await
-}
-
-async fn recover_expired_operation_leases_at(pool: &SqlitePool, now: DateTime<Utc>) -> Result<u64> {
-    let result = sqlx::query(
-        "UPDATE media_operations SET state = CASE WHEN attempt >= max_attempts THEN 'dead_letter' ELSE 'unknown' END, \
-         finished_at = CASE WHEN attempt >= max_attempts THEN ? ELSE NULL END, \
-         dead_letter_at = CASE WHEN attempt >= max_attempts THEN ? ELSE NULL END, \
-         retry_at = CASE WHEN attempt >= max_attempts THEN NULL ELSE ? END, \
-         lease_owner = NULL, lease_expires_at = NULL, error_code = 'worker_lease_expired', \
-         error_message = 'The worker lease expired before the outcome was recorded' \
-         WHERE state = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
-    )
-    .bind(now)
-    .bind(now)
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    SqliteOperationStore::new(pool.clone())
+        .recover_running(
+            OPERATION_NAMESPACE,
+            "worker_interrupted",
+            Utc::now().timestamp_micros(),
+        )
+        .await
+        .map_err(operation_error)
 }
 
 pub async fn reconcile_once(state: &AppState) -> Result<bool> {
@@ -184,11 +161,7 @@ pub async fn reconcile_once(state: &AppState) -> Result<bool> {
     let Some(lease_owner) = acquire_reconciler_lease(state).await? else {
         return Ok(false);
     };
-    let result = async {
-        recover_expired_operation_leases(&state.pool).await?;
-        reconcile_once_with_lease(state, &lease_owner).await
-    }
-    .await;
+    let result = async { reconcile_once_with_lease(state, &lease_owner).await }.await;
     let release = release_reconciler_lease(&state.pool, &lease_owner).await;
     match (result, release) {
         (Ok(processed), Ok(_)) => Ok(processed),
@@ -356,12 +329,55 @@ fn corrupt_global_lease() -> AppError {
 }
 
 pub async fn reconcile_available(state: &AppState) -> Result<()> {
+    SqliteOperationStore::new(state.pool.clone())
+        .recover_expired(OPERATION_NAMESPACE, Utc::now().timestamp_micros())
+        .await
+        .map_err(operation_error)?;
     for _ in 0..64 {
         if !reconcile_once(state).await? {
             break;
         }
     }
     Ok(())
+}
+
+/// The outbox event ID is also the product audit ID, making replay idempotent.
+/// Only safe product metadata is projected; request and result payloads are not logged.
+pub async fn flush_operation_audit(pool: &SqlitePool) -> Result<usize> {
+    let store = SqliteOperationStore::new(pool.clone());
+    let events = store
+        .pending_audit_events(128)
+        .await
+        .map_err(operation_error)?;
+    let count = events.len();
+    for event in events {
+        let operation = store
+            .get(&event.operation_id)
+            .await
+            .map_err(operation_error)?
+            .ok_or_else(|| AppError::Internal("审计操作不存在".into()))?;
+        let operation = operation_view(operation)?;
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, details, created_at) \
+            VALUES (?, (SELECT administrator_id FROM _sarmg_administrators WHERE administrator_id = ?), \
+            'media.operation.transition', 'camera', ?, ?, ?) ON CONFLICT(id) DO NOTHING")
+            .bind(Uuid::parse_str(&event.event_id).map_err(|_| AppError::Internal("审计事件 ID 无效".into()))?)
+            .bind(operation.requested_by)
+            .bind(operation.camera_id)
+            .bind(json!({ "operation_id": event.operation_id, "generation": operation.generation,
+                "from_state": event.from_state, "to_state": event.to_state }))
+            .bind(timestamp(event.created_at_micros)?)
+            .execute(&mut *transaction).await?;
+        SqliteOperationStore::mark_audit_delivered_in(
+            &mut transaction,
+            &event.event_id,
+            Utc::now().timestamp_micros(),
+        )
+        .await
+        .map_err(operation_error)?;
+        transaction.commit().await?;
+    }
+    Ok(count)
 }
 
 async fn claim_next_operation(
@@ -371,34 +387,26 @@ async fn claim_next_operation(
 ) -> Result<Option<MediaOperationView>> {
     let now = Utc::now();
     let lease_expires_at = lease_deadline(now, request_timeout, OPERATION_LEASE_REQUEST_BUDGET);
-    let sql = format!(
-        "UPDATE media_operations SET state = 'running', attempt = attempt + 1, started_at = ?, \
-         finished_at = NULL, lease_owner = ?, lease_expires_at = ?, error_code = NULL, \
-         error_message = NULL WHERE id = ( \
-             SELECT candidate.id FROM media_operations candidate \
-             WHERE (candidate.state = 'pending' OR (candidate.state IN ('failed', 'unknown') \
-                    AND candidate.retry_at IS NOT NULL AND candidate.retry_at <= ?)) \
-               AND candidate.attempt < candidate.max_attempts \
-               AND NOT EXISTS (SELECT 1 FROM media_operations active \
-                   WHERE active.camera_id = candidate.camera_id AND active.state = 'running') \
-             ORDER BY candidate.created_at, candidate.attempt, candidate.id LIMIT 1 \
-         ) AND (state = 'pending' OR (state IN ('failed', 'unknown') AND retry_at IS NOT NULL \
-         AND retry_at <= ?)) AND EXISTS (SELECT 1 FROM media_reconciler_leases \
-             WHERE singleton = 1 AND lease_owner = ? AND lease_expires_at > ?) \
-         RETURNING {fields}",
-        fields = operation_select_fields()
-    );
-    sqlx::query_as::<_, MediaOperationView>(&sql)
-        .bind(now)
-        .bind(global_owner)
-        .bind(lease_expires_at)
-        .bind(now)
-        .bind(now)
-        .bind(global_owner)
-        .bind(now)
-        .fetch_optional(pool)
-        .await
-        .map_err(AppError::from)
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let lease = load_global_lease_state(&mut *transaction).await?;
+    if lease.owner.as_deref() != Some(global_owner)
+        || lease.lease_expires_at.is_none_or(|expiry| expiry <= now)
+    {
+        return Err(AppError::Conflict(
+            "媒体协调器租约已由其他执行器接管".into(),
+        ));
+    }
+    let claimed = SqliteOperationStore::claim_next_in(
+        &mut transaction,
+        OPERATION_NAMESPACE,
+        global_owner,
+        now.timestamp_micros(),
+        lease_expires_at.timestamp_micros(),
+    )
+    .await
+    .map_err(operation_error)?;
+    transaction.commit().await?;
+    claimed.map(operation_view).transpose()
 }
 
 fn lease_deadline(
@@ -433,11 +441,6 @@ async fn renew_claimed_leases(state: &AppState, operation: &MediaOperationView) 
         state.config.request_timeout,
         GLOBAL_LEASE_REQUEST_BUDGET,
     );
-    let operation_deadline = lease_deadline(
-        now,
-        state.config.request_timeout,
-        OPERATION_LEASE_REQUEST_BUDGET,
-    );
     let global = sqlx::query(
         "UPDATE media_reconciler_leases SET lease_expires_at = ?, updated_at = ? \
          WHERE singleton = 1 AND lease_owner = ? AND lease_expires_at > ?",
@@ -448,23 +451,24 @@ async fn renew_claimed_leases(state: &AppState, operation: &MediaOperationView) 
     .bind(now)
     .execute(&mut *transaction)
     .await?;
-    let claimed = sqlx::query(
-        "UPDATE media_operations SET lease_expires_at = ? \
-         WHERE id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ?",
-    )
-    .bind(operation_deadline)
-    .bind(&operation.id)
-    .bind(owner)
-    .bind(now)
-    .execute(&mut *transaction)
-    .await?;
     if global.rows_affected() != 1 {
         return Err(corrupt_global_lease());
     }
-    if claimed.rows_affected() != 1 {
+    transaction.commit().await?;
+    let current = SqliteOperationStore::new(state.pool.clone())
+        .get(&operation.id)
+        .await
+        .map_err(operation_error)?
+        .ok_or_else(|| AppError::Conflict("媒体操作已不存在".into()))?;
+    if current.operation.state != OperationState::Running
+        || current.operation.lease_owner.as_deref() != Some(owner)
+        || current
+            .operation
+            .lease_expiry_micros
+            .is_none_or(|expiry| expiry <= now.timestamp_micros())
+    {
         return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
     }
-    transaction.commit().await?;
     Ok(())
 }
 
@@ -475,7 +479,193 @@ fn operation_owner(operation: &MediaOperationView) -> Result<&str> {
     }
 }
 
+fn operation_error(error: sarmg_operations::Error) -> AppError {
+    if matches!(error, sarmg_operations::Error::ConcurrentModification) {
+        return AppError::Conflict("媒体操作租约已由其他执行器接管".into());
+    }
+    tracing::error!(error = %error, "Foundation rejected media operation state transition");
+    AppError::Internal("媒体操作状态不符合当前 Foundation 合同".into())
+}
+
+async fn enqueue_operation_in(
+    transaction: &mut Transaction<'_, Sqlite>,
+    request: MediaOperationRequest,
+    now: DateTime<Utc>,
+) -> Result<MediaOperationView> {
+    let request_payload = serde_json::to_vec(&request)
+        .map_err(|_| AppError::Internal("媒体操作请求无法编码".into()))?;
+    let request_fingerprint: [u8; 32] = Sha256::digest(&request_payload).into();
+    let mut idempotency = Sha256::new();
+    for value in [
+        OPERATION_NAMESPACE.as_bytes(),
+        request.camera_id.hyphenated().to_string().as_bytes(),
+        request.generation.to_string().as_bytes(),
+        request.reason.as_bytes(),
+        now.timestamp_micros().to_string().as_bytes(),
+    ] {
+        idempotency.update((value.len() as u64).to_be_bytes());
+        idempotency.update(value);
+    }
+    let idempotency_digest: [u8; 32] = idempotency.finalize().into();
+    let value = NewOperation {
+        operation_id: Uuid::new_v4().to_string(),
+        namespace: OPERATION_NAMESPACE.into(),
+        target_key: request.camera_id.hyphenated().to_string(),
+        action: "reconcile_camera".into(),
+        idempotency_digest,
+        request_fingerprint,
+        request_payload,
+        max_attempts: 8,
+        not_before_micros: now.timestamp_micros(),
+        created_at_micros: now.timestamp_micros(),
+    };
+    let stored = match SqliteOperationStore::enqueue_in(transaction, value)
+        .await
+        .map_err(operation_error)?
+    {
+        EnqueueOutcome::Created(stored) | EnqueueOutcome::Existing(stored) => stored,
+    };
+    operation_view(stored)
+}
+
+fn operation_view(stored: StoredOperation) -> Result<MediaOperationView> {
+    if stored.operation.namespace != OPERATION_NAMESPACE || stored.action != "reconcile_camera" {
+        return Err(AppError::NotFound("媒体操作不存在".into()));
+    }
+    let request: MediaOperationRequest = serde_json::from_slice(&stored.request_payload)
+        .map_err(|_| AppError::Internal("媒体操作请求损坏".into()))?;
+    if stored.operation.target_key != request.camera_id.hyphenated().to_string() {
+        return Err(AppError::Internal("媒体操作目标与请求不一致".into()));
+    }
+    let created_at = timestamp(stored.created_at_micros)?;
+    let updated_at = timestamp(stored.updated_at_micros)?;
+    let state = stored.operation.state;
+    let retry_at = (state == OperationState::Pending)
+        .then(|| timestamp(stored.operation.not_before_micros))
+        .transpose()?;
+    let finished_at = matches!(
+        state,
+        OperationState::Succeeded
+            | OperationState::Failed
+            | OperationState::Unknown
+            | OperationState::DeadLetter
+            | OperationState::Resolved
+    )
+    .then_some(updated_at);
+    Ok(MediaOperationView {
+        id: stored.operation.operation_id,
+        camera_id: request.camera_id,
+        generation: request.generation,
+        kind: stored.action,
+        state: state.as_str().into(),
+        reason: request.reason,
+        requested_by: request.requested_by,
+        attempt: i64::from(stored.operation.attempt),
+        max_attempts: i64::from(stored.operation.max_attempts),
+        created_at,
+        started_at: (state == OperationState::Running).then_some(updated_at),
+        finished_at,
+        retry_at,
+        error_code: stored.operation.error_code,
+        error_message: None,
+        lease_owner: stored.operation.lease_owner,
+        lease_expires_at: stored
+            .operation
+            .lease_expiry_micros
+            .map(timestamp)
+            .transpose()?,
+    })
+}
+
+fn timestamp(micros: i64) -> Result<DateTime<Utc>> {
+    DateTime::from_timestamp_micros(micros)
+        .ok_or_else(|| AppError::Internal("媒体操作时间戳无效".into()))
+}
+
+async fn complete_owned(
+    pool: &SqlitePool,
+    operation: &MediaOperationView,
+    event: Transition,
+    result: Option<serde_json::Value>,
+) -> Result<()> {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    complete_owned_in(&mut transaction, operation, event, result).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn complete_owned_in(
+    transaction: &mut Transaction<'_, Sqlite>,
+    operation: &MediaOperationView,
+    event: Transition,
+    result: Option<serde_json::Value>,
+) -> Result<()> {
+    let owner = operation_owner(operation)?;
+    let now = Utc::now();
+    let lease = load_global_lease_state(&mut **transaction).await?;
+    if lease.owner.as_deref() != Some(owner)
+        || lease.lease_expires_at.is_none_or(|expiry| expiry <= now)
+    {
+        return Err(AppError::Conflict(
+            "媒体协调器租约已由其他执行器接管".into(),
+        ));
+    }
+    let payload = result
+        .map(|value| serde_json::to_vec(&value))
+        .transpose()
+        .map_err(|_| AppError::Internal("媒体操作结果无法编码".into()))?;
+    SqliteOperationStore::apply_transition_owned_in(
+        transaction,
+        &operation.id,
+        owner,
+        event,
+        payload.as_deref(),
+        now.timestamp_micros(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(operation_error)
+}
+
 async fn apply_claimed_operation(state: &AppState, operation: MediaOperationView) -> Result<()> {
+    let store = SqliteOperationStore::new(state.pool.clone());
+    let claim = store
+        .get(&operation.id)
+        .await
+        .map_err(operation_error)?
+        .ok_or_else(|| AppError::NotFound("媒体操作不存在".into()))?;
+    if claim.operation.lease_owner != operation.lease_owner
+        || i64::from(claim.operation.attempt) != operation.attempt
+        || claim.operation.lease_expiry_micros
+            != operation
+                .lease_expires_at
+                .map(|value| value.timestamp_micros())
+    {
+        return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
+    }
+    let result = apply_claimed_operation_inner(state, operation).await;
+    if result.is_err() {
+        // Local completion failure after remote effects is ambiguous, not retryable.
+        // Captured owner/attempt/expiry prevent this marker touching another claim.
+        match store
+            .abandon_claim(
+                &claim.operation,
+                "completion_persistence_uncertain",
+                Utc::now().timestamp_micros(),
+            )
+            .await
+        {
+            Ok(_) | Err(sarmg_operations::Error::ConcurrentModification) => {}
+            Err(error) => return Err(operation_error(error)),
+        }
+    }
+    result
+}
+
+async fn apply_claimed_operation_inner(
+    state: &AppState,
+    operation: MediaOperationView,
+) -> Result<()> {
     renew_claimed_leases(state, &operation).await?;
     let desired = load_desired(&state.pool, operation.camera_id).await?;
     if desired.generation != operation.generation {
@@ -491,8 +681,8 @@ async fn apply_claimed_operation(state: &AppState, operation: MediaOperationView
 
     let result = apply_desired(state, &camera, &desired).await;
     match result {
-        Ok(applied) => finish_success(state, &operation, &desired, &applied).await,
-        Err(error) => finish_failure(state, &operation, &error).await,
+        Ok(applied) => finish_success(&state.pool, &operation, &desired, &applied).await,
+        Err(error) => finish_failure(&state.pool, &operation, &error).await,
     }
 }
 
@@ -556,14 +746,13 @@ async fn apply_desired(
 }
 
 async fn finish_success(
-    state: &AppState,
+    pool: &SqlitePool,
     operation: &MediaOperationView,
     desired: &DesiredState,
     applied: &AppliedSources,
 ) -> Result<()> {
-    let owner = operation_owner(operation)?;
     let now = Utc::now();
-    let mut transaction = state.pool.begin().await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let current_generation = sqlx::query_scalar::<_, i64>(
         "SELECT generation FROM media_desired_states WHERE camera_id = ?",
     )
@@ -571,46 +760,15 @@ async fn finish_success(
     .fetch_one(&mut *transaction)
     .await?;
     if current_generation != desired.generation {
-        let result = sqlx::query(
-            "UPDATE media_operations SET state = 'succeeded', finished_at = ?, retry_at = NULL, \
-             lease_owner = NULL, lease_expires_at = NULL, result_json = ?, error_code = NULL, \
-             error_message = NULL WHERE id = ? AND state = 'running' AND lease_owner = ? \
-             AND lease_expires_at > ? AND EXISTS (SELECT 1 FROM media_reconciler_leases \
-                 WHERE singleton = 1 AND lease_owner = ? AND lease_expires_at > ?)",
+        complete_owned_in(
+            &mut transaction,
+            operation,
+            Transition::Succeed,
+            Some(json!({ "converged": false, "superseded_after_apply": true })),
         )
-        .bind(now)
-        .bind(json!({ "converged": false, "superseded_after_apply": true }))
-        .bind(&operation.id)
-        .bind(owner)
-        .bind(now)
-        .bind(owner)
-        .bind(now)
-        .execute(&mut *transaction)
         .await?;
-        if result.rows_affected() != 1 {
-            return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
-        }
         transaction.commit().await?;
         return Ok(());
-    }
-    let result = sqlx::query(
-        "UPDATE media_operations SET state = 'succeeded', finished_at = ?, retry_at = NULL, \
-         lease_owner = NULL, lease_expires_at = NULL, result_json = ?, error_code = NULL, \
-         error_message = NULL WHERE id = ? AND state = 'running' AND lease_owner = ? \
-         AND lease_expires_at > ? AND EXISTS (SELECT 1 FROM media_reconciler_leases \
-             WHERE singleton = 1 AND lease_owner = ? AND lease_expires_at > ?)",
-    )
-    .bind(now)
-    .bind(json!({ "generation": desired.generation, "converged": true }))
-    .bind(&operation.id)
-    .bind(owner)
-    .bind(now)
-    .bind(owner)
-    .bind(now)
-    .execute(&mut *transaction)
-    .await?;
-    if result.rows_affected() != 1 {
-        return Err(AppError::Conflict("媒体操作状态已被其他执行器修改".into()));
     }
 
     persist_applied_path(
@@ -648,6 +806,13 @@ async fn finish_success(
     .bind(now)
     .bind(desired.camera_id)
     .execute(&mut *transaction)
+    .await?;
+    complete_owned_in(
+        &mut transaction,
+        operation,
+        Transition::Succeed,
+        Some(json!({ "generation": desired.generation, "converged": true })),
+    )
     .await?;
     transaction.commit().await?;
     Ok(())
@@ -695,49 +860,38 @@ async fn persist_applied_path(
 }
 
 async fn finish_failure(
-    state: &AppState,
+    pool: &SqlitePool,
     operation: &MediaOperationView,
     error: &AppError,
 ) -> Result<()> {
-    let owner = operation_owner(operation)?;
-    let (mut operation_state, error_code, error_message, retryable) = sanitized_failure(error);
-    let exhausted = retryable && operation.attempt >= operation.max_attempts;
-    if exhausted {
-        operation_state = "dead_letter";
-    }
-    let retry_at = (retryable && !exhausted).then(|| Utc::now() + retry_delay(operation.attempt));
+    let (kind, error_code, error_message) = sanitized_failure(error);
     let now = Utc::now();
-    let finished_at = (operation_state != "unknown").then_some(now);
-    let dead_letter_at = exhausted.then_some(now);
-    let mut transaction = state.pool.begin().await?;
-    let result = sqlx::query(
-        "UPDATE media_operations SET state = ?, finished_at = ?, retry_at = ?, dead_letter_at = ?, \
-         lease_owner = NULL, lease_expires_at = NULL, error_code = ?, error_message = ? \
-         WHERE id = ? AND state = 'running' AND lease_owner = ? AND lease_expires_at > ? \
-         AND EXISTS (SELECT 1 FROM media_reconciler_leases WHERE singleton = 1 \
-             AND lease_owner = ? AND lease_expires_at > ?)",
-    )
-    .bind(operation_state)
-    .bind(finished_at)
-    .bind(retry_at)
-    .bind(dead_letter_at)
-    .bind(error_code)
-    .bind(error_message)
-    .bind(&operation.id)
-    .bind(owner)
-    .bind(now)
-    .bind(owner)
-    .bind(now)
-    .execute(&mut *transaction)
-    .await?;
-    if result.rows_affected() != 1 {
-        return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
-    }
-    sqlx::query("UPDATE cameras SET status = 'error', updated_at = ? WHERE id = ?")
+    let retry_at = (kind == FailureKind::Retryable).then(|| now + retry_delay(operation.attempt));
+    let event = match kind {
+        FailureKind::Indeterminate => Transition::MarkIndeterminate {
+            code: error_code.into(),
+        },
+        FailureKind::Retryable | FailureKind::Definitive => Transition::Fail {
+            code: error_code.into(),
+            retryable: kind == FailureKind::Retryable,
+            retry_not_before_micros: retry_at.map_or(0, |value| value.timestamp_micros()),
+        },
+    };
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE cameras SET status = 'error', updated_at = ? WHERE id = ? \
+        AND EXISTS (SELECT 1 FROM media_desired_states WHERE camera_id = cameras.id AND generation = ?)")
         .bind(now)
         .bind(operation.camera_id)
+        .bind(operation.generation)
         .execute(&mut *transaction)
         .await?;
+    complete_owned_in(
+        &mut transaction,
+        operation,
+        event,
+        Some(json!({ "error": error_message })),
+    )
+    .await?;
     transaction.commit().await?;
     tracing::warn!(
         operation_id = %operation.id,
@@ -748,31 +902,34 @@ async fn finish_failure(
     Ok(())
 }
 
-fn sanitized_failure(error: &AppError) -> (&'static str, &'static str, &'static str, bool) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureKind {
+    Retryable,
+    Definitive,
+    Indeterminate,
+}
+
+fn sanitized_failure(error: &AppError) -> (FailureKind, &'static str, &'static str) {
     match error {
         AppError::UpstreamUnknown(_) => (
-            "unknown",
+            FailureKind::Indeterminate,
             "media_outcome_unknown",
             "The media service outcome could not be determined",
-            true,
         ),
         AppError::Upstream(_) => (
-            "failed",
+            FailureKind::Retryable,
             "media_request_failed",
             "The media service rejected or could not process the desired state",
-            true,
         ),
         AppError::Validation(_) => (
-            "failed",
+            FailureKind::Definitive,
             "invalid_stored_camera_configuration",
             "The stored camera configuration is invalid",
-            false,
         ),
         _ => (
-            "failed",
+            FailureKind::Definitive,
             "media_reconciliation_internal",
             "The desired media state could not be prepared",
-            false,
         ),
     }
 }
@@ -783,28 +940,13 @@ fn retry_delay(attempt: i64) -> Duration {
 }
 
 async fn finish_superseded(pool: &SqlitePool, operation: &MediaOperationView) -> Result<()> {
-    let owner = operation_owner(operation)?;
-    let now = Utc::now();
-    let result = sqlx::query(
-        "UPDATE media_operations SET state = 'succeeded', finished_at = ?, retry_at = NULL, \
-         lease_owner = NULL, lease_expires_at = NULL, result_json = ?, error_code = NULL, \
-         error_message = NULL WHERE id = ? AND state = 'running' AND lease_owner = ? \
-         AND lease_expires_at > ? AND EXISTS (SELECT 1 FROM media_reconciler_leases \
-             WHERE singleton = 1 AND lease_owner = ? AND lease_expires_at > ?)",
+    complete_owned(
+        pool,
+        operation,
+        Transition::Succeed,
+        Some(json!({ "converged": false, "superseded": true })),
     )
-    .bind(now)
-    .bind(json!({ "converged": false, "superseded": true }))
-    .bind(&operation.id)
-    .bind(owner)
-    .bind(now)
-    .bind(owner)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    if result.rows_affected() != 1 {
-        return Err(AppError::Conflict("媒体操作租约已由其他执行器接管".into()));
-    }
-    Ok(())
+    .await
 }
 
 async fn load_desired(pool: &SqlitePool, camera_id: Uuid) -> Result<DesiredState> {
@@ -988,24 +1130,44 @@ async fn ensure_drift_operation(
     observation_started_at: DateTime<Utc>,
 ) -> Result<()> {
     let now = Utc::now();
-    sqlx::query(
-        "INSERT OR IGNORE INTO media_operations (id, camera_id, generation, kind, state, \
-         reason, attempt, created_at, retry_at) \
-         SELECT ?, ?, ?, 'reconcile_camera', 'pending', 'drift_detected', 0, ?, ? \
-         WHERE NOT EXISTS (SELECT 1 FROM media_operations WHERE camera_id = ? AND generation = ? \
-             AND (state IN ('pending', 'running', 'failed', 'unknown') \
-                  OR (state = 'succeeded' AND finished_at >= ?)))",
+    let store = SqliteOperationStore::new(pool.clone());
+    if let Some(latest) = store
+        .latest_for_target(
+            OPERATION_NAMESPACE,
+            &desired.camera_id.hyphenated().to_string(),
+        )
+        .await
+        .map_err(operation_error)?
+    {
+        let request: MediaOperationRequest = serde_json::from_slice(&latest.request_payload)
+            .map_err(|_| AppError::Internal("媒体操作请求损坏".into()))?;
+        let blocks_new = request.generation == desired.generation
+            && (matches!(
+                latest.operation.state,
+                OperationState::Pending
+                    | OperationState::Running
+                    | OperationState::Unknown
+                    | OperationState::Failed
+                    | OperationState::DeadLetter
+            ) || (latest.operation.state == OperationState::Succeeded
+                && latest.updated_at_micros >= observation_started_at.timestamp_micros()));
+        if blocks_new {
+            return Ok(());
+        }
+    }
+    let mut transaction = pool.begin().await?;
+    enqueue_operation_in(
+        &mut transaction,
+        MediaOperationRequest {
+            camera_id: desired.camera_id,
+            generation: desired.generation,
+            reason: "drift_detected".into(),
+            requested_by: None,
+        },
+        now,
     )
-    .bind(Uuid::new_v4().to_string())
-    .bind(desired.camera_id)
-    .bind(desired.generation)
-    .bind(now)
-    .bind(now)
-    .bind(desired.camera_id)
-    .bind(desired.generation)
-    .bind(observation_started_at)
-    .execute(pool)
     .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1036,14 +1198,10 @@ fn source_with_credentials(
     Ok(url.to_string())
 }
 
-const fn operation_select_fields() -> &'static str {
-    "id, camera_id, generation, kind, state, reason, requested_by, attempt, max_attempts, created_at, \
-     started_at, finished_at, retry_at, error_code, error_message, lease_owner, lease_expires_at"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sarmg_admin_core::AdministratorStore as _;
 
     async fn lease_test_database() -> (tempfile::TempDir, SqlitePool, String, String) {
         let temporary = tempfile::tempdir().unwrap();
@@ -1051,26 +1209,35 @@ mod tests {
         let database_url = format!("sqlite://{}", database.display());
         let pool = crate::sqlite::open_pool(&database_url).await.unwrap();
         let now = Utc::now();
-        let user = Uuid::new_v4();
+        let now_micros = now.timestamp_micros();
         let camera = Uuid::new_v4();
         let operation = Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-             VALUES (?, 'lease-admin', 'hash', ?, ?)",
-        )
-        .bind(user)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let administrator = sarmg_admin_core::AdministratorService::new(
+            sarmg_admin_sqlite::SqliteAdministratorStore::new(pool.clone()),
+        );
+        assert!(administrator
+            .bootstrap_administrator("lease-admin", "lease-admin-password", now_micros as u64)
+            .await
+            .unwrap());
+        let user = administrator
+            .store()
+            .administrator_by_username("lease-admin")
+            .await
+            .unwrap()
+            .unwrap()
+            .administrator_id
+            .to_string();
+        assert!(
+            Uuid::parse_str(&user).is_err(),
+            "Foundation administrator IDs are opaque, not product UUIDs"
+        );
         sqlx::query(
             "INSERT INTO cameras (id, name, main_stream_url_enc, created_by, created_at, updated_at) \
              VALUES (?, 'Lease Camera', ?, ?, ?, ?)",
         )
         .bind(camera)
         .bind(vec![1u8; 32])
-        .bind(user)
+        .bind(user.to_string())
         .bind(now)
         .bind(now)
         .execute(&pool)
@@ -1085,18 +1252,28 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO media_operations (id, camera_id, generation, kind, state, reason, \
-             attempt, created_at, retry_at) VALUES (?, ?, 1, 'reconcile_camera', 'pending', \
-             'drift_detected', 0, ?, ?)",
-        )
-        .bind(&operation)
-        .bind(camera)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let request = MediaOperationRequest {
+            camera_id: camera,
+            generation: 1,
+            reason: "drift_detected".into(),
+            requested_by: Some(user.to_string()),
+        };
+        let payload = serde_json::to_vec(&request).unwrap();
+        SqliteOperationStore::new(pool.clone())
+            .enqueue(NewOperation {
+                operation_id: operation.clone(),
+                namespace: OPERATION_NAMESPACE.into(),
+                target_key: camera.hyphenated().to_string(),
+                action: "reconcile_camera".into(),
+                idempotency_digest: Sha256::digest(operation.as_bytes()).into(),
+                request_fingerprint: Sha256::digest(&payload).into(),
+                request_payload: payload,
+                max_attempts: 8,
+                not_before_micros: now_micros,
+                created_at_micros: now_micros,
+            })
+            .await
+            .unwrap();
         (temporary, pool, operation, database_url)
     }
 
@@ -1106,6 +1283,165 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::seconds(2));
         assert_eq!(retry_delay(8), Duration::seconds(256));
         assert_eq!(retry_delay(100), Duration::seconds(256));
+    }
+
+    async fn claim_for_test(pool: &SqlitePool) -> MediaOperationView {
+        let owner = Uuid::new_v4().to_string();
+        sqlx::query("UPDATE media_reconciler_leases SET lease_owner = ?, lease_expires_at = ?, updated_at = ? WHERE singleton = 1")
+            .bind(&owner).bind(Utc::now() + Duration::minutes(5)).bind(Utc::now())
+            .execute(pool).await.unwrap();
+        claim_next_operation(pool, &owner, StdDuration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn success_and_audit_failure_cannot_publish_partial_camera_results() {
+        let (_directory, pool, id, _) = lease_test_database().await;
+        let operation = claim_for_test(&pool).await;
+        let desired = load_desired(&pool, operation.camera_id).await.unwrap();
+        let applied = AppliedSources {
+            main_digest: Some([42; 32]),
+            sub_digest: None,
+        };
+        sqlx::raw_sql("CREATE TRIGGER reject_operation_audit BEFORE INSERT ON _sarmg_operation_audit_outbox BEGIN SELECT RAISE(FAIL, 'injected'); END;")
+            .execute(&pool).await.unwrap();
+        assert!(finish_success(&pool, &operation, &desired, &applied)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_actual_paths")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let store = SqliteOperationStore::new(pool.clone());
+        assert_eq!(
+            store.get(&id).await.unwrap().unwrap().operation.state,
+            OperationState::Running
+        );
+        sqlx::query("DROP TRIGGER reject_operation_audit")
+            .execute(&pool)
+            .await
+            .unwrap();
+        finish_success(&pool, &operation, &desired, &applied)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_actual_paths")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store.get(&id).await.unwrap().unwrap().operation.state,
+            OperationState::Succeeded
+        );
+        assert_eq!(store.pending_audit_count().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn superseded_global_owner_cannot_publish_success_or_failure() {
+        let (_directory, pool, id, _) = lease_test_database().await;
+        let operation = claim_for_test(&pool).await;
+        let desired = load_desired(&pool, operation.camera_id).await.unwrap();
+        let initial_status: String = sqlx::query_scalar("SELECT status FROM cameras WHERE id = ?")
+            .bind(operation.camera_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media_reconciler_leases SET lease_owner = ? WHERE singleton = 1")
+            .bind(Uuid::new_v4().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(finish_success(
+            &pool,
+            &operation,
+            &desired,
+            &AppliedSources {
+                main_digest: None,
+                sub_digest: None
+            }
+        )
+        .await
+        .is_err());
+        assert!(
+            finish_failure(&pool, &operation, &AppError::Upstream("rejected".into()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_actual_paths")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM cameras WHERE id = ?")
+                .bind(operation.camera_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            initial_status
+        );
+        assert_eq!(
+            SqliteOperationStore::new(pool)
+                .get(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .state,
+            OperationState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_audit_delivery_is_atomic_and_idempotent() {
+        let (_directory, pool, _, _) = lease_test_database().await;
+        let store = SqliteOperationStore::new(pool.clone());
+        sqlx::raw_sql("CREATE TRIGGER reject_ack BEFORE UPDATE OF delivered_at_micros ON _sarmg_operation_audit_outbox BEGIN SELECT RAISE(FAIL, 'injected'); END;")
+            .execute(&pool).await.unwrap();
+        assert!(flush_operation_audit(&pool).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.pending_audit_count().await.unwrap(), 1);
+        sqlx::query("DROP TRIGGER reject_ack")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(flush_operation_audit(&pool).await.unwrap(), 1);
+        assert_eq!(flush_operation_audit(&pool).await.unwrap(), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.pending_audit_count().await.unwrap(), 0);
+        let record = sqlx::query_as::<_, crate::models::AuditRecord>(
+            "SELECT id, user_id, action, entity_type, entity_id, details, created_at FROM audit_logs",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(record.user_id.as_ref().map(String::len), Some(43));
+        assert!(record.entity_id.is_some());
+        let event_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO events (id, kind, severity, message, acknowledged_by, created_at) VALUES (?, 'test', 'info', 'test', ?, ?)")
+            .bind(event_id).bind(record.user_id).bind(Utc::now()).execute(&pool).await.unwrap();
+        let event = sqlx::query_as::<_, crate::models::EventRecord>(
+            "SELECT id, camera_id, kind, severity, message, details, acknowledged_at, acknowledged_by, created_at FROM events WHERE id = ?",
+        ).bind(event_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(event.acknowledged_by.as_ref().map(String::len), Some(43));
     }
 
     #[test]
@@ -1126,7 +1462,7 @@ mod tests {
     fn persisted_failures_never_include_upstream_or_camera_details() {
         let secret = "rtsp://admin:super-secret@camera.invalid/live";
         let error = AppError::Upstream(format!("rejected payload containing {secret}"));
-        let (_, code, message, _) = sanitized_failure(&error);
+        let (_, code, message) = sanitized_failure(&error);
         assert_eq!(code, "media_request_failed");
         assert!(!message.contains("super-secret"));
         assert!(!message.contains("camera.invalid"));
@@ -1136,16 +1472,6 @@ mod tests {
     async fn expired_operation_is_fenced_and_a_new_owner_can_take_over() {
         let (_temporary, pool, operation_id, _database_url) = lease_test_database().await;
         let active_until = Utc::now() + Duration::minutes(5);
-        sqlx::query(
-            "UPDATE media_operations SET state = 'running', attempt = 1, started_at = ?, \
-             lease_owner = 'old-owner', lease_expires_at = ? WHERE id = ?",
-        )
-        .bind(Utc::now())
-        .bind(active_until)
-        .bind(&operation_id)
-        .execute(&pool)
-        .await
-        .unwrap();
         let new_owner = Uuid::new_v4().to_string();
         sqlx::query(
             "UPDATE media_reconciler_leases SET lease_owner = ?, lease_expires_at = ?, \
@@ -1157,52 +1483,51 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let old_operation =
-            sqlx::query_as::<_, MediaOperationView>(&format!("{OPERATION_SELECT} WHERE id = ?"))
-                .bind(&operation_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let store = SqliteOperationStore::new(pool.clone());
+        let claimed = store
+            .claim_next(
+                OPERATION_NAMESPACE,
+                &new_owner,
+                Utc::now().timestamp_micros(),
+                active_until.timestamp_micros(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut old_operation = operation_view(claimed).unwrap();
+        old_operation.lease_owner = Some("old-owner".into());
         assert!(finish_superseded(&pool, &old_operation).await.is_err());
         let fenced_state: String =
-            sqlx::query_scalar("SELECT state FROM media_operations WHERE id = ?")
+            sqlx::query_scalar("SELECT state FROM _sarmg_operations WHERE operation_id = ?")
                 .bind(&operation_id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(fenced_state, "running");
 
-        let expired = Utc::now() - Duration::seconds(1);
-        sqlx::query("UPDATE media_operations SET lease_expires_at = ? WHERE id = ?")
+        let expired = (Utc::now() - Duration::seconds(1)).timestamp_micros();
+        sqlx::query("UPDATE _sarmg_operations SET lease_expiry_micros = ? WHERE operation_id = ?")
             .bind(expired)
             .bind(&operation_id)
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(
-            recover_expired_operation_leases_at(&pool, Utc::now())
+        assert_eq!(recover_interrupted_operations(&pool).await.unwrap(), 1);
+        assert!(
+            claim_next_operation(&pool, &new_owner, StdDuration::from_secs(1))
                 .await
-                .unwrap(),
-            1
+                .unwrap()
+                .is_none(),
+            "Unknown operations are never automatically claimed"
         );
-        let claimed = claim_next_operation(&pool, &new_owner, StdDuration::from_secs(1))
-            .await
-            .unwrap()
-            .expect("new owner claims expired operation");
-        assert_eq!(claimed.lease_owner.as_deref(), Some(new_owner.as_str()));
-        assert_eq!(claimed.state, "running");
-
-        let mut stale = claimed.clone();
-        stale.lease_owner = Some("old-owner".into());
-        stale.lease_expires_at = Some(active_until);
-        assert!(finish_superseded(&pool, &stale).await.is_err());
-        let still_owned: (String, Option<String>) =
-            sqlx::query_as("SELECT state, lease_owner FROM media_operations WHERE id = ?")
-                .bind(&operation_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(still_owned, ("running".into(), Some(new_owner.clone())));
+        let still_unknown: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, lease_owner FROM _sarmg_operations WHERE operation_id = ?",
+        )
+        .bind(&operation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_unknown, ("unknown".into(), None));
 
         assert!(!release_reconciler_lease(&pool, "old-owner").await.unwrap());
         let global_owner: Option<String> = sqlx::query_scalar(
@@ -1213,19 +1538,12 @@ mod tests {
         .unwrap();
         assert_eq!(global_owner.as_deref(), Some(new_owner.as_str()));
 
-        finish_superseded(&pool, &claimed).await.unwrap();
-        let state: String = sqlx::query_scalar("SELECT state FROM media_operations WHERE id = ?")
-            .bind(&operation_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(state, "succeeded");
         assert!(release_reconciler_lease(&pool, &new_owner).await.unwrap());
         pool.close().await;
     }
 
     #[tokio::test]
-    async fn startup_recovery_from_another_pool_preserves_active_leases() {
+    async fn startup_recovery_marks_previous_running_work_unknown() {
         let (_temporary, first, operation_id, database_url) = lease_test_database().await;
         let active_until = Utc::now() + Duration::minutes(5);
         let healthy_owner = Uuid::new_v4().to_string();
@@ -1239,27 +1557,27 @@ mod tests {
         .execute(&first)
         .await
         .unwrap();
-        sqlx::query(
-            "UPDATE media_operations SET state = 'running', started_at = ?, attempt = 1, \
-             lease_owner = ?, lease_expires_at = ? WHERE id = ?",
-        )
-        .bind(Utc::now())
-        .bind(&healthy_owner)
-        .bind(active_until)
-        .bind(&operation_id)
-        .execute(&first)
-        .await
-        .unwrap();
+        SqliteOperationStore::new(first.clone())
+            .claim_next(
+                OPERATION_NAMESPACE,
+                &healthy_owner,
+                Utc::now().timestamp_micros(),
+                active_until.timestamp_micros(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
 
         let second = crate::sqlite::open_pool(&database_url).await.unwrap();
-        assert_eq!(recover_interrupted_operations(&second).await.unwrap(), 0);
-        let operation: (String, Option<String>) =
-            sqlx::query_as("SELECT state, lease_owner FROM media_operations WHERE id = ?")
-                .bind(&operation_id)
-                .fetch_one(&first)
-                .await
-                .unwrap();
-        assert_eq!(operation, ("running".into(), Some(healthy_owner.clone())));
+        assert_eq!(recover_interrupted_operations(&second).await.unwrap(), 1);
+        let operation: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, lease_owner FROM _sarmg_operations WHERE operation_id = ?",
+        )
+        .bind(&operation_id)
+        .fetch_one(&first)
+        .await
+        .unwrap();
+        assert_eq!(operation, ("unknown".into(), None));
         let global: Option<String> = sqlx::query_scalar(
             "SELECT lease_owner FROM media_reconciler_leases WHERE singleton = 1",
         )

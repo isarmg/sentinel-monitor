@@ -4,37 +4,77 @@ use crate::{
     reconciliation, AppState,
 };
 use serde_json::{json, Value};
-use tokio::time::{self, MissedTickBehavior};
+use tokio::{
+    sync::watch,
+    time::{self, MissedTickBehavior},
+};
 use uuid::Uuid;
 
 const CAMERA_SELECT: &str = "SELECT id, name, location, main_stream_url_enc, sub_stream_url_enc, \
     onvif_url, username_enc, password_enc, enabled, record_enabled, status, last_seen_at, created_at, updated_at \
     FROM cameras WHERE deleted_at IS NULL";
 
-pub fn spawn(state: AppState) {
-    let reconcile_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = time::interval(reconcile_state.config.reconcile_interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Err(error) = reconciliation::reconcile_available(&reconcile_state).await {
-                tracing::warn!(error = %error, "camera reconciliation cycle failed");
+pub async fn operation_audit_loop(
+    pool: sqlx::SqlitePool,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::result::Result<(), String> {
+    let mut interval = time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = sarmg_server_runtime::wait_for_shutdown(&mut shutdown) => return Ok(()),
+            _ = interval.tick() => {
+                reconciliation::flush_operation_audit(&pool).await
+                    .map_err(|_| "operation audit delivery failed".to_owned())?;
             }
         }
-    });
+    }
+}
 
-    tokio::spawn(async move {
-        time::sleep(std::time::Duration::from_secs(2)).await;
-        let mut interval = time::interval(state.config.status_interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Err(error) = refresh_statuses(&state).await {
-                tracing::warn!(%error, "camera status refresh failed");
+pub async fn reconcile_loop(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::result::Result<(), String> {
+    let mut interval = time::interval(state.config.reconcile_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+            }
+            _ = interval.tick() => {
+                if let Err(error) = reconciliation::reconcile_available(&state).await {
+                    tracing::warn!(error = %error, "camera reconciliation cycle failed");
+                }
             }
         }
-    });
+    }
+}
+
+pub async fn status_loop(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::result::Result<(), String> {
+    tokio::select! {
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+        }
+        _ = time::sleep(std::time::Duration::from_secs(2)) => {}
+    }
+    let mut interval = time::interval(state.config.status_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+            }
+            _ = interval.tick() => {
+                if let Err(error) = refresh_statuses(&state).await {
+                    tracing::warn!(%error, "camera status refresh failed");
+                }
+            }
+        }
+    }
 }
 
 pub fn camera_path(id: Uuid, profile: &str) -> String {

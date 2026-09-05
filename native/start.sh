@@ -161,7 +161,7 @@ fi
 
 APP_READY=false
 for _ in {1..60}; do
-  if curl -fsS "${SENTINEL_READY_URL:-http://127.0.0.1:8080/health/ready}" >/dev/null; then
+  if readiness="$(curl -fsS --max-time 3 --max-filesize 128 -w ':%{http_code}' "${SENTINEL_READY_URL:-http://127.0.0.1:8080/readyz}")" && [[ "$readiness" == '{"ready":true}:200' ]]; then
     APP_READY=true
     break
   fi
@@ -177,4 +177,4 @@ trap - EXIT
 STARTED_APP=""
 STARTED_MEDIA=""
 
-echo "Sentinel Monitor 0.2.0 is ready at ${SENTINEL_READY_URL:-http://127.0.0.1:8080/health/ready}"
+echo "Sentinel Monitor 0.2.0 is ready at ${SENTINEL_READY_URL:-http://127.0.0.1:8080/readyz}"

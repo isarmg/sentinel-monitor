@@ -1,6 +1,11 @@
 use anyhow::{ensure, Context};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags};
+use sarmg_schema_identity::{
+    schema_fingerprint as fingerprint_schema_rows, validate_product_metadata_columns,
+    validate_product_metadata_ddl, verify_current_schema, ProductMetadataColumn,
+    ProductMetadataRow, SchemaIdentity, SchemaRow, SQLITE_SCHEMA_ROWS_QUERY,
+};
 use sha2::{Digest, Sha256};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -21,17 +26,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 const MAX_CONNECTIONS: u32 = 10;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const APPLICATION: &str = "sentinel-monitor";
-pub const CURRENT_SCHEMA_REVISION: i64 = 1;
+pub const CURRENT_SCHEMA_REVISION: i64 = 3;
 pub const CURRENT_SCHEMA_SHA256: &str =
-    "f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0";
-const CURRENT_SCHEMA: &str = include_str!("current_schema.sql");
-const PRODUCT_METADATA_SQL: &str = "CREATE TABLE product_metadata (
-    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-    application TEXT NOT NULL,
-    application_version TEXT NOT NULL,
-    schema_revision INTEGER NOT NULL,
-    schema_sha256 TEXT NOT NULL
-)";
+    "18d53d385fda41458b3e614d0f1179409a52137b52c6b69ce5c3c19c5f84506e";
+const CURRENT_SCHEMA: &str = include_str!("../schema/generated/current_schema.sql");
 const GLOBAL_LEASE_SQL: &str = "CREATE TABLE media_reconciler_leases (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
     lease_owner TEXT,
@@ -66,6 +64,15 @@ pub(crate) struct GlobalLeaseState {
     pub owner: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+pub(crate) fn current_schema_identity() -> anyhow::Result<SchemaIdentity> {
+    Ok(SchemaIdentity::new(
+        APPLICATION,
+        env!("CARGO_PKG_VERSION"),
+        u64::try_from(CURRENT_SCHEMA_REVISION).context("current schema revision is negative")?,
+        CURRENT_SCHEMA_SHA256,
+    )?)
 }
 
 pub async fn open_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
@@ -346,11 +353,19 @@ fn initialize_current_database(path: &Path) -> anyhow::Result<()> {
         connection.execute_batch("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;")?;
         let transaction_result = (|| {
             connection.execute_batch(CURRENT_SCHEMA)?;
+            connection.execute(
+                "INSERT INTO _sarmg_platform_metadata(\
+                 singleton,platform_generation,platform_schema_revision,profile,created_at_micros\
+                 ) VALUES(1,1,1,'server-control-plane',?)",
+                [Utc::now().timestamp_micros()],
+            )?;
+            connection.execute(
+                "INSERT INTO media_reconciler_leases(singleton,updated_at) VALUES(1,'1970-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            let expected = current_schema_identity()?;
             let actual = schema_fingerprint(&connection)?;
-            ensure!(
-                actual == CURRENT_SCHEMA_SHA256,
-                "compiled current schema fingerprint mismatch: {actual}"
-            );
+            expected.verify_fingerprint(&actual)?;
             connection.execute(
                 "INSERT INTO product_metadata (
                      singleton, application, application_version, schema_revision, schema_sha256
@@ -388,53 +403,10 @@ fn initialize_current_database(path: &Path) -> anyhow::Result<()> {
 
 fn validate_current_connection(connection: &Connection) -> anyhow::Result<()> {
     validate_product_metadata_table(connection)?;
-    let count: i64 = connection.query_row("SELECT COUNT(*) FROM product_metadata", [], |row| {
-        row.get(0)
-    })?;
-    ensure!(count == 1, "product_metadata must contain exactly one row");
-    let (singleton, application, version, revision, expected_fingerprint): (
-        i64,
-        String,
-        String,
-        i64,
-        String,
-    ) = connection.query_row(
-        "SELECT singleton, application, application_version, schema_revision, schema_sha256
-         FROM product_metadata",
-        [],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
-    )?;
-    ensure!(singleton == 1, "product_metadata singleton is invalid");
-    ensure!(
-        application == APPLICATION,
-        "database belongs to a different application"
-    );
-    ensure!(
-        version == env!("CARGO_PKG_VERSION"),
-        "database application version is not exactly current"
-    );
-    ensure!(
-        revision == CURRENT_SCHEMA_REVISION,
-        "database schema revision is not exactly current"
-    );
-    ensure!(
-        expected_fingerprint == CURRENT_SCHEMA_SHA256,
-        "database schema fingerprint metadata is not exactly current"
-    );
+    let metadata_rows = product_metadata_rows(connection)?;
     validate_global_lease_table(connection)?;
-    let actual = schema_fingerprint(connection)?;
-    ensure!(
-        actual == CURRENT_SCHEMA_SHA256,
-        "actual SQLite schema does not match the compiled current schema"
-    );
+    let schema_rows = schema_rows(connection)?;
+    verify_current_schema(&metadata_rows, &schema_rows, &current_schema_identity()?)?;
     Ok(())
 }
 
@@ -447,33 +419,81 @@ fn validate_product_metadata_table(connection: &Connection) -> anyhow::Result<()
             |row| row.get(0),
         )
         .context("database has no current product_metadata table")?;
-    ensure!(
-        normalize_sql(&sql) == normalize_sql(PRODUCT_METADATA_SQL),
-        "product_metadata table does not match the current contract"
-    );
+    validate_product_metadata_ddl(&sql)?;
     let mut columns = connection.prepare("PRAGMA table_info('product_metadata')")?;
     let actual = columns
         .query_map([], |row| {
+            Ok(ProductMetadataColumn {
+                cid: row.get(0)?,
+                name: row.get(1)?,
+                declared_type: row.get(2)?,
+                not_null: row.get(3)?,
+                default_sql: row.get(4)?,
+                primary_key_position: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_product_metadata_columns(&actual)?;
+    Ok(())
+}
+
+fn product_metadata_rows(connection: &Connection) -> anyhow::Result<Vec<ProductMetadataRow>> {
+    let mut statement = connection.prepare(
+        "SELECT typeof(singleton), singleton, typeof(application), application,
+                typeof(application_version), application_version,
+                typeof(schema_revision), schema_revision,
+                typeof(schema_sha256), schema_sha256
+         FROM product_metadata ORDER BY singleton",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
             Ok((
-                row.get::<_, String>(1)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let expected = vec![
-        ("singleton".to_string(), "INTEGER".to_string(), 1, 1),
-        ("application".to_string(), "TEXT".to_string(), 1, 0),
-        ("application_version".to_string(), "TEXT".to_string(), 1, 0),
-        ("schema_revision".to_string(), "INTEGER".to_string(), 1, 0),
-        ("schema_sha256".to_string(), "TEXT".to_string(), 1, 0),
-    ];
-    ensure!(
-        actual == expected,
-        "product_metadata columns do not match the current contract"
-    );
-    Ok(())
+
+    rows.into_iter()
+        .map(
+            |(
+                singleton_storage,
+                singleton,
+                application_storage,
+                application,
+                version_storage,
+                application_version,
+                revision_storage,
+                schema_revision,
+                fingerprint_storage,
+                schema_sha256,
+            )| {
+                ensure!(
+                    singleton_storage == "integer"
+                        && application_storage == "text"
+                        && version_storage == "text"
+                        && revision_storage == "integer"
+                        && fingerprint_storage == "text",
+                    "product_metadata values do not use the current SQLite storage classes"
+                );
+                Ok(ProductMetadataRow {
+                    singleton,
+                    application,
+                    application_version,
+                    schema_revision,
+                    schema_sha256,
+                })
+            },
+        )
+        .collect()
 }
 
 fn validate_global_lease_table(connection: &Connection) -> anyhow::Result<GlobalLeaseState> {
@@ -632,30 +652,22 @@ fn parse_canonical_utc(value: &str, label: &str) -> anyhow::Result<DateTime<Utc>
 }
 
 fn schema_fingerprint(connection: &Connection) -> anyhow::Result<String> {
-    let mut statement = connection.prepare(
-        "SELECT type, name, tbl_name, COALESCE(sql, '')
-         FROM sqlite_schema
-         WHERE name NOT GLOB 'sqlite_*' AND name <> 'product_metadata'
-         ORDER BY type, name, tbl_name",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok([
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ])
-    })?;
-    let mut hasher = Sha256::new();
-    for row in rows {
-        for field in row? {
-            let bytes = field.as_bytes();
-            let length = u64::try_from(bytes.len()).context("schema field is too large")?;
-            hasher.update(length.to_be_bytes());
-            hasher.update(bytes);
-        }
-    }
-    Ok(lower_hex(hasher.finalize()))
+    Ok(fingerprint_schema_rows(&schema_rows(connection)?)?)
+}
+
+fn schema_rows(connection: &Connection) -> anyhow::Result<Vec<SchemaRow>> {
+    let mut statement = connection.prepare(SQLITE_SCHEMA_ROWS_QUERY)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SchemaRow::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 fn normalize_sql(value: &str) -> String {
@@ -664,15 +676,6 @@ fn normalize_sql(value: &str) -> String {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.as_ref().len() * 2);
-    for byte in bytes.as_ref() {
-        write!(&mut output, "{byte:02x}").expect("write to String");
-    }
-    output
 }
 
 fn require_secure_database_file(path: &Path) -> anyhow::Result<()> {
@@ -878,6 +881,12 @@ mod tests {
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
             .unwrap();
         connection.execute_batch(CURRENT_SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO media_reconciler_leases(singleton,updated_at) VALUES(1,'1970-01-01T00:00:00+00:00')",
+                [],
+            )
+            .unwrap();
         let fingerprint = schema_fingerprint(&connection).unwrap();
         connection
             .execute(
@@ -916,11 +925,34 @@ mod tests {
             ),
             (
                 "wrong-revision",
-                "UPDATE product_metadata SET schema_revision = 2",
+                "UPDATE product_metadata SET schema_revision = 4",
+            ),
+            (
+                "negative-revision",
+                "UPDATE product_metadata SET schema_revision = -1",
             ),
             (
                 "wrong-fingerprint",
                 "UPDATE product_metadata SET schema_sha256 = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'",
+            ),
+            (
+                "wrong-metadata-storage-class",
+                "UPDATE product_metadata SET schema_sha256 = x'00'",
+            ),
+            ("missing-metadata-row", "DELETE FROM product_metadata"),
+            (
+                "extra-metadata-row",
+                "PRAGMA ignore_check_constraints=ON;
+                 INSERT INTO product_metadata (
+                     singleton, application, application_version, schema_revision, schema_sha256
+                 ) VALUES (
+                     2, 'sentinel-monitor', '0.2.0', 1,
+                     'f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0'
+                 )",
+            ),
+            (
+                "metadata-shape-drift",
+                "ALTER TABLE product_metadata ADD COLUMN unexpected TEXT",
             ),
             ("schema-tamper", "CREATE TABLE unexpected_product_table(id INTEGER)"),
         ] {

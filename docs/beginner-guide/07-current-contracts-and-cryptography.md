@@ -12,6 +12,11 @@
 `f547ddc817d830d23b5305bb1f88b29898d6531568edd6eb194c2b629eb560c0`；`users` 只有 canonical
 `username`，没有 email/role。空文件、非当前库和漂移库都只读拒绝。
 
+共享 Foundation `sarmg-schema-identity 0.3.1` 定义 fingerprint v1 的字节 framing、metadata 五列 DDL/
+shape 和 exact identity 比较；Sentinel 把私有 rusqlite generation 映射为共享 `SchemaRow`/
+`ProductMetadataRow` 后执行验证。SQLite 文件、WAL/journal 快照、路径防替换和业务 lease 校验仍由产品
+负责。这里只存在当前 revision 1，不因为采用共享算法增加任何旧格式兼容。
+
 ## 7.3 Administrator 身份合同
 
 登录 JSON 只接受 `username/password`，Session 只返回 `authenticated/user_id/username/role/csrf_token`。

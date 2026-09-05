@@ -25,5 +25,5 @@ show_status "Rust application" "$SENTINEL_RUNTIME_PATH/app.pid" \
   "$SENTINEL_RELEASE_ROOT/bin/sentinel-monitor"
 show_status "MediaMTX" "$SENTINEL_RUNTIME_PATH/mediamtx.pid" \
   "$SENTINEL_RELEASE_ROOT/bin/mediamtx"
-curl -fsS "${SENTINEL_READY_URL:-http://127.0.0.1:8080/health/ready}" || true
+curl -fsS "${SENTINEL_READY_URL:-http://127.0.0.1:8080/readyz}" || true
 echo

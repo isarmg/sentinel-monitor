@@ -10,18 +10,25 @@
     "dev": "vite --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "check:foundation": "node tests/design-foundation.test.mjs",
-    "build": "npm run check:foundation && npm run typecheck && vite build"
+    "build": "npm run check:foundation && npm run typecheck && vite build",
+    "test:browser": "npm run build && node tests/browser-acceptance.mjs"
   },
   "dependencies": {
-    "@sarmg/admin-web": "https://github.com/isarmg/sarmg-foundation/releases/download/v0.3.0/sarmg-admin-web-0.3.0.tgz",
-    "@sarmg/contracts": "https://github.com/isarmg/sarmg-foundation/releases/download/v0.3.0/sarmg-contracts-0.3.0.tgz",
-    "@sarmg/design-tokens": "https://github.com/isarmg/sarmg-foundation/releases/download/v0.3.0/sarmg-design-tokens-0.3.0.tgz",
-    "@sarmg/http-client": "https://github.com/isarmg/sarmg-foundation/releases/download/v0.3.0/sarmg-http-client-0.3.0.tgz",
+    "@sarmg/admin-web": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-admin-web-0.6.0.tgz",
+    "@sarmg/admin-shell": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-admin-shell-0.6.0.tgz",
+    "@sarmg/admin-ui": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-admin-ui-0.6.0.tgz",
+    "@sarmg/contracts": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-contracts-0.6.0.tgz",
+    "@sarmg/design-tokens": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-design-tokens-0.6.0.tgz",
+    "@sarmg/http-client": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-http-client-0.6.0.tgz",
+    "@sarmg/web-fonts": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-web-fonts-0.6.0.tgz",
+    "@sarmg/web-toolchain": "https://github.com/isarmg/sarmg-foundation-server/releases/download/v0.6.0/sarmg-web-toolchain-0.6.0.tgz",
     "hls.js": "1.6.13",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
     "@vitejs/plugin-react": "4.7.0",

@@ -1,0 +1,23 @@
+format = 1
+product_id = "sentinel-monitor"
+
+[foundation]
+platform_generation = 1
+version = "0.6.0"
+git_rev = "1e889d08fa69fcf2b5fffe45e8cc42b68218f4f1"
+
+[[components]]
+id = "server"
+profile = "server-control-plane"
+http_adapter = "axum"
+web_profile = "web-react-admin"
+capabilities = [
+  "platform-sqlite",
+  "admin-persistent",
+  "server-runtime",
+  "server-health",
+  "durable-operations",
+  "secure-http",
+  "secure-xml",
+  "secret-envelope",
+]

@@ -111,6 +111,10 @@ inventory 表或逐文件 Hash 索引。Web 不应直连 9996/9997/9998 管理/�
 `product_metadata`、实际 `sqlite_schema` 指纹和 reconciler singleton 状态，再打开生产写连接。已有空
 文件、非当前身份、额外列、非法租约或 Schema drift 都只读拒绝，不自动补表/补行。
 
+Schema fingerprint framing、`product_metadata` DDL/列形状和 exact-current identity 比较来自 Foundation
+`sarmg-schema-identity 0.3.1`；Sentinel 只保留 rusqlite 私有 generation adapter、文件安全和媒体租约等
+产品不变量。这样多个产品不会复制同一 fingerprint 算法，也不会引入旧 Schema reader。
+
 ## 9. 修改代码的方法
 
 - 路由变化：同步 Rust、Web contract、MediaMTX 配置和测试。

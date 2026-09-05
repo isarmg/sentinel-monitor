@@ -1,31 +1,3 @@
-CREATE TABLE product_metadata (
-    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-    application TEXT NOT NULL,
-    application_version TEXT NOT NULL,
-    schema_revision INTEGER NOT NULL,
-    schema_sha256 TEXT NOT NULL
-);
-
-CREATE TABLE users (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL CHECK (
-        length(username) BETWEEN 3 AND 64
-        AND username = lower(username)
-        AND username NOT GLOB '*[^a-z0-9._-]*'
-        AND substr(username, 1, 1) GLOB '[a-z0-9]'
-        AND substr(username, -1, 1) GLOB '[a-z0-9]'
-        AND instr(username, '@') = 0
-    ),
-    password_hash TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1,
-    last_login_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    session_version INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE UNIQUE INDEX users_username_idx ON users (username);
-
 CREATE TABLE cameras (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -39,7 +11,7 @@ CREATE TABLE cameras (
     record_enabled INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'online', 'offline', 'disabled', 'error')),
     last_seen_at TEXT,
-    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_by TEXT REFERENCES _sarmg_administrators(administrator_id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     deleted_at TEXT
@@ -56,7 +28,7 @@ CREATE TABLE events (
     message TEXT NOT NULL,
     details TEXT NOT NULL DEFAULT '{}',
     acknowledged_at TEXT,
-    acknowledged_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    acknowledged_by TEXT REFERENCES _sarmg_administrators(administrator_id) ON DELETE SET NULL,
     created_at TEXT NOT NULL
 );
 
@@ -66,7 +38,7 @@ CREATE INDEX events_unacknowledged_idx ON events (created_at DESC) WHERE acknowl
 
 CREATE TABLE audit_logs (
     id TEXT PRIMARY KEY,
-    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    user_id TEXT REFERENCES _sarmg_administrators(administrator_id) ON DELETE SET NULL,
     action TEXT NOT NULL,
     entity_type TEXT NOT NULL,
     entity_id TEXT,
@@ -75,26 +47,6 @@ CREATE TABLE audit_logs (
 );
 
 CREATE INDEX audit_logs_created_at_idx ON audit_logs (created_at DESC);
-
-CREATE TABLE browser_sessions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_digest BLOB NOT NULL UNIQUE CHECK (length(token_digest) = 32),
-    csrf_digest BLOB NOT NULL CHECK (length(csrf_digest) = 32),
-    session_version INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    idle_expires_at TEXT NOT NULL,
-    absolute_expires_at TEXT NOT NULL,
-    revoked_at TEXT,
-    CHECK (idle_expires_at <= absolute_expires_at)
-);
-
-CREATE INDEX browser_sessions_user_idx
-    ON browser_sessions (user_id, absolute_expires_at DESC);
-CREATE INDEX browser_sessions_expiry_idx
-    ON browser_sessions (idle_expires_at, absolute_expires_at)
-    WHERE revoked_at IS NULL;
 
 CREATE TABLE media_desired_states (
     camera_id TEXT PRIMARY KEY REFERENCES cameras(id) ON DELETE RESTRICT,
@@ -105,43 +57,6 @@ CREATE TABLE media_desired_states (
     record_enabled INTEGER NOT NULL CHECK (record_enabled IN (0, 1)),
     updated_at TEXT NOT NULL
 );
-
-CREATE TABLE media_operations (
-    id TEXT PRIMARY KEY,
-    camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE RESTRICT,
-    generation INTEGER NOT NULL CHECK (generation > 0),
-    kind TEXT NOT NULL CHECK (kind = 'reconcile_camera'),
-    state TEXT NOT NULL CHECK (
-        state IN ('pending', 'running', 'succeeded', 'failed', 'unknown', 'dead_letter', 'resolved')
-    ),
-    reason TEXT NOT NULL CHECK (
-        reason IN ('camera_created', 'camera_updated', 'camera_deleted', 'drift_detected')
-    ),
-    requested_by TEXT REFERENCES users(id) ON DELETE SET NULL,
-    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
-    max_attempts INTEGER NOT NULL DEFAULT 8 CHECK (max_attempts BETWEEN 1 AND 64),
-    created_at TEXT NOT NULL,
-    started_at TEXT,
-    finished_at TEXT,
-    retry_at TEXT,
-    lease_owner TEXT,
-    lease_expires_at TEXT,
-    result_json TEXT,
-    error_code TEXT,
-    error_message TEXT,
-    dead_letter_at TEXT,
-    resolved_at TEXT,
-    resolved_by TEXT REFERENCES users(id) ON DELETE SET NULL,
-    resolution TEXT
-);
-
-CREATE INDEX media_operations_queue_idx
-    ON media_operations (state, retry_at, created_at);
-CREATE INDEX media_operations_camera_idx
-    ON media_operations (camera_id, generation, created_at DESC);
-CREATE UNIQUE INDEX media_operations_active_generation_idx
-    ON media_operations (camera_id, generation)
-    WHERE state IN ('pending', 'running', 'unknown');
 
 CREATE TABLE media_actual_paths (
     path_name TEXT PRIMARY KEY,
@@ -155,7 +70,7 @@ CREATE TABLE media_actual_paths (
     source_on_demand INTEGER CHECK (source_on_demand IS NULL OR source_on_demand IN (0, 1)),
     record_configured INTEGER CHECK (record_configured IS NULL OR record_configured IN (0, 1)),
     applied_generation INTEGER,
-    last_operation_id TEXT REFERENCES media_operations(id) ON DELETE SET NULL,
+    last_operation_id TEXT REFERENCES _sarmg_operations(operation_id) ON DELETE SET NULL,
     observed_at TEXT NOT NULL
 );
 
@@ -190,6 +105,3 @@ CREATE TABLE media_reconciler_leases (
         )
     )
 );
-
-INSERT INTO media_reconciler_leases (singleton, updated_at)
-VALUES (1, '1970-01-01T00:00:00+00:00');

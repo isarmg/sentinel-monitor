@@ -22,6 +22,10 @@ credential 在 Server 内解密，只在调用/生成受保护配置的最短范
 对绝对 ticket/Location 也会携带 Bearer；生产必须把 WebRTC base URL 锁定为同源相对路径，直到客户端
 实现显式 same-origin 拒绝。
 
+当前原生部署模板只有 `deploy/Caddyfile`：`/media-webrtc/*`、`/media-hls/*` 和其余应用流量分别转发到
+`127.0.0.1:8889`、`127.0.0.1:8888`、`127.0.0.1:8080`。这些是同主机进程端口，不是容器服务名；仓库
+没有 Docker/Compose 运行模式，也没有 `app` 或 `mediamtx` DNS 兼容分支。
+
 ## 6.5 录像树
 
 录像字节由 MediaMTX 写入固定 recordings directory。文件名、目录、mode、链接和容量都是备份/安全

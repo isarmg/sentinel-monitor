@@ -69,7 +69,7 @@ APP_PID="$!"
 
 READY=false
 for _ in {1..120}; do
-  if curl --fail --silent "http://127.0.0.1:$PORT/health/live" >/dev/null; then
+  if curl --fail --silent "http://127.0.0.1:$PORT/healthz" >/dev/null; then
     READY=true
     break
   fi

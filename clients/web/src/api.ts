@@ -75,15 +75,6 @@ export type MonitorEvent = {
   created_at: string;
 };
 
-export type ManagedUser = {
-  id: string;
-  username: string;
-  active: boolean;
-  last_login_at: string | null;
-  created_at: string;
-  updated_at: string;
-};
-
 export type AuditRow = {
   id: string;
   action: string;
@@ -197,16 +188,6 @@ const isMonitorEvent: JsonGuard<MonitorEvent> = (
   isNullableString(value.acknowledged_at) &&
   ["info", "warning", "critical"].includes(value.severity as string);
 export const isMonitorEvents = arrayOf(isMonitorEvent);
-
-const isManagedUser: JsonGuard<ManagedUser> = (
-  value,
-): value is ManagedUser =>
-  isRecord(value) &&
-  ["id", "username", "created_at", "updated_at"].every((key) => isString(value[key])) &&
-  isBoolean(value.active) &&
-  isNullableString(value.last_login_at);
-export const isManagedUsers = arrayOf(isManagedUser);
-export const isManagedUserResponse = isManagedUser;
 
 const isAuditRow: JsonGuard<AuditRow> = (value): value is AuditRow =>
   isRecord(value) &&
